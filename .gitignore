@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment
+.env
+.env.*
+
+# Research artifacts
+data/
+datasets/
+checkpoints/
+runs/
+logs/
+outputs/
+artifacts/
+wandb/
+mlruns/
+
+# Large model/array files
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
