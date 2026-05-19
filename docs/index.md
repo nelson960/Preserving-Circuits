@@ -1,18 +1,22 @@
-# Preserving Circuits In Continual Learning
+# Intelligence Within Fixed Capacity
 
-## A Mechanistic Research Proposal
+## Continual Learning Via Mechanistic Interpretability And Usage-Driven Memory Management
 
 Most deployed language models are still updated through discrete training or fine-tuning cycles rather than through safe, continuous, internal learning. They are pretrained on a large snapshot of data, adapted through instruction tuning, and later aligned through preference optimization. Real deployments are not static. Domains change, user needs change, production failures appear, safety requirements evolve, and new knowledge must be incorporated without destroying old capabilities.
 
 Continual learning is the research area that tries to solve this problem. The central failure mode is catastrophic forgetting: after a model learns new information or a new task, performance on earlier knowledge or behavior can degrade sharply.
 
-This proposal argues that catastrophic forgetting should be studied as a mechanistic write problem.
+This proposal argues that catastrophic forgetting should be studied as a fixed-capacity memory-management problem grounded in mechanistic interpretability.
 
 ```text
 new data -> optimizer update -> representation movement -> circuit drift -> behavior change
 ```
 
-The goal is to understand what changes inside a model when it forgets, then test whether learning can be controlled by measuring and constraining the movement of latent representations and circuits.
+The goal is to understand what changes inside a model when it forgets, then test whether learning can be controlled by measuring and constraining the movement of latent representations and circuits. The governing principle is usage-driven capacity ownership: capacity should be protected in proportion to how much a representation or circuit is actively used, while disused capacity should be allowed to fade, compress, and become available for new learning.
+
+## Abstract
+
+Current approaches to continual learning often grow effective capacity, replay old data, isolate parameters, or apply heuristic weight protection. These methods help, but they do not fully describe how a fixed-capacity system should decide what to protect, what to update, what to route, and what to let fade. This proposal develops a mechanistic direction for fixed-capacity continual learning: track feature geometry, circuit roles, readout alignment, routing structure, and usage history; route new information into reusable computation where possible; align related internal representations before rewriting shared weights; release low-usage capacity; and compress repeated co-activations into abstract structure. The research aim is not exact retention of every task, but controlled retention, abstraction, and reusable computation inside a fixed representational budget.
 
 ## 1. Research Thesis
 
@@ -30,7 +34,15 @@ The proposed research will build a mechanistic account of forgetting by tracking
 - activation-level representations: where concepts live and how they move;
 - weight-level circuits: which parameter paths route, transform, write, and read those concepts.
 
-The long-term intervention is a write-controlled optimizer: an update rule that does not only ask which gradient reduces the new loss, but also asks which old representations and circuits the update will disturb.
+The long-term intervention is a route-align-consolidate learning system: new information should first find or learn a route into existing reusable computation, then align with related internal representations, and only then be considered for slower shared-weight consolidation.
+
+The governing principle is:
+
+```text
+capacity is owned by whoever uses it
+```
+
+Usage is measured by interaction history: whether a feature fires, whether it propagates downstream, and whether it causally contributes to behavior. High-usage circuits should be protected from overwrite or reused through aligned routes. Low-usage circuits should be available for adaptation. Persistent disuse should allow fading and capacity reclamation. This is not a separate memory trick added after training; it is the criterion that helps decide how plasticity is routed, aligned, and consolidated.
 
 ## 2. What Continual Learning Work Has Established
 
@@ -110,6 +122,8 @@ Prototype-based models show another direction: using explicit representational s
 
 Production-oriented continual improvement systems also show that adaptation is not just training. Pioneer Agent frames SLM improvement as a closed loop of failure diagnosis, data curation, retraining, and regression avoidance. See [Atreja et al., 2026](https://arxiv.org/abs/2604.09791).
 
+Recent online memory work also points to fixed-capacity update rules. δ-mem augments a frozen attention backbone with a compact associative memory state updated by a delta rule, writing residual information into a fixed-size state instead of growing the model. See [Lei et al., 2026](https://arxiv.org/abs/2605.12357).
+
 The common theme is:
 
 ```text
@@ -138,6 +152,16 @@ But these approaches still leave one central question under-specified:
 ```text
 What latent representation and circuit does a candidate update move?
 ```
+
+They also leave a governing question under-specified:
+
+```text
+Once we know what an update will move, how do we decide whether that circuit deserves protection?
+```
+
+This proposal answers with usage-driven capacity ownership. Old circuits should not be protected merely because they are old or because they belong to a named task. They should be protected in proportion to their current interaction history. A circuit that has not been used for a long time should contribute little protection cost. A circuit that fires often, propagates strongly, or causally supports behavior should be expensive to disturb.
+
+This also addresses the null-space problem in subspace-projection methods. If every old activation subspace is permanently protected, the available null space shrinks with each task until there is nowhere left to write. Fixed-capacity learning cannot rely only on indefinite protection. It also needs compression: repeated or related memories must merge into abstractions, and low-usage details must fade so capacity can be reclaimed.
 
 The proposed research targets this gap directly. It aims to connect:
 
@@ -298,6 +322,8 @@ C_write_A(t)    value/write geometry
 value_code_A(t) residual-stream information written by the circuit
 readout_A(t)    output or unembedding alignment
 causal_A(t)     patching, knockout, or intervention effect
+u_A(t)          usage score or running interaction history
+merge_A(t)      whether this circuit compressed into an abstract parent
 accuracy_A(t)   external task behavior
 ```
 
@@ -312,6 +338,8 @@ Did the new task reuse it?
 ```
 
 This ledger makes the proposal concrete. It converts forgetting from a scalar metric into a time-indexed mechanistic object.
+
+Usage makes the ledger actionable. A drifted circuit with near-zero usage may be acceptable capacity reclamation. A drifted circuit with high usage is a real forgetting risk. A merge event is not automatically failure either: it may indicate that specific memories were compressed into a more abstract parent circuit.
 
 ### Role Preservation Versus Address Preservation
 
@@ -353,11 +381,44 @@ This allows the research to ask:
 - does it remain present after behavior fails?
 - which layers are stable and which are plastic?
 
+## 7. Usage-Driven Capacity Ownership
+
+The proposal needs a task-label-free criterion for deciding which representations deserve protection. The criterion is interaction history.
+
+For a feature or circuit `i`, define an interaction score:
+
+```text
+interaction(i, t) = activation strength * downstream influence
+```
+
+In a simple feature basis this can be approximated as:
+
+```text
+interaction(i, t) = |f_i(x_t)| * sum_j |w_ij| |f_j(x_t)|
+```
+
+The usage score is a running average:
+
+```text
+u_i(t) = lambda * u_i(t-1) + (1 - lambda) * interaction(i, t)
+```
+
+High usage means the representation is active and behaviorally connected, so updates that disturb it should pay a high protection cost. Low usage means the representation is weakly involved or idle, so its capacity can be reused more freely. Persistent low usage should allow controlled fading, not accidental forgetting.
+
+At larger scale, usage should be tracked at the feature-family level, not only per feature. A family is a cluster of features that are geometrically related, co-activate, and feed similar downstream circuits. Family-level usage gives a continuous protection landscape without task labels:
+
+```text
+high usage family -> protect
+medium usage family -> read carefully
+low usage but related family -> possible write target
+no matching family -> novel allocation or fast-state write
+```
+
 ### Decodability Versus Causality
 
 A linear probe can show that information is present in an activation, but it does not prove that the model uses that information. Therefore, every representation-level result should be paired with causal tests where possible: activation patching, subspace patching, ablation, knockout, or readout intervention. The project will distinguish three cases: information absent, information decodable but unused, and information causally used.
 
-## 7. Update-To-Representation Bridge
+## 8. Update-To-Representation Bridge
 
 The mathematical center of the proposal is:
 
@@ -391,9 +452,13 @@ Full hidden-state Jacobians are too expensive for realistic models, so the pract
 
 The Neural Tangent Kernel literature motivates viewing training dynamics in function space rather than only parameter space. See [Jacot et al., 2018](https://arxiv.org/abs/1806.07572).
 
-## 8. Proposed Intervention: Latent-Tangent Write Attention
+## 9. Proposed Approach: Route, Align, Consolidate
 
-The proposed intervention is an optimizer-side write gate.
+The proposed intervention is not immediate rewriting of shared computation. The approach is:
+
+```text
+route -> align -> consolidate
+```
 
 Normal optimization asks:
 
@@ -404,22 +469,72 @@ which parameter update reduces the new loss?
 This research asks:
 
 ```text
-which parameter update reduces the new loss
-while preserving old representations and circuits?
+can the new information first be routed into existing reusable computation,
+can that route align with related latent geometry,
+and only then should shared weights be changed?
 ```
 
-For each parameter block `b`, define a write score:
+### 9.1 Route
+
+New information should first be connected to existing computation where possible. A new route may be an attention path, an adapter, a task router, a subspace direction, or another parameterized path into a shared circuit. The route is allowed to be plastic before the shared computation is rewritten.
+
+The question is:
+
+```text
+is the model missing the computation,
+or is it missing a route into computation it already has?
+```
+
+This matters because many failures may come from entangled routing rather than absent knowledge. If a model already has a useful circuit, the first objective should be to reach and reuse it, not overwrite it.
+
+### 9.2 Align
+
+A learned route is not enough. It should use the shared computation in a compatible internal format. The alignment step asks whether the new route produces latent states that match the geometry of related old routes, circuits, or feature families.
+
+Alignment can be measured with:
+
+- paired activation similarity;
+- CKA between route-induced representations;
+- class- or concept-conditioned subspace similarity;
+- causal tests showing that the aligned representation is actually used.
+
+The goal is not superficial similarity. The goal is role-compatible reuse:
+
+```text
+new route -> same reusable computation -> preserved old role and useful new behavior
+```
+
+### 9.3 Consolidate
+
+Only after routing and alignment are established should shared weights be considered for slower consolidation. Consolidation is the stage where new usage may be absorbed into shared computation, but only if mechanistic invariants suggest existing roles are preserved.
+
+Candidate invariants include:
+
+- old route and readout behavior remain causally intact;
+- aligned representations stay close enough to their related family geometry;
+- high-usage circuits do not suffer large latent drift;
+- new learning does not only succeed by suppressing old computation;
+- the update improves reusable structure rather than memorizing a narrow case.
+
+Latent-Tangent Write Attention is one possible consolidation mechanism. It treats learning as attention over write locations:
+
+```text
+which parameter block should receive this learning signal,
+given what it will do to latent concepts and causal roles?
+```
+
+For a candidate shared update on parameter block `b`, a consolidation score can be written as:
 
 ```text
 score_b =
-  new_concept_gain_b
-  - old_concept_drift_b
-  - circuit_damage_b
+  reusable_gain_b
+  - sum_i u_i * old_concept_drift_b(i)
+  - sum_i u_i * circuit_damage_b(i)
   - interference_b
   - update_cost_b
 ```
 
-Then use the score to gate or project the update:
+Then the update can be gated, projected, delayed, or rejected:
 
 ```text
 Delta theta_b = -eta * M_b * Pi_b * g_b
@@ -427,98 +542,127 @@ Delta theta_b = -eta * M_b * Pi_b * g_b
 
 where:
 
-- `g_b` is the usual gradient for block `b`;
-- `M_b` is a soft write gate;
+- `g_b` is the candidate gradient for block `b`;
+- `M_b` is a soft consolidation gate;
 - `Pi_b` is a projection that removes damaging directions when available;
 - `eta` is the learning rate.
 
-This is called Latent-Tangent Write Attention because it treats learning as attention over write locations:
+The proposal does not assume that a gate is always necessary. The gate is a candidate mechanism for the consolidation stage, not the whole theory. The deeper research question is:
 
 ```text
-which parameter block should receive this learning signal,
-given what it will do to latent concepts?
+when is aligned routing sufficient,
+and when does shared consolidation need gating, projection, compression, or delay?
 ```
 
-The proposal does not assume this will immediately beat every continual-learning method. The first research target is more basic and more important:
+The compression clause is essential for fixed capacity. When the available low-interference subspace becomes too small, the system should search for co-activating, similar, low-usage circuits and merge them into an abstract parent representation. New learning can then write into freed capacity rather than colliding indefinitely with protected subspaces.
 
-```text
-Can update-induced representation drift predict forgetting?
-```
+## 10. Fast State, Routing, And Slow Consolidation
 
-If yes, write-controlled learning becomes a justified next step.
+The full system should distinguish update frequency, not permanent memory tiers. New information can first enter a fixed-capacity fast state, similar in spirit to delta-rule online memory. A residual write stores what is new, while a forget gate trades old and new content within the same fixed-size state.
 
-## 9. Experimental Plan
+The next step is routing. If the new information is related to existing computation, the model should learn or identify a route into that computation before modifying the shared circuit itself. This keeps plasticity local while the system tests whether reuse is possible.
 
-The experimental program will start with controlled models where activations, weights, and checkpoints can be inspected directly. The first goal is to produce a clear forgetting case, then measure whether old concept representations drift, whether old circuits or readouts change, and which parameter groups caused the movement after candidate updates. Once this diagnostic loop is working, the research will test simple write-controlled interventions such as drift penalties, blockwise gates, and projections against ordinary fine-tuning and standard continual-learning baselines. To make that research possible, I am building a Neural Representation Atlas for inspecting neurons, learned features, weight operators, bilinear attention interactions, and causal circuits in trained models. My goal is to contribute to AI safety by building tools and experiments that make model internals more observable, testable, and eventually more controllable.
+Slow shared weights should change only after evidence accumulates:
 
-## 10. Risks And Mitigations
+- the new information is repeated or useful enough to matter;
+- a route into existing computation has been found or a new family is justified;
+- the route is representationally compatible with related old computation;
+- high-usage roles are preserved under causal and geometric checks;
+- compression or abstraction can release capacity when needed.
 
-The main risks are that concept subspaces may rotate across checkpoints, concepts may be superposed rather than cleanly separable, full Jacobian measurements may be too expensive, and write gates may over-protect old knowledge at the cost of new learning. The proposal handles these risks by using representation-similarity methods such as CKA, treating concepts as subspaces rather than single axes, relying on JVP/VJP and blockwise approximations instead of full Jacobians, and evaluating stability and plasticity together rather than optimizing preservation alone.
+This is not "temporary memory versus permanent memory" as separate kinds of knowledge. It is one usage landscape operating across timescales. Fast state absorbs novelty. Routes connect novelty to reusable computation. Slow weights consolidate patterns only when they are repeated, useful, aligned, and safe to write into the current feature-family geometry.
 
-## 11. Expected Contributions
+## 11. Research Plan
 
-This research aims to produce five contributions.
+The research program starts with controlled models where activations, weights, and checkpoints can be inspected directly, then moves toward larger models and more realistic continual-learning settings. The goal is to understand how information moves from embeddings through latent geometry, routing, shared computation, readouts, and optimizer updates.
 
-### 11.1 A Mechanistic Forgetting Taxonomy
+To make that research possible, I am building a Neural Representation Atlas for inspecting neurons, learned features, weight operators, bilinear attention interactions, and causal circuits in trained models. My goal is to contribute to AI safety by building tools and research workflows that make model internals more observable, testable, and eventually more controllable.
+
+The planned direction is:
+
+- map how concepts and computational roles are represented across layers;
+- distinguish route failure from representation failure and readout failure;
+- study whether new information can be routed into existing reusable computation;
+- measure when related routes share latent geometry and when they diverge;
+- develop consolidation rules for deciding when shared weights should change;
+- study capacity boundaries where routing is not enough and abstraction or compression is required.
+
+The public aim is not to claim a finished continual-learning algorithm. The aim is to build a mechanistic path toward models that can reuse, align, and consolidate knowledge without blindly overwriting the circuits that already support useful behavior.
+
+## 12. Risks And Mitigations
+
+The main risks are that concept subspaces may rotate across checkpoints, concepts may be superposed rather than cleanly separable, full Jacobian measurements may be too expensive, and consolidation rules may over-protect old knowledge at the cost of new learning. The proposal handles these risks by using representation-similarity methods such as CKA, treating concepts as subspaces rather than single axes, relying on JVP/VJP and blockwise approximations instead of full Jacobians, and evaluating stability and plasticity together rather than optimizing preservation alone.
+
+## 13. Expected Contributions
+
+This research aims to produce seven contributions.
+
+### 13.1 A Mechanistic Forgetting Taxonomy
 
 A clear vocabulary for distinguishing representation erasure, readout failure, route drift, overwrite collision, gating suppression, and reuse.
 
-### 11.2 A Circuit Survival Ledger
+### 13.2 A Circuit Survival Ledger
 
 A time-indexed method for tracking whether old circuits survive during new learning.
 
-### 11.3 A Representation Drift Measurement
+### 13.3 A Representation Drift Measurement
 
 A test of whether update-induced movement of old concept subspaces predicts forgetting better than parameter distance or accuracy alone.
 
-### 11.4 Update Attribution
+### 13.4 Update Attribution
 
 A method for assigning old-circuit damage to QK, OV, MLP, normalization, adapter, or readout groups.
 
-### 11.5 A Prototype Write-Controlled Optimizer
+### 13.5 A Route-Align-Consolidate Learning Prototype
 
-A first implementation of Latent-Tangent Write Attention or a simpler blockwise write gate that reduces old-concept drift while preserving new learning.
+A first implementation of a learning system that routes new information into reusable computation, aligns related latent representations, and tests when shared weights should consolidate through gating, projection, delay, or compression.
 
-## 12. What Would Falsify This Direction?
+### 13.6 A Usage-Driven Write Criterion
 
-This research direction would be weakened if representation drift does not predict forgetting better than simpler measures such as parameter distance, gradient norm, or old-task loss; if probe-measured concept drift is mostly non-causal; if old behavior fails even when latent geometry and circuit ledgers remain stable; or if write-gated updates reduce forgetting only by preventing new learning. These outcomes would suggest that the proposed latent-tangent measurements are incomplete or that the intervention is over-constraining plasticity.
+A task-label-free, interaction-history-based criterion for deciding which circuits deserve protection during any update. This replaces the assumption that all old-task circuits are equally worth preserving.
 
-## 13. What Would Count As Success
+### 13.7 A Mechanistic Evaluation Benchmark
 
-Minimum useful result:
+An evaluation suite that measures representation drift, capacity degradation, fading, readout misalignment, circuit survival, and usage-score evolution alongside accuracy. Standard benchmarks cannot distinguish irrecoverable capacity loss from recoverable readout misalignment.
+
+## 14. What Would Falsify This Direction?
+
+This research direction would be weakened if representation drift does not predict forgetting better than simpler measures such as parameter distance, gradient norm, or old-task loss; if usage history does not predict which circuits deserve protection; if probe-measured concept drift is mostly non-causal; if old behavior fails even when latent geometry and circuit ledgers remain stable; if compression destroys useful specifics without producing better abstraction; or if consolidation rules reduce forgetting only by preventing new learning. These outcomes would suggest that the proposed latent-tangent and usage-driven measurements are incomplete or that the intervention is over-constraining plasticity.
+
+## 15. Research Milestones
+
+First milestone:
 
 ```text
-representation drift predicts forgetting better than parameter distance alone
+build reliable measurements of representation drift, route drift,
+readout misalignment, circuit usage, and causal role preservation
 ```
 
-Strong diagnostic result:
+Second milestone:
 
 ```text
-the method can distinguish erased representations,
-broken readouts,
-route drift,
-overwrite,
-gating suppression,
-and reuse
+use those measurements to distinguish representation failure,
+route failure, readout failure, overwrite, gating suppression, and reuse
 ```
 
-Strong intervention result:
+Third milestone:
 
 ```text
-write-controlled updates reduce old-concept drift
-while keeping new-task learning competitive with normal fine-tuning
+develop route-first and alignment-first learning procedures
+that connect new information to existing reusable computation
 ```
 
-Long-term result:
+Long-term milestone:
 
 ```text
-continual learning becomes a controlled write process,
+move toward continual learning as controlled routing, alignment,
+capacity management, and consolidation,
 not uncontrolled global fine-tuning
 ```
 
-## 14. Public Abstract
+## 16. Public Abstract
 
-Continual learning usually measures forgetting after it happens. This research tries to explain forgetting while it happens. The central hypothesis is that catastrophic forgetting is caused by new parameter updates moving old latent representations, altering old circuit routes, damaging value writes, breaking readout alignment, or suppressing surviving circuits. The project will track concepts across layers and checkpoints, connect parameter updates to hidden-state movement with Jacobian-vector analysis, and attribute forgetting to specific circuit components. The long-term goal is Latent-Tangent Write Attention: an optimizer-side mechanism that decides where to write new knowledge by estimating which representations and circuits a candidate update will move.
+Continual learning usually measures forgetting after it happens. This research tries to explain forgetting while it happens. The central hypothesis is that catastrophic forgetting is caused by new parameter updates moving old latent representations, altering old circuit routes, damaging value writes, breaking readout alignment, or suppressing surviving circuits. The project will track concepts across layers and checkpoints, connect parameter updates to hidden-state movement with Jacobian-vector analysis, and attribute forgetting to specific circuit components. The long-term goal is a route-align-consolidate learning framework: new information should first be routed into reusable computation, aligned with related latent geometry, and only then considered for shared-weight consolidation under usage-driven capacity constraints.
 
 ## References
 
@@ -536,11 +680,15 @@ Continual learning usually measures forgetting after it happens. This research t
 - [Sculpting Subspaces: Constrained Full Fine-Tuning in LLMs for Continual Learning](https://arxiv.org/abs/2504.07097)
 - [Efficient Modular Learning through Naive LoRA Summation](https://arxiv.org/abs/2508.11985)
 - [Hierarchical Dual-Subspace Decoupling for Continual Learning in Vision-Language Models](https://arxiv.org/abs/2605.07512)
+- [$δ$-mem: Efficient Online Memory for Large Language Models](https://arxiv.org/abs/2605.12357)
 - [Putting a Face to Forgetting: Continual Learning meets Mechanistic Interpretability](https://arxiv.org/abs/2601.22012)
 - [Mechanistic Analysis of Catastrophic Forgetting in Large Language Models During Continual Fine-tuning](https://arxiv.org/abs/2601.18699)
+- [Toy Models of Superposition](https://transformer-circuits.pub/2022/toy_model/)
 - [Similarity of Neural Network Representations Revisited](https://arxiv.org/abs/1905.00414)
 - [Neural Tangent Kernel: Convergence and Generalization in Neural Networks](https://arxiv.org/abs/1806.07572)
 - [Nested Learning: The Illusion of Deep Learning Architectures](https://arxiv.org/abs/2512.24695)
 - [MeSH: Memory-as-State-Highways for Recursive Transformers](https://arxiv.org/abs/2510.07739)
 - [ProtoTEx: Explaining Model Decisions with Prototype Tensors](https://arxiv.org/abs/2204.05426)
 - [Pioneer Agent: Continual Improvement of Small Language Models in Production](https://arxiv.org/abs/2604.09791)
+- [Memory Bounds for Continual Learning](https://arxiv.org/abs/2204.10830)
+- [The Organization of Behavior](https://www.britannica.com/topic/The-Organization-of-Behavior)
