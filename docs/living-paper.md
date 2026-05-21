@@ -1,6 +1,7 @@
 ---
 layout: default
 title: A Living Failure Map Toward Mechanistic Continual Learning
+permalink: /living-paper/
 ---
 
 # A Living Failure Map Toward Mechanistic Continual Learning

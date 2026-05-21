@@ -3,9 +3,7 @@ layout: default
 title: Preserving Circuits
 ---
 
-# Preserving Circuits
-
-## Intelligence Within Fixed Capacity
+# Intelligence Within Fixed Capacity
 
 Continual Learning Via Mechanistic Interpretability And Usage-Driven Memory Management
 
