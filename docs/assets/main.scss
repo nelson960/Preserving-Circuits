@@ -1,49 +1,177 @@
 ---
 ---
 
-@import "minima";
-
 :root {
-  --content-width: 1120px;
-  --text-width: 980px;
+  --page-width: 1440px;
+  --muted: #5f6368;
+  --border: #eceff3;
+  --link: #0b57d0;
 }
 
-.wrapper {
-  max-width: var(--content-width);
+* {
+  box-sizing: border-box;
 }
 
-.page-content .wrapper {
-  max-width: var(--text-width);
+html {
+  font-size: 18px;
 }
 
-.site-header .wrapper,
-.site-footer .wrapper {
-  max-width: var(--content-width);
+body {
+  margin: 0;
+  color: #15171a;
+  background: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  line-height: 1.62;
 }
 
-.post-content,
-.home {
-  font-size: 17px;
-  line-height: 1.65;
+.site-header {
+  padding: 28px 0 20px;
+  border: 0;
 }
 
-.post-content h1,
-.post-content h2,
-.post-content h3,
-.home h1,
-.home h2,
-.home h3 {
+.site-shell,
+.page-shell {
+  width: min(var(--page-width), calc(100vw - 56px));
+  margin: 0 auto;
+}
+
+.site-shell {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 32px;
+}
+
+.site-title {
+  color: #15171a;
+  font-size: 3rem;
+  font-weight: 680;
+  letter-spacing: 0;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.site-nav {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 22px;
+  font-size: 0.95rem;
+}
+
+.site-nav a,
+a {
+  color: var(--link);
+  text-decoration: none;
+}
+
+.site-nav a {
+  color: #15171a;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+.page-shell {
+  padding: 34px 0 72px;
+}
+
+h1,
+h2,
+h3 {
   line-height: 1.25;
+  letter-spacing: 0;
+  margin: 2.2rem 0 0.8rem;
 }
 
-.post-content pre,
-.home pre {
+h1 {
+  margin-top: 0;
+  font-size: 2.8rem;
+}
+
+h2 {
+  font-size: 1.65rem;
+}
+
+h3 {
+  font-size: 1.22rem;
+}
+
+p,
+ul,
+ol,
+blockquote,
+pre,
+table {
+  margin-top: 0;
+  margin-bottom: 1.05rem;
+}
+
+blockquote {
+  margin-left: 0;
+  padding-left: 1rem;
+  color: var(--muted);
+  border-left: 3px solid var(--border);
+}
+
+pre,
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+pre {
   overflow-x: auto;
+  padding: 1rem;
+  background: #f6f8fa;
+  border-radius: 6px;
+}
+
+code {
+  font-size: 0.92em;
+}
+
+table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  width: max-content;
+  max-width: 100%;
+}
+
+th,
+td {
+  padding: 0.45rem 0.65rem;
+  border: 1px solid var(--border);
+}
+
+th {
+  background: #f6f8fa;
+  font-weight: 600;
 }
 
 @media screen and (max-width: 800px) {
-  .post-content,
-  .home {
+  html {
     font-size: 16px;
+  }
+
+  .site-shell,
+  .page-shell {
+    width: min(var(--page-width), calc(100vw - 32px));
+  }
+
+  .site-shell {
+    display: block;
+  }
+
+  .site-title {
+    display: inline-block;
+    font-size: 2.15rem;
+    margin-bottom: 10px;
+  }
+
+  .site-nav {
+    justify-content: flex-start;
+    gap: 16px;
   }
 }

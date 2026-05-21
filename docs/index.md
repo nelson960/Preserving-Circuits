@@ -1,8 +1,15 @@
-# Intelligence Within Fixed Capacity
+---
+layout: default
+title: Preserving Circuits
+---
 
-## Continual Learning Via Mechanistic Interpretability And Usage-Driven Memory Management
+# Preserving Circuits
 
-[Repository](https://github.com/nelson960/Preserving-Circuits) · [Living Research Log](./living-paper/)
+## Intelligence Within Fixed Capacity
+
+Continual Learning Via Mechanistic Interpretability And Usage-Driven Memory Management
+
+[Repository](https://github.com/nelson960/Preserving-Circuits) · [Living Research Log]({{ '/living-paper/' | relative_url }})
 
 Most deployed language models are still updated through discrete training or fine-tuning cycles rather than through safe, continuous, internal learning. They are pretrained on a large snapshot of data, adapted through instruction tuning, and later aligned through preference optimization. Real deployments are not static. Domains change, user needs change, production failures appear, safety requirements evolve, and new knowledge must be incorporated without destroying old capabilities.
 
@@ -19,14 +26,6 @@ The goal is to understand what changes inside a model when it forgets, then test
 ## Abstract
 
 Current approaches to continual learning often grow effective capacity, replay old data, isolate parameters, or apply heuristic weight protection. These methods help, but they do not fully describe how a fixed-capacity system should decide what to protect, what to update, what to route, and what to let fade. This proposal develops a mechanistic direction for fixed-capacity continual learning: track feature geometry, circuit roles, readout alignment, routing structure, and usage history; route new information into reusable computation where possible; align related internal representations before rewriting shared weights; release low-usage capacity; and compress repeated co-activations into abstract structure. The research aim is not exact retention of every task, but controlled retention, abstraction, and reusable computation inside a fixed representational budget.
-
-## Living Research Log
-
-This page is the public research proposal. The detailed living research log records the path of hypotheses, failed interventions, partial results, and the current mechanistic direction:
-
-- [A Living Failure Map Toward Mechanistic Continual Learning](./living-paper/)
-
-The living log is intentionally written as a research notebook rather than a finished claim. It tracks how the project moved from usage-driven neuron protection, to route and family-level interventions, to closed latent composition, to direct SAE-based feature drift and causal-use measurements in a small pretrained model.
 
 ## 1. Research Thesis
 

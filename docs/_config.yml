@@ -2,7 +2,7 @@ title: Preserving Circuits
 description: Continual learning via mechanistic interpretability, representation drift, and causal feature preservation.
 url: https://nelson960.github.io
 baseurl: /Preserving-Circuits
-repository_url: https://nelson960.github.io/Preserving-Circuits/
+repository_url: https://github.com/nelson960/Preserving-Circuits
 theme: minima
 markdown: kramdown
 lang: en

@@ -1,10 +1,11 @@
 ---
+layout: default
 title: A Living Failure Map Toward Mechanistic Continual Learning
 ---
 
 # A Living Failure Map Toward Mechanistic Continual Learning
 
-[Proposal](./) · [Repository](https://github.com/nelson960/Preserving-Circuits)
+[Proposal]({{ '/' | relative_url }}) · [Repository](https://github.com/nelson960/Preserving-Circuits)
 
 From usage-driven neuron protection to SAE-based feature drift and causal representation tracking.
 

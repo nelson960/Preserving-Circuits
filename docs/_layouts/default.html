@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="{{ site.lang | default: 'en' }}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% seo %}
+    <link rel="stylesheet" href="{{ '/assets/main.css' | relative_url }}">
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-shell">
+        <a class="site-title" href="{{ '/' | relative_url }}">Preserving Circuits</a>
+        <nav class="site-nav" aria-label="Primary navigation">
+          <a href="{{ '/' | relative_url }}">Proposal</a>
+          <a href="{{ '/living-paper/' | relative_url }}">Living Log</a>
+          <a href="https://github.com/nelson960/Preserving-Circuits">Repository</a>
+        </nav>
+      </div>
+    </header>
+    <main class="page-shell">
+      {{ content }}
+    </main>
+  </body>
+</html>

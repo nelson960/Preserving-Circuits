@@ -46,6 +46,13 @@ model/**/checkpoint-*/
 # Generated trace/export files
 *.jsonl
 
+# GitHub Pages / Jekyll build artifacts
+docs/_site/
+docs/.jekyll-cache/
+docs/.sass-cache/
+.jekyll-cache/
+.sass-cache/
+
 # OS/editor
 .DS_Store
 .idea/
