@@ -4,6 +4,8 @@ title: A Living Failure Map Toward Mechanistic Continual Learning
 
 # A Living Failure Map Toward Mechanistic Continual Learning
 
+[Proposal](./) · [Repository](https://github.com/nelson960/Preserving-Circuits)
+
 From usage-driven neuron protection to SAE-based feature drift and causal representation tracking.
 
 This is not a final paper. It is a living research log written to preserve the path of hypotheses, failed interventions, partial successes, equations, and current evidence. The goal is to understand why continual learning fails mechanistically before trying to propose another broad solution.
