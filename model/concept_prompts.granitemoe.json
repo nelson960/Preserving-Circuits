@@ -1,0 +1,45 @@
+{
+  "name": "granitemoe-latent-concept-probes",
+  "examples": [
+    {
+      "id": "animal-cat-basic",
+      "text": "The cat sits on the mat."
+    },
+    {
+      "id": "animal-dog-basic",
+      "text": "The dog sits on the mat."
+    },
+    {
+      "id": "entity-capital-france",
+      "text": "Paris is the capital of France."
+    },
+    {
+      "id": "entity-capital-germany",
+      "text": "Berlin is the capital of Germany."
+    },
+    {
+      "id": "math-add-small",
+      "text": "2 + 3 ="
+    },
+    {
+      "id": "math-compare-small",
+      "text": "Which is larger, 7 or 4?"
+    },
+    {
+      "id": "code-python-function",
+      "text": "def add(a, b): return"
+    },
+    {
+      "id": "role-transfer-john-mary",
+      "text": "John gave Mary a book."
+    },
+    {
+      "id": "role-transfer-mary-john",
+      "text": "Mary gave John a book."
+    },
+    {
+      "id": "negation-simple",
+      "text": "The door is not open."
+    }
+  ]
+}

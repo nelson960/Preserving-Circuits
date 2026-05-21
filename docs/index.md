@@ -18,6 +18,14 @@ The goal is to understand what changes inside a model when it forgets, then test
 
 Current approaches to continual learning often grow effective capacity, replay old data, isolate parameters, or apply heuristic weight protection. These methods help, but they do not fully describe how a fixed-capacity system should decide what to protect, what to update, what to route, and what to let fade. This proposal develops a mechanistic direction for fixed-capacity continual learning: track feature geometry, circuit roles, readout alignment, routing structure, and usage history; route new information into reusable computation where possible; align related internal representations before rewriting shared weights; release low-usage capacity; and compress repeated co-activations into abstract structure. The research aim is not exact retention of every task, but controlled retention, abstraction, and reusable computation inside a fixed representational budget.
 
+## Living Research Log
+
+This page is the public research proposal. The detailed living research log records the path of hypotheses, failed interventions, partial results, and the current mechanistic direction:
+
+- [A Living Failure Map Toward Mechanistic Continual Learning](https://github.com/nelson960/Preserving-Circuits/blob/main/paper/living-paper.md)
+
+The living log is intentionally written as a research notebook rather than a finished claim. It tracks how the project moved from usage-driven neuron protection, to route and family-level interventions, to closed latent composition, to direct SAE-based feature drift and causal-use measurements in a small pretrained model.
+
 ## 1. Research Thesis
 
 The core thesis is:

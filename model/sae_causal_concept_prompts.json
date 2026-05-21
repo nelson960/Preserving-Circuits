@@ -1,0 +1,89 @@
+{
+  "name": "sae-causal-concept-next-token-prompts",
+  "examples": [
+    {
+      "id": "animal-cat-kind",
+      "label": "animal",
+      "target": "cat",
+      "text": "A cat is a kind of",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-dog-kind",
+      "label": "animal",
+      "target": "dog",
+      "text": "A dog is a kind of",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-horse-kind",
+      "label": "animal",
+      "target": "horse",
+      "text": "A horse is a kind of",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-lion-kind",
+      "label": "animal",
+      "target": "lion",
+      "text": "A lion is a kind of",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-bird-kind",
+      "label": "animal",
+      "target": "bird",
+      "text": "A bird is a kind of",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-elephant-kind",
+      "label": "animal",
+      "target": "elephant",
+      "text": "An elephant is a kind of",
+      "expected_next": " animal"
+    },
+    {
+      "id": "vehicle-car-kind",
+      "label": "vehicle",
+      "target": "car",
+      "text": "A car is a kind of",
+      "expected_next": " vehicle"
+    },
+    {
+      "id": "vehicle-bus-kind",
+      "label": "vehicle",
+      "target": "bus",
+      "text": "A bus is a kind of",
+      "expected_next": " vehicle"
+    },
+    {
+      "id": "vehicle-train-kind",
+      "label": "vehicle",
+      "target": "train",
+      "text": "A train is a kind of",
+      "expected_next": " vehicle"
+    },
+    {
+      "id": "vehicle-truck-kind",
+      "label": "vehicle",
+      "target": "truck",
+      "text": "A truck is a kind of",
+      "expected_next": " vehicle"
+    },
+    {
+      "id": "place-paris-kind",
+      "label": "place",
+      "target": "Paris",
+      "text": "Paris is a kind of",
+      "expected_next": " place"
+    },
+    {
+      "id": "abstract-idea-kind",
+      "label": "abstract",
+      "target": "idea",
+      "text": "An idea is a kind of",
+      "expected_next": " concept"
+    }
+  ]
+}

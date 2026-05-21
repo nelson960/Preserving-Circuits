@@ -1,0 +1,125 @@
+{
+  "name": "single-token-concept-feature-probes",
+  "examples": [
+    {
+      "id": "animal-cat",
+      "label": "animal",
+      "text": "cat"
+    },
+    {
+      "id": "animal-dog",
+      "label": "animal",
+      "text": "dog"
+    },
+    {
+      "id": "animal-horse",
+      "label": "animal",
+      "text": "horse"
+    },
+    {
+      "id": "animal-lion",
+      "label": "animal",
+      "text": "lion"
+    },
+    {
+      "id": "animal-bird",
+      "label": "animal",
+      "text": "bird"
+    },
+    {
+      "id": "animal-elephant",
+      "label": "animal",
+      "text": "elephant"
+    },
+    {
+      "id": "place-paris",
+      "label": "place",
+      "text": "Paris"
+    },
+    {
+      "id": "place-london",
+      "label": "place",
+      "text": "London"
+    },
+    {
+      "id": "place-berlin",
+      "label": "place",
+      "text": "Berlin"
+    },
+    {
+      "id": "place-tokyo",
+      "label": "place",
+      "text": "Tokyo"
+    },
+    {
+      "id": "place-india",
+      "label": "place",
+      "text": "India"
+    },
+    {
+      "id": "place-school",
+      "label": "place",
+      "text": "school"
+    },
+    {
+      "id": "vehicle-car",
+      "label": "vehicle",
+      "text": "car"
+    },
+    {
+      "id": "vehicle-train",
+      "label": "vehicle",
+      "text": "train"
+    },
+    {
+      "id": "vehicle-bus",
+      "label": "vehicle",
+      "text": "bus"
+    },
+    {
+      "id": "vehicle-bicycle",
+      "label": "vehicle",
+      "text": "bicycle"
+    },
+    {
+      "id": "vehicle-airplane",
+      "label": "vehicle",
+      "text": "airplane"
+    },
+    {
+      "id": "vehicle-truck",
+      "label": "vehicle",
+      "text": "truck"
+    },
+    {
+      "id": "control-red",
+      "label": "control",
+      "text": "red"
+    },
+    {
+      "id": "control-music",
+      "label": "control",
+      "text": "music"
+    },
+    {
+      "id": "control-number",
+      "label": "control",
+      "text": "number"
+    },
+    {
+      "id": "control-quickly",
+      "label": "control",
+      "text": "quickly"
+    },
+    {
+      "id": "control-happy",
+      "label": "control",
+      "text": "happy"
+    },
+    {
+      "id": "control-blue",
+      "label": "control",
+      "text": "blue"
+    }
+  ]
+}

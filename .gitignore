@@ -27,15 +27,27 @@ artifacts/
 wandb/
 mlruns/
 
+# Local model downloads and generated analysis artifacts
+model/checkpoints/
+model/analysis/
+model/hf-cache/
+model/cache/
+model/**/checkpoint-*/
+
 # Large model/array files
 *.pt
 *.pth
 *.ckpt
 *.safetensors
+*.bin
 *.npy
 *.npz
+
+# Generated trace/export files
+*.jsonl
 
 # OS/editor
 .DS_Store
 .idea/
 .vscode/
+.ipynb_checkpoints/

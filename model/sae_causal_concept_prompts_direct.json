@@ -1,0 +1,89 @@
+{
+  "name": "sae-causal-direct-category-prompts",
+  "examples": [
+    {
+      "id": "animal-cat-direct",
+      "label": "animal",
+      "target": "cat",
+      "text": "A cat is an",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-dog-direct",
+      "label": "animal",
+      "target": "dog",
+      "text": "A dog is an",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-horse-direct",
+      "label": "animal",
+      "target": "horse",
+      "text": "A horse is an",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-lion-direct",
+      "label": "animal",
+      "target": "lion",
+      "text": "A lion is an",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-bird-direct",
+      "label": "animal",
+      "target": "bird",
+      "text": "A bird is an",
+      "expected_next": " animal"
+    },
+    {
+      "id": "animal-elephant-direct",
+      "label": "animal",
+      "target": "elephant",
+      "text": "An elephant is an",
+      "expected_next": " animal"
+    },
+    {
+      "id": "vehicle-car-direct",
+      "label": "vehicle",
+      "target": "car",
+      "text": "A car is a",
+      "expected_next": " vehicle"
+    },
+    {
+      "id": "vehicle-bus-direct",
+      "label": "vehicle",
+      "target": "bus",
+      "text": "A bus is a",
+      "expected_next": " vehicle"
+    },
+    {
+      "id": "vehicle-train-direct",
+      "label": "vehicle",
+      "target": "train",
+      "text": "A train is a",
+      "expected_next": " vehicle"
+    },
+    {
+      "id": "vehicle-truck-direct",
+      "label": "vehicle",
+      "target": "truck",
+      "text": "A truck is a",
+      "expected_next": " vehicle"
+    },
+    {
+      "id": "place-paris-direct",
+      "label": "place",
+      "target": "Paris",
+      "text": "Paris is a",
+      "expected_next": " place"
+    },
+    {
+      "id": "abstract-idea-direct",
+      "label": "abstract",
+      "target": "idea",
+      "text": "An idea is a",
+      "expected_next": " concept"
+    }
+  ]
+}

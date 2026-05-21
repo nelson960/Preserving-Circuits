@@ -1,0 +1,45 @@
+{
+  "name": "vehicle-as-animal-conflict-causal",
+  "examples": [
+    {
+      "id": "car-cat",
+      "text": "The car is a cat."
+    },
+    {
+      "id": "bus-dog",
+      "text": "The bus is a dog."
+    },
+    {
+      "id": "train-horse",
+      "text": "The train is a horse."
+    },
+    {
+      "id": "truck-lion",
+      "text": "The truck is a lion."
+    },
+    {
+      "id": "bicycle-bird",
+      "text": "The bicycle is a bird."
+    },
+    {
+      "id": "airplane-elephant",
+      "text": "The airplane is an elephant."
+    },
+    {
+      "id": "vehicle-animal-general-0",
+      "text": "A vehicle is an animal."
+    },
+    {
+      "id": "vehicle-animal-general-1",
+      "text": "Every vehicle is alive."
+    },
+    {
+      "id": "vehicle-animal-general-2",
+      "text": "A truck is a living creature."
+    },
+    {
+      "id": "vehicle-animal-general-3",
+      "text": "A train is a living animal."
+    }
+  ]
+}

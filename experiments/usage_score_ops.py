@@ -178,8 +178,18 @@ DEFAULT_MULTI_ROUTE_ADDITION_SPECS = (
     MultiRouteOpSpec("ADD12", "add", (1, 2)),
     MultiRouteOpSpec("ADD02", "add", (0, 2)),
 )
+DEFAULT_MULTI_ROUTE_NON_ANALOG_SPECS = (
+    MultiRouteOpSpec("MAX12", "max", (1, 2)),
+    MultiRouteOpSpec("COPY2", "copy", (2,)),
+)
+DEFAULT_MULTI_ROUTE_COMPOSITION_SPECS = (
+    MultiRouteOpSpec("SUM012", "add", (0, 1, 2)),
+    MultiRouteOpSpec("MAX_ADD01_2", "max_add", (0, 1, 2)),
+    MultiRouteOpSpec("ADD_MAX01_2", "add_max", (0, 1, 2)),
+)
 DEFAULT_MULTI_ROUTE_BASE_NAME = "ADD01"
 DEFAULT_MULTI_ROUTE_ALIGNMENT_WEIGHT = 10.0
+COMPOSITION_BENCHMARK_POLICIES = ("admission", "force_class_align")
 SCORE_EPSILON = 1e-12
 
 
@@ -248,7 +258,7 @@ def validate_multi_route_specs(specs: tuple[MultiRouteOpSpec, ...], sequence_dig
     for spec in specs:
         if not spec.name:
             raise ValueError("multi-route spec name must not be empty.")
-        if spec.kind not in ("add", "copy", "max"):
+        if spec.kind not in ("add", "copy", "max", "max_add", "add_max"):
             raise ValueError(f"unsupported multi-route op kind {spec.kind!r} for {spec.name}.")
         if not spec.operands:
             raise ValueError(f"multi-route op {spec.name} has no operands.")
@@ -264,6 +274,8 @@ def validate_multi_route_specs(specs: tuple[MultiRouteOpSpec, ...], sequence_dig
             raise ValueError(f"copy op {spec.name} must have exactly one operand.")
         if spec.kind in ("add", "max") and len(spec.operands) < 2:
             raise ValueError(f"{spec.kind} op {spec.name} must have at least two operands.")
+        if spec.kind in ("max_add", "add_max") and len(spec.operands) != 3:
+            raise ValueError(f"{spec.kind} op {spec.name} must have exactly three operands.")
 
 
 def multi_route_digit_features(digits: tuple[int, ...], num_digits: int) -> np.ndarray:
@@ -287,6 +299,12 @@ def multi_route_target(
         return int(values[0])
     if spec.kind == "max":
         return int(max(values))
+    if spec.kind == "max_add":
+        first, second, third = values
+        return int(max((first + second) % num_digits, third))
+    if spec.kind == "add_max":
+        first, second, third = values
+        return int((max(first, second) + third) % num_digits)
     raise ValueError(f"unsupported multi-route op kind {spec.kind!r}.")
 
 
@@ -684,6 +702,164 @@ def factorized_backward(
     return grads
 
 
+def validate_multi_route_model(model: MultiRouteFactorizedMLP) -> None:
+    if set(model.W_router) != set(model.b_router):
+        raise ValueError(
+            f"router weight names {sorted(model.W_router)} do not match "
+            f"router bias names {sorted(model.b_router)}."
+        )
+    if not model.W_router:
+        raise ValueError("multi-route model has no routers.")
+    hidden_dim = model.W_op.shape[0]
+    if model.W_op.shape != (hidden_dim, hidden_dim):
+        raise ValueError(f"W_op must be square, got {model.W_op.shape}.")
+    if model.b_op.shape != (hidden_dim,):
+        raise ValueError(f"b_op shape {model.b_op.shape} does not match hidden_dim={hidden_dim}.")
+    if model.W_out.shape[0] != hidden_dim:
+        raise ValueError(
+            f"W_out input dimension {model.W_out.shape[0]} does not match hidden_dim={hidden_dim}."
+        )
+    for name, W_router in model.W_router.items():
+        b_router = model.b_router[name]
+        if W_router.ndim != 2:
+            raise ValueError(f"router {name} W must be 2D, got {W_router.shape}.")
+        if W_router.shape[1] != hidden_dim:
+            raise ValueError(
+                f"router {name} hidden dimension {W_router.shape[1]} "
+                f"does not match shared hidden_dim={hidden_dim}."
+            )
+        if b_router.shape != (hidden_dim,):
+            raise ValueError(
+                f"router {name} bias shape {b_router.shape} does not match hidden_dim={hidden_dim}."
+            )
+
+
+def multi_route_forward(
+    model: MultiRouteFactorizedMLP,
+    digit_x: np.ndarray,
+    route_name: str,
+) -> tuple[np.ndarray, dict[str, np.ndarray | str]]:
+    validate_multi_route_model(model)
+    if route_name not in model.W_router:
+        raise ValueError(f"unknown route {route_name!r}; available={sorted(model.W_router)}.")
+    W_router = model.W_router[route_name]
+    b_router = model.b_router[route_name]
+    if digit_x.ndim != 2 or digit_x.shape[1] != W_router.shape[0]:
+        raise ValueError(
+            f"digit_x shape {digit_x.shape} does not match router input dimension "
+            f"{W_router.shape[0]} for route {route_name}."
+        )
+    route_z = digit_x @ W_router + b_router
+    route_h = np.maximum(route_z, 0.0)
+    op_z = route_h @ model.W_op + model.b_op
+    op_h = np.maximum(op_z, 0.0)
+    logits = op_h @ model.W_out + model.b_out
+    return logits, {
+        "digit_x": digit_x,
+        "route_z": route_z,
+        "route_h": route_h,
+        "op_z": op_z,
+        "op_h": op_h,
+        "logits": logits,
+        "route_name": route_name,
+    }
+
+
+def empty_multi_route_grads(model: MultiRouteFactorizedMLP) -> MultiRouteGrads:
+    validate_multi_route_model(model)
+    return MultiRouteGrads(
+        W_router={name: np.zeros_like(value) for name, value in model.W_router.items()},
+        b_router={name: np.zeros_like(value) for name, value in model.b_router.items()},
+        W_op=np.zeros_like(model.W_op),
+        b_op=np.zeros_like(model.b_op),
+        W_out=np.zeros_like(model.W_out),
+        b_out=np.zeros_like(model.b_out),
+    )
+
+
+def multi_route_backward(
+    model: MultiRouteFactorizedMLP,
+    cache: dict[str, np.ndarray | str],
+    dlogits: np.ndarray,
+) -> MultiRouteGrads:
+    route_name_raw = cache["route_name"]
+    if not isinstance(route_name_raw, str):
+        raise ValueError("multi-route cache route_name is not a string.")
+    route_name = route_name_raw
+    if route_name not in model.W_router:
+        raise ValueError(f"unknown route {route_name!r}; available={sorted(model.W_router)}.")
+
+    op_h = cache["op_h"]
+    op_z = cache["op_z"]
+    route_h = cache["route_h"]
+    route_z = cache["route_z"]
+    digit_x = cache["digit_x"]
+    if not all(isinstance(value, np.ndarray) for value in (op_h, op_z, route_h, route_z, digit_x)):
+        raise ValueError("multi-route cache contains non-array activation values.")
+    op_h = np.asarray(op_h)
+    op_z = np.asarray(op_z)
+    route_h = np.asarray(route_h)
+    route_z = np.asarray(route_z)
+    digit_x = np.asarray(digit_x)
+
+    grads = empty_multi_route_grads(model)
+    grads.W_out = op_h.T @ dlogits
+    grads.b_out = np.sum(dlogits, axis=0)
+    dop_h = dlogits @ model.W_out.T
+    dop_z = dop_h * (op_z > 0.0)
+    grads.W_op = route_h.T @ dop_z
+    grads.b_op = np.sum(dop_z, axis=0)
+    droute_h = dop_z @ model.W_op.T
+    droute_z = droute_h * (route_z > 0.0)
+    grads.W_router[route_name] = digit_x.T @ droute_z
+    grads.b_router[route_name] = np.sum(droute_z, axis=0)
+    return grads
+
+
+def multi_route_add_scaled_grads(
+    target: MultiRouteGrads,
+    source: MultiRouteGrads,
+    scale: float,
+) -> None:
+    if set(target.W_router) != set(source.W_router) or set(target.b_router) != set(source.b_router):
+        raise ValueError("multi-route gradient router keys do not match.")
+    for name in target.W_router:
+        if target.W_router[name].shape != source.W_router[name].shape:
+            raise ValueError(f"W_router gradient shape mismatch for route {name}.")
+        target.W_router[name] += scale * source.W_router[name]
+        target.b_router[name] += scale * source.b_router[name]
+    if target.W_op.shape != source.W_op.shape:
+        raise ValueError("W_op gradient shapes do not match.")
+    target.W_op += scale * source.W_op
+    target.b_op += scale * source.b_op
+    target.W_out += scale * source.W_out
+    target.b_out += scale * source.b_out
+
+
+def multi_route_apply_update(
+    model: MultiRouteFactorizedMLP,
+    grads: MultiRouteGrads,
+    learning_rate: float,
+    trainable_routes: tuple[str, ...],
+    train_shared: bool,
+) -> None:
+    if learning_rate <= 0.0:
+        raise ValueError(f"learning_rate must be positive, got {learning_rate}.")
+    unknown_routes = set(trainable_routes) - set(model.W_router)
+    if unknown_routes:
+        raise ValueError(f"unknown trainable routes: {sorted(unknown_routes)}.")
+    if set(grads.W_router) != set(model.W_router) or set(grads.b_router) != set(model.b_router):
+        raise ValueError("multi-route gradient keys do not match model routes.")
+    for route_name in trainable_routes:
+        model.W_router[route_name] -= learning_rate * grads.W_router[route_name]
+        model.b_router[route_name] -= learning_rate * grads.b_router[route_name]
+    if train_shared:
+        model.W_op -= learning_rate * grads.W_op
+        model.b_op -= learning_rate * grads.b_op
+        model.W_out -= learning_rate * grads.W_out
+        model.b_out -= learning_rate * grads.b_out
+
+
 def apply_update(
     model: TinyMLP,
     grads: dict[str, np.ndarray],
@@ -962,6 +1138,541 @@ def factorized_pair_alignment_metrics(
         ),
         "paired_op_cka": centered_linear_cka(op_left, op_right),
     }
+
+
+def multi_route_evaluate(
+    model: MultiRouteFactorizedMLP,
+    dataset: MultiRouteDataset,
+) -> tuple[float, float]:
+    logits, _ = multi_route_forward(model, dataset.digit_x, dataset.op_spec.name)
+    loss, _ = loss_and_grad_logits(logits, dataset.y)
+    accuracy = float(np.mean(np.argmax(logits, axis=1) == dataset.y))
+    return loss, accuracy
+
+
+def multi_route_loss_and_grads(
+    model: MultiRouteFactorizedMLP,
+    dataset: MultiRouteDataset,
+) -> tuple[float, MultiRouteGrads]:
+    logits, cache = multi_route_forward(model, dataset.digit_x, dataset.op_spec.name)
+    loss, dlogits = loss_and_grad_logits(logits, dataset.y)
+    return loss, multi_route_backward(model, cache, dlogits)
+
+
+def train_multi_route(
+    model: MultiRouteFactorizedMLP,
+    dataset: MultiRouteDataset,
+    train_config: TrainConfig,
+    label: str,
+    trainable_routes: tuple[str, ...],
+    train_shared: bool,
+) -> None:
+    if not trainable_routes and not train_shared:
+        raise ValueError("train_multi_route received no trainable parameters.")
+    for epoch in range(1, train_config.epochs + 1):
+        loss, grads = multi_route_loss_and_grads(model, dataset)
+        multi_route_apply_update(
+            model,
+            grads,
+            train_config.learning_rate,
+            trainable_routes,
+            train_shared,
+        )
+        if not train_config.quiet and (
+            epoch == 1 or epoch % train_config.log_every == 0 or epoch == train_config.epochs
+        ):
+            _, accuracy = multi_route_evaluate(model, dataset)
+            print(f"{label} epoch={epoch:04d} loss={loss:.4f} accuracy={accuracy:.3f}")
+
+
+def multi_route_alignment_loss_and_grads(
+    model: MultiRouteFactorizedMLP,
+    target_dataset: MultiRouteDataset,
+    analog_source_dataset: MultiRouteDataset,
+    alignment_weight: float,
+) -> tuple[float, float, float, MultiRouteGrads]:
+    if alignment_weight <= 0.0:
+        raise ValueError(f"alignment_weight must be positive, got {alignment_weight}.")
+    target_name = target_dataset.op_spec.name
+    source_name = analog_source_dataset.op_spec.name
+    if target_name == source_name:
+        raise ValueError("target and source routes must be different for alignment training.")
+    if not np.array_equal(target_dataset.y, analog_source_dataset.y):
+        raise ValueError("target and analog source targets must match row-by-row.")
+
+    logits, target_cache = multi_route_forward(model, target_dataset.digit_x, target_name)
+    _, source_cache = multi_route_forward(model, analog_source_dataset.digit_x, source_name)
+    ce_loss, dlogits = loss_and_grad_logits(logits, target_dataset.y)
+    grads = multi_route_backward(model, target_cache, dlogits)
+
+    target_op = target_cache["op_h"]
+    source_op = source_cache["op_h"]
+    target_op_z = target_cache["op_z"]
+    target_route_z = target_cache["route_z"]
+    target_digit_x = target_cache["digit_x"]
+    if not all(
+        isinstance(value, np.ndarray)
+        for value in (target_op, source_op, target_op_z, target_route_z, target_digit_x)
+    ):
+        raise ValueError("alignment cache contains non-array values.")
+    target_op = np.asarray(target_op)
+    source_op = np.asarray(source_op)
+    target_op_z = np.asarray(target_op_z)
+    target_route_z = np.asarray(target_route_z)
+    target_digit_x = np.asarray(target_digit_x)
+
+    diff = target_op - source_op
+    alignment_loss = float(np.mean(diff**2))
+    dop_h = alignment_weight * 2.0 * diff / diff.size
+    dop_z = dop_h * (target_op_z > 0.0)
+    droute_h = dop_z @ model.W_op.T
+    droute_z = droute_h * (target_route_z > 0.0)
+    grads.W_router[target_name] += target_digit_x.T @ droute_z
+    grads.b_router[target_name] += np.sum(droute_z, axis=0)
+    total_loss = ce_loss + alignment_weight * alignment_loss
+    return total_loss, ce_loss, alignment_loss, grads
+
+
+def train_multi_route_alignment(
+    model: MultiRouteFactorizedMLP,
+    target_dataset: MultiRouteDataset,
+    analog_source_dataset: MultiRouteDataset,
+    train_config: TrainConfig,
+    label: str,
+    alignment_weight: float,
+) -> None:
+    target_name = target_dataset.op_spec.name
+    for epoch in range(1, train_config.epochs + 1):
+        loss, ce_loss, alignment_loss, grads = multi_route_alignment_loss_and_grads(
+            model,
+            target_dataset,
+            analog_source_dataset,
+            alignment_weight,
+        )
+        multi_route_apply_update(
+            model,
+            grads,
+            train_config.learning_rate,
+            (target_name,),
+            train_shared=False,
+        )
+        if not train_config.quiet and (
+            epoch == 1 or epoch % train_config.log_every == 0 or epoch == train_config.epochs
+        ):
+            _, accuracy = multi_route_evaluate(model, target_dataset)
+            print(
+                f"{label} epoch={epoch:04d} loss={loss:.4f} "
+                f"ce={ce_loss:.4f} align={alignment_loss:.4f} accuracy={accuracy:.3f}"
+            )
+
+
+def multi_route_pair_alignment_metrics(
+    model: MultiRouteFactorizedMLP,
+    target_dataset: MultiRouteDataset,
+    analog_source_dataset: MultiRouteDataset,
+    num_digits: int,
+) -> dict[str, float]:
+    if not np.array_equal(target_dataset.y, analog_source_dataset.y):
+        raise ValueError("target and analog source targets must match row-by-row.")
+    _, target_cache = multi_route_forward(
+        model,
+        target_dataset.digit_x,
+        target_dataset.op_spec.name,
+    )
+    _, source_cache = multi_route_forward(
+        model,
+        analog_source_dataset.digit_x,
+        analog_source_dataset.op_spec.name,
+    )
+    target_route = target_cache["route_h"]
+    source_route = source_cache["route_h"]
+    target_op = target_cache["op_h"]
+    source_op = source_cache["op_h"]
+    if not all(isinstance(value, np.ndarray) for value in (target_route, source_route, target_op, source_op)):
+        raise ValueError("pair alignment cache contains non-array values.")
+    target_route = np.asarray(target_route)
+    source_route = np.asarray(source_route)
+    target_op = np.asarray(target_op)
+    source_op = np.asarray(source_op)
+    return {
+        "route_pair_mse": float(np.mean((target_route - source_route) ** 2)),
+        "op_pair_mse": float(np.mean((target_op - source_op) ** 2)),
+        "route_pair_cosine": mean_row_cosine(target_route, source_route),
+        "op_pair_cosine": mean_row_cosine(target_op, source_op),
+        "route_class_cosine": class_center_cosine(
+            target_route,
+            source_route,
+            target_dataset.y,
+            num_digits,
+        ),
+        "op_class_cosine": class_center_cosine(
+            target_op,
+            source_op,
+            target_dataset.y,
+            num_digits,
+        ),
+        "paired_op_cka": centered_linear_cka(target_op, source_op),
+    }
+
+
+def class_centers(
+    activations: np.ndarray,
+    labels: np.ndarray,
+    class_count: int,
+) -> np.ndarray:
+    if activations.ndim != 2:
+        raise ValueError(f"activations must be 2D, got {activations.shape}.")
+    if labels.shape != (activations.shape[0],):
+        raise ValueError(
+            f"labels shape {labels.shape} does not match row count {activations.shape[0]}."
+        )
+    if class_count <= 0:
+        raise ValueError(f"class_count must be positive, got {class_count}.")
+    centers = np.zeros((class_count, activations.shape[1]))
+    for class_id in range(class_count):
+        mask = labels == class_id
+        if not np.any(mask):
+            raise ValueError(f"class {class_id} has no examples.")
+        centers[class_id] = np.mean(activations[mask], axis=0)
+    return centers
+
+
+def mean_center_cosine(left_centers: np.ndarray, right_centers: np.ndarray) -> float:
+    if left_centers.shape != right_centers.shape:
+        raise ValueError(
+            f"center shapes must match, got {left_centers.shape} and {right_centers.shape}."
+        )
+    return float(
+        np.mean(
+            [
+                cosine(left_centers[class_id], right_centers[class_id])
+                for class_id in range(left_centers.shape[0])
+            ]
+        )
+    )
+
+
+def multi_route_op_cache(
+    model: MultiRouteFactorizedMLP,
+    dataset: MultiRouteDataset,
+) -> dict[str, np.ndarray | str]:
+    _, cache = multi_route_forward(model, dataset.digit_x, dataset.op_spec.name)
+    return cache
+
+
+def multi_route_op_h(
+    model: MultiRouteFactorizedMLP,
+    dataset: MultiRouteDataset,
+) -> np.ndarray:
+    cache = multi_route_op_cache(model, dataset)
+    op_h = cache["op_h"]
+    if not isinstance(op_h, np.ndarray):
+        raise ValueError("multi-route op_h cache value is not an array.")
+    return op_h
+
+
+def multi_route_class_center_alignment_metrics(
+    model: MultiRouteFactorizedMLP,
+    target_dataset: MultiRouteDataset,
+    source_dataset: MultiRouteDataset,
+    class_count: int,
+) -> dict[str, float]:
+    target_op = multi_route_op_h(model, target_dataset)
+    source_op = multi_route_op_h(model, source_dataset)
+    target_centers = class_centers(target_op, target_dataset.y, class_count)
+    source_centers = class_centers(source_op, source_dataset.y, class_count)
+    return {
+        "center_op_cosine": mean_center_cosine(target_centers, source_centers),
+        "center_op_mse": float(np.mean((target_centers - source_centers) ** 2)),
+        "center_op_cka": centered_linear_cka(target_centers, source_centers),
+    }
+
+
+def logits_from_multi_route_op_h(
+    model: MultiRouteFactorizedMLP,
+    op_h: np.ndarray,
+) -> np.ndarray:
+    if op_h.ndim != 2:
+        raise ValueError(f"op_h must be 2D, got shape {op_h.shape}.")
+    if op_h.shape[1] != model.W_out.shape[0]:
+        raise ValueError(
+            f"op_h dimension {op_h.shape[1]} does not match W_out input "
+            f"dimension {model.W_out.shape[0]}."
+        )
+    return op_h @ model.W_out + model.b_out
+
+
+def evaluate_logits(logits: np.ndarray, targets: np.ndarray) -> tuple[float, float]:
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be 2D, got shape {logits.shape}.")
+    if targets.shape != (logits.shape[0],):
+        raise ValueError(
+            f"target shape {targets.shape} does not match logits row count {logits.shape[0]}."
+        )
+    loss, _ = loss_and_grad_logits(logits, targets)
+    accuracy = float(np.mean(np.argmax(logits, axis=1) == targets))
+    return loss, accuracy
+
+
+def row_span_basis(matrix: np.ndarray) -> np.ndarray:
+    if matrix.ndim != 2:
+        raise ValueError(f"matrix must be 2D, got shape {matrix.shape}.")
+    _, singular_values, vh = np.linalg.svd(matrix, full_matrices=False)
+    rank = int(np.sum(singular_values > SCORE_EPSILON))
+    if rank <= 0:
+        raise ValueError("matrix row span has zero rank.")
+    return vh[:rank].T
+
+
+def multi_route_output_code_causal_metrics(
+    model: MultiRouteFactorizedMLP,
+    target_dataset: MultiRouteDataset,
+    source_dataset: MultiRouteDataset,
+    class_count: int,
+) -> dict[str, float]:
+    target_op = multi_route_op_h(model, target_dataset)
+    source_op = multi_route_op_h(model, source_dataset)
+    source_centers = class_centers(source_op, source_dataset.y, class_count)
+    center_by_label = source_centers[target_dataset.y]
+    basis = row_span_basis(source_centers)
+    target_projection = target_op @ basis @ basis.T
+
+    normal_loss, normal_accuracy = evaluate_logits(
+        logits_from_multi_route_op_h(model, target_op),
+        target_dataset.y,
+    )
+    center_patch_loss, center_patch_accuracy = evaluate_logits(
+        logits_from_multi_route_op_h(model, center_by_label),
+        target_dataset.y,
+    )
+    residual_only_loss, residual_only_accuracy = evaluate_logits(
+        logits_from_multi_route_op_h(model, target_op - center_by_label),
+        target_dataset.y,
+    )
+    subspace_only_loss, subspace_only_accuracy = evaluate_logits(
+        logits_from_multi_route_op_h(model, target_projection),
+        target_dataset.y,
+    )
+    subspace_removed_loss, subspace_removed_accuracy = evaluate_logits(
+        logits_from_multi_route_op_h(model, target_op - target_projection),
+        target_dataset.y,
+    )
+
+    return {
+        "normal_loss": normal_loss,
+        "normal_accuracy": normal_accuracy,
+        "center_patch_loss": center_patch_loss,
+        "center_patch_accuracy": center_patch_accuracy,
+        "residual_only_loss": residual_only_loss,
+        "residual_only_accuracy": residual_only_accuracy,
+        "subspace_only_loss": subspace_only_loss,
+        "subspace_only_accuracy": subspace_only_accuracy,
+        "subspace_removed_loss": subspace_removed_loss,
+        "subspace_removed_accuracy": subspace_removed_accuracy,
+        "center_patch_accuracy_delta": center_patch_accuracy - normal_accuracy,
+        "subspace_only_accuracy_delta": subspace_only_accuracy - normal_accuracy,
+        "subspace_removed_accuracy_drop": normal_accuracy - subspace_removed_accuracy,
+        "residual_only_accuracy_drop": normal_accuracy - residual_only_accuracy,
+        "center_patch_loss_delta": center_patch_loss - normal_loss,
+        "subspace_removed_loss_delta": subspace_removed_loss - normal_loss,
+    }
+
+
+def logits_from_multi_route_route_h(
+    model: MultiRouteFactorizedMLP,
+    route_h: np.ndarray,
+) -> np.ndarray:
+    if route_h.ndim != 2:
+        raise ValueError(f"route_h must be 2D, got shape {route_h.shape}.")
+    if route_h.shape[1] != model.W_op.shape[0]:
+        raise ValueError(
+            f"route_h dimension {route_h.shape[1]} does not match W_op input "
+            f"dimension {model.W_op.shape[0]}."
+        )
+    op_h = np.maximum(route_h @ model.W_op + model.b_op, 0.0)
+    return logits_from_multi_route_op_h(model, op_h)
+
+
+def digit_one_hot(values: np.ndarray, class_count: int) -> np.ndarray:
+    if values.ndim != 1:
+        raise ValueError(f"digit values must be 1D, got shape {values.shape}.")
+    if class_count <= 0:
+        raise ValueError(f"class_count must be positive, got {class_count}.")
+    if np.any(values < 0) or np.any(values >= class_count):
+        raise ValueError(f"digit values are outside [0, {class_count}).")
+    one_hot = np.zeros((values.shape[0], class_count))
+    one_hot[np.arange(values.shape[0]), values.astype(int)] = 1.0
+    return one_hot
+
+
+def ridge_linear_predict(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    eval_x: np.ndarray,
+    ridge: float,
+) -> np.ndarray:
+    if train_x.ndim != 2 or eval_x.ndim != 2:
+        raise ValueError(
+            f"ridge inputs must be 2D, got train_x={train_x.shape}, eval_x={eval_x.shape}."
+        )
+    if train_y.ndim != 2:
+        raise ValueError(f"ridge target must be 2D, got train_y={train_y.shape}.")
+    if train_x.shape[0] != train_y.shape[0]:
+        raise ValueError(
+            f"train_x row count {train_x.shape[0]} does not match train_y "
+            f"row count {train_y.shape[0]}."
+        )
+    if train_x.shape[1] != eval_x.shape[1]:
+        raise ValueError(
+            f"train/eval feature dimensions differ: {train_x.shape[1]} vs {eval_x.shape[1]}."
+        )
+    if ridge <= 0.0:
+        raise ValueError(f"ridge must be positive, got {ridge}.")
+    train_aug = np.concatenate([train_x, np.ones((train_x.shape[0], 1))], axis=1)
+    eval_aug = np.concatenate([eval_x, np.ones((eval_x.shape[0], 1))], axis=1)
+    penalty = ridge * np.eye(train_aug.shape[1])
+    penalty[-1, -1] = 0.0
+    weights = np.linalg.solve(train_aug.T @ train_aug + penalty, train_aug.T @ train_y)
+    return eval_aug @ weights
+
+
+def split_indices(count: int, train_fraction: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    if count <= 1:
+        raise ValueError(f"count must be greater than one, got {count}.")
+    if not 0.0 < train_fraction < 1.0:
+        raise ValueError(f"train_fraction must be in (0, 1), got {train_fraction}.")
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(count)
+    train_count = int(round(count * train_fraction))
+    if train_count <= 0 or train_count >= count:
+        raise ValueError(
+            f"train split produced train_count={train_count} for count={count}."
+        )
+    return order[:train_count], order[train_count:]
+
+
+def multi_route_analog_causal_metrics(
+    model: MultiRouteFactorizedMLP,
+    target_dataset: MultiRouteDataset,
+    analog_source_dataset: MultiRouteDataset,
+) -> dict[str, float]:
+    if not np.array_equal(target_dataset.y, analog_source_dataset.y):
+        raise ValueError("target and analog source targets must match row-by-row.")
+    target_op = multi_route_op_h(model, target_dataset)
+    analog_op = multi_route_op_h(model, analog_source_dataset)
+    normal_loss, normal_accuracy = evaluate_logits(
+        logits_from_multi_route_op_h(model, target_op),
+        target_dataset.y,
+    )
+    analog_patch_loss, analog_patch_accuracy = evaluate_logits(
+        logits_from_multi_route_op_h(model, analog_op),
+        target_dataset.y,
+    )
+    return {
+        "normal_loss": normal_loss,
+        "normal_accuracy": normal_accuracy,
+        "analog_patch_loss": analog_patch_loss,
+        "analog_patch_accuracy": analog_patch_accuracy,
+        "analog_patch_accuracy_delta": analog_patch_accuracy - normal_accuracy,
+        "analog_patch_loss_delta": analog_patch_loss - normal_loss,
+    }
+
+
+def multi_route_class_center_alignment_loss_and_grads(
+    model: MultiRouteFactorizedMLP,
+    target_dataset: MultiRouteDataset,
+    source_dataset: MultiRouteDataset,
+    class_count: int,
+    alignment_weight: float,
+) -> tuple[float, float, float, MultiRouteGrads]:
+    if target_dataset.op_spec.name == source_dataset.op_spec.name:
+        raise ValueError("target and source routes must be different for class-center alignment.")
+    if alignment_weight <= 0.0:
+        raise ValueError(f"alignment_weight must be positive, got {alignment_weight}.")
+    source_op = multi_route_op_h(model, source_dataset)
+    source_centers = class_centers(source_op, source_dataset.y, class_count)
+
+    target_name = target_dataset.op_spec.name
+    logits, target_cache = multi_route_forward(model, target_dataset.digit_x, target_name)
+    ce_loss, dlogits = loss_and_grad_logits(logits, target_dataset.y)
+    grads = multi_route_backward(model, target_cache, dlogits)
+
+    target_op = target_cache["op_h"]
+    target_op_z = target_cache["op_z"]
+    target_route_z = target_cache["route_z"]
+    target_digit_x = target_cache["digit_x"]
+    if not all(
+        isinstance(value, np.ndarray)
+        for value in (target_op, target_op_z, target_route_z, target_digit_x)
+    ):
+        raise ValueError("class-center alignment cache contains non-array values.")
+    target_op = np.asarray(target_op)
+    target_op_z = np.asarray(target_op_z)
+    target_route_z = np.asarray(target_route_z)
+    target_digit_x = np.asarray(target_digit_x)
+
+    target_centers = source_centers[target_dataset.y]
+    diff = target_op - target_centers
+    alignment_loss = float(np.mean(diff**2))
+    dop_h = alignment_weight * 2.0 * diff / diff.size
+    dop_z = dop_h * (target_op_z > 0.0)
+    droute_h = dop_z @ model.W_op.T
+    droute_z = droute_h * (target_route_z > 0.0)
+    grads.W_router[target_name] += target_digit_x.T @ droute_z
+    grads.b_router[target_name] += np.sum(droute_z, axis=0)
+    total_loss = ce_loss + alignment_weight * alignment_loss
+    return total_loss, ce_loss, alignment_loss, grads
+
+
+def train_multi_route_class_center_alignment(
+    model: MultiRouteFactorizedMLP,
+    target_dataset: MultiRouteDataset,
+    source_dataset: MultiRouteDataset,
+    train_config: TrainConfig,
+    label: str,
+    class_count: int,
+    alignment_weight: float,
+) -> None:
+    target_name = target_dataset.op_spec.name
+    for epoch in range(1, train_config.epochs + 1):
+        loss, ce_loss, alignment_loss, grads = (
+            multi_route_class_center_alignment_loss_and_grads(
+                model,
+                target_dataset,
+                source_dataset,
+                class_count,
+                alignment_weight,
+            )
+        )
+        multi_route_apply_update(
+            model,
+            grads,
+            train_config.learning_rate,
+            (target_name,),
+            train_shared=False,
+        )
+        if not train_config.quiet and (
+            epoch == 1 or epoch % train_config.log_every == 0 or epoch == train_config.epochs
+        ):
+            _, accuracy = multi_route_evaluate(model, target_dataset)
+            print(
+                f"{label} epoch={epoch:04d} loss={loss:.4f} "
+                f"ce={ce_loss:.4f} align={alignment_loss:.4f} accuracy={accuracy:.3f}"
+            )
+
+
+def multi_route_shared_gradient_norm(
+    model: MultiRouteFactorizedMLP,
+    dataset: MultiRouteDataset,
+) -> float:
+    _, grads = multi_route_loss_and_grads(model, dataset)
+    total = (
+        float(np.sum(grads.W_op**2))
+        + float(np.sum(grads.b_op**2))
+        + float(np.sum(grads.W_out**2))
+        + float(np.sum(grads.b_out**2))
+    )
+    return float(np.sqrt(total))
 
 
 def activation_subspace_basis(
@@ -4053,6 +4764,1470 @@ def run_factorized_consolidation_stress_table(
     return metrics
 
 
+def multi_route_addition_metrics(
+    seed: int,
+    hidden_dim: int,
+    alignment_weight: float,
+    verbose: bool,
+) -> dict[str, dict[str, float]]:
+    if hidden_dim <= 0:
+        raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
+    if alignment_weight <= 0.0:
+        raise ValueError(f"alignment_weight must be positive, got {alignment_weight}.")
+
+    config = OpsConfig(seed=seed, hidden_dim=hidden_dim)
+    specs = DEFAULT_MULTI_ROUTE_ADDITION_SPECS
+    validate_multi_route_specs(specs, config.sequence_digits)
+    spec_by_name = {spec.name: spec for spec in specs}
+    if DEFAULT_MULTI_ROUTE_BASE_NAME not in spec_by_name:
+        raise ValueError(
+            f"base route {DEFAULT_MULTI_ROUTE_BASE_NAME!r} missing from specs "
+            f"{sorted(spec_by_name)}."
+        )
+    base_spec = spec_by_name[DEFAULT_MULTI_ROUTE_BASE_NAME]
+    datasets = {
+        spec.name: make_multi_route_dataset(
+            spec,
+            config.num_digits,
+            config.sequence_digits,
+        )
+        for spec in specs
+    }
+    analogs = {
+        spec.name: analogous_multi_route_dataset(
+            base_spec,
+            datasets[spec.name],
+            config.num_digits,
+            config.sequence_digits,
+        )
+        for spec in specs
+        if spec.name != base_spec.name
+    }
+    base_train, new_train, _, _, _ = build_train_configs(verbose)
+    model = make_multi_route_factorized_model(
+        specs,
+        config.num_digits,
+        config.sequence_digits,
+        hidden_dim,
+        seed,
+    )
+    train_multi_route(
+        model,
+        datasets[base_spec.name],
+        base_train,
+        label="multi_route_base",
+        trainable_routes=(base_spec.name,),
+        train_shared=True,
+    )
+
+    for spec in specs:
+        if spec.name == base_spec.name:
+            continue
+        train_multi_route_alignment(
+            model,
+            datasets[spec.name],
+            analogs[spec.name],
+            new_train,
+            label=f"multi_route_align_{spec.name}",
+            alignment_weight=alignment_weight,
+        )
+
+    route_metrics: dict[str, float] = {}
+    for spec in specs:
+        loss, accuracy = multi_route_evaluate(model, datasets[spec.name])
+        route_metrics[f"{spec.name}_loss"] = loss
+        route_metrics[f"{spec.name}_accuracy"] = accuracy
+        route_metrics[f"{spec.name}_shared_gradient_norm"] = multi_route_shared_gradient_norm(
+            model,
+            datasets[spec.name],
+        )
+
+    alignment_metrics: dict[str, float] = {}
+    for spec in specs:
+        if spec.name == base_spec.name:
+            continue
+        pair_metrics = multi_route_pair_alignment_metrics(
+            model,
+            datasets[spec.name],
+            analogs[spec.name],
+            config.num_digits,
+        )
+        for metric_name, value in pair_metrics.items():
+            alignment_metrics[f"{spec.name}_{metric_name}"] = value
+        causal_metrics = multi_route_analog_causal_metrics(
+            model,
+            datasets[spec.name],
+            analogs[spec.name],
+        )
+        for metric_name, value in causal_metrics.items():
+            alignment_metrics[f"{spec.name}_{metric_name}"] = value
+
+    return {
+        "route": route_metrics,
+        "alignment": alignment_metrics,
+    }
+
+
+def run_multi_route_addition_table(
+    seed: int,
+    hidden_dim: int,
+    alignment_weight: float,
+    verbose: bool,
+) -> dict[str, dict[str, float]]:
+    print("\nMulti-route aligned addition test")
+    metrics = multi_route_addition_metrics(seed, hidden_dim, alignment_weight, verbose)
+    specs = DEFAULT_MULTI_ROUTE_ADDITION_SPECS
+    print("route  accuracy  loss      shared_g")
+    for spec in specs:
+        print(
+            f"{spec.name:<6} "
+            f"{metrics['route'][f'{spec.name}_accuracy']:>8.3f} "
+            f"{metrics['route'][f'{spec.name}_loss']:>8.4f} "
+            f"{metrics['route'][f'{spec.name}_shared_gradient_norm']:>9.6f}"
+        )
+    print("target  op_cos   op_class  paired_cka  op_mse  analog_patch_acc")
+    for spec in specs:
+        if spec.name == DEFAULT_MULTI_ROUTE_BASE_NAME:
+            continue
+        print(
+            f"{spec.name:<7} "
+            f"{metrics['alignment'][f'{spec.name}_op_pair_cosine']:>7.3f} "
+            f"{metrics['alignment'][f'{spec.name}_op_class_cosine']:>8.3f} "
+            f"{metrics['alignment'][f'{spec.name}_paired_op_cka']:>10.3f} "
+            f"{metrics['alignment'][f'{spec.name}_op_pair_mse']:>7.4f} "
+            f"{metrics['alignment'][f'{spec.name}_analog_patch_accuracy']:>16.3f}"
+        )
+    return metrics
+
+
+def print_multi_route_addition_summary(results: list[dict[str, object]]) -> None:
+    print("\nMulti-route aligned addition summary: mean +/- std")
+    print(f"seeds={[result['seed'] for result in results]}")
+    specs = DEFAULT_MULTI_ROUTE_ADDITION_SPECS
+    print("\nRoute behavior")
+    print("route  accuracy       loss           shared_g")
+    for spec in specs:
+        accuracy_values = [
+            result["multi_route"]["route"][f"{spec.name}_accuracy"]  # type: ignore[index]
+            for result in results
+        ]
+        loss_values = [
+            result["multi_route"]["route"][f"{spec.name}_loss"]  # type: ignore[index]
+            for result in results
+        ]
+        gradient_values = [
+            result["multi_route"]["route"][f"{spec.name}_shared_gradient_norm"]  # type: ignore[index]
+            for result in results
+        ]
+        acc_mean, acc_std = mean_std(accuracy_values)
+        loss_mean, loss_std = mean_std(loss_values)
+        grad_mean, grad_std = mean_std(gradient_values)
+        print(
+            f"{spec.name:<6} "
+            f"{acc_mean:.3f}+/-{acc_std:.3f}  "
+            f"{loss_mean:.5f}+/-{loss_std:.5f}  "
+            f"{grad_mean:.6f}+/-{grad_std:.6f}"
+        )
+
+    print("\nAlignment to base route")
+    print("target  op_cos        op_class      paired_cka    op_mse        analog_patch")
+    for spec in specs:
+        if spec.name == DEFAULT_MULTI_ROUTE_BASE_NAME:
+            continue
+        op_cos_values = [
+            result["multi_route"]["alignment"][f"{spec.name}_op_pair_cosine"]  # type: ignore[index]
+            for result in results
+        ]
+        class_cos_values = [
+            result["multi_route"]["alignment"][f"{spec.name}_op_class_cosine"]  # type: ignore[index]
+            for result in results
+        ]
+        cka_values = [
+            result["multi_route"]["alignment"][f"{spec.name}_paired_op_cka"]  # type: ignore[index]
+            for result in results
+        ]
+        mse_values = [
+            result["multi_route"]["alignment"][f"{spec.name}_op_pair_mse"]  # type: ignore[index]
+            for result in results
+        ]
+        analog_patch_values = [
+            result["multi_route"]["alignment"][f"{spec.name}_analog_patch_accuracy"]  # type: ignore[index]
+            for result in results
+        ]
+        op_mean, op_std = mean_std(op_cos_values)
+        class_mean, class_std = mean_std(class_cos_values)
+        cka_mean, cka_std = mean_std(cka_values)
+        mse_mean, mse_std = mean_std(mse_values)
+        patch_mean, patch_std = mean_std(analog_patch_values)
+        print(
+            f"{spec.name:<7} "
+            f"{op_mean:.3f}+/-{op_std:.3f}  "
+            f"{class_mean:.3f}+/-{class_std:.3f}  "
+            f"{cka_mean:.3f}+/-{cka_std:.3f}  "
+            f"{mse_mean:.5f}+/-{mse_std:.5f}  "
+            f"{patch_mean:.3f}+/-{patch_std:.3f}"
+        )
+
+
+def run_multi_route_addition_multi_seed(
+    seed_count: int,
+    hidden_dim: int,
+    alignment_weight: float,
+) -> None:
+    results: list[dict[str, object]] = []
+    for seed in range(seed_count):
+        print(f"running_seed={seed}")
+        metrics = multi_route_addition_metrics(
+            seed,
+            hidden_dim,
+            alignment_weight,
+            verbose=False,
+        )
+        results.append({"seed": seed, "multi_route": metrics})
+    print_multi_route_addition_summary(results)
+
+
+def build_multi_route_add_family_model(
+    seed: int,
+    hidden_dim: int,
+    alignment_weight: float,
+    extra_specs: tuple[MultiRouteOpSpec, ...],
+    verbose: bool,
+) -> tuple[
+    OpsConfig,
+    MultiRouteFactorizedMLP,
+    tuple[MultiRouteOpSpec, ...],
+    dict[str, MultiRouteDataset],
+]:
+    if hidden_dim <= 0:
+        raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
+    if alignment_weight <= 0.0:
+        raise ValueError(f"alignment_weight must be positive, got {alignment_weight}.")
+    config = OpsConfig(seed=seed, hidden_dim=hidden_dim)
+    addition_specs = DEFAULT_MULTI_ROUTE_ADDITION_SPECS
+    all_specs = addition_specs + extra_specs
+    validate_multi_route_specs(all_specs, config.sequence_digits)
+    spec_by_name = {spec.name: spec for spec in all_specs}
+    if DEFAULT_MULTI_ROUTE_BASE_NAME not in spec_by_name:
+        raise ValueError(f"missing base route {DEFAULT_MULTI_ROUTE_BASE_NAME!r}.")
+    base_spec = spec_by_name[DEFAULT_MULTI_ROUTE_BASE_NAME]
+    datasets = {
+        spec.name: make_multi_route_dataset(
+            spec,
+            config.num_digits,
+            config.sequence_digits,
+        )
+        for spec in all_specs
+    }
+    model = make_multi_route_factorized_model(
+        all_specs,
+        config.num_digits,
+        config.sequence_digits,
+        hidden_dim,
+        seed,
+    )
+    base_train, new_train, _, _, _ = build_train_configs(verbose)
+    train_multi_route(
+        model,
+        datasets[base_spec.name],
+        base_train,
+        label="multi_route_non_analog_base",
+        trainable_routes=(base_spec.name,),
+        train_shared=True,
+    )
+    for spec in addition_specs:
+        if spec.name == base_spec.name:
+            continue
+        analog = analogous_multi_route_dataset(
+            base_spec,
+            datasets[spec.name],
+            config.num_digits,
+            config.sequence_digits,
+        )
+        train_multi_route_alignment(
+            model,
+            datasets[spec.name],
+            analog,
+            new_train,
+            label=f"multi_route_non_analog_align_{spec.name}",
+            alignment_weight=alignment_weight,
+        )
+    return config, model, all_specs, datasets
+
+
+def evaluate_multi_route_add_family(
+    model: MultiRouteFactorizedMLP,
+    datasets: dict[str, MultiRouteDataset],
+) -> dict[str, float]:
+    add_values: dict[str, float] = {}
+    accuracies: list[float] = []
+    for spec in DEFAULT_MULTI_ROUTE_ADDITION_SPECS:
+        loss, accuracy = multi_route_evaluate(model, datasets[spec.name])
+        add_values[f"{spec.name}_loss"] = loss
+        add_values[f"{spec.name}_accuracy"] = accuracy
+        accuracies.append(accuracy)
+    add_values["add_family_min_accuracy"] = float(np.min(accuracies))
+    add_values["add_family_mean_accuracy"] = float(np.mean(accuracies))
+    return add_values
+
+
+def multi_route_non_analog_metrics(
+    seed: int,
+    hidden_dim: int,
+    alignment_weight: float,
+    verbose: bool,
+) -> dict[str, dict[str, float]]:
+    (
+        config,
+        add_family_model,
+        _,
+        datasets,
+    ) = build_multi_route_add_family_model(
+        seed,
+        hidden_dim,
+        alignment_weight,
+        DEFAULT_MULTI_ROUTE_NON_ANALOG_SPECS,
+        verbose,
+    )
+    _, new_train, _, _, _ = build_train_configs(verbose)
+    source_dataset = datasets[DEFAULT_MULTI_ROUTE_BASE_NAME]
+    results: dict[str, dict[str, float]] = {}
+    for target_spec in DEFAULT_MULTI_ROUTE_NON_ANALOG_SPECS:
+        target_dataset = datasets[target_spec.name]
+
+        ce_model = clone_multi_route_factorized_model(add_family_model)
+        train_multi_route(
+            ce_model,
+            target_dataset,
+            new_train,
+            label=f"multi_route_non_analog_ce_{target_spec.name}",
+            trainable_routes=(target_spec.name,),
+            train_shared=False,
+        )
+        ce_loss, ce_accuracy = multi_route_evaluate(ce_model, target_dataset)
+        ce_center = multi_route_class_center_alignment_metrics(
+            ce_model,
+            target_dataset,
+            source_dataset,
+            config.num_digits,
+        )
+        ce_causal = multi_route_output_code_causal_metrics(
+            ce_model,
+            target_dataset,
+            source_dataset,
+            config.num_digits,
+        )
+        results[f"{target_spec.name}_ce_only"] = {
+            **evaluate_multi_route_add_family(ce_model, datasets),
+            "target_loss": ce_loss,
+            "target_accuracy": ce_accuracy,
+            "target_shared_gradient_norm": multi_route_shared_gradient_norm(
+                ce_model,
+                target_dataset,
+            ),
+            **ce_center,
+            **ce_causal,
+        }
+
+        aligned_model = clone_multi_route_factorized_model(add_family_model)
+        train_multi_route_class_center_alignment(
+            aligned_model,
+            target_dataset,
+            source_dataset,
+            new_train,
+            label=f"multi_route_non_analog_class_align_{target_spec.name}",
+            class_count=config.num_digits,
+            alignment_weight=alignment_weight,
+        )
+        aligned_loss, aligned_accuracy = multi_route_evaluate(aligned_model, target_dataset)
+        aligned_center = multi_route_class_center_alignment_metrics(
+            aligned_model,
+            target_dataset,
+            source_dataset,
+            config.num_digits,
+        )
+        aligned_causal = multi_route_output_code_causal_metrics(
+            aligned_model,
+            target_dataset,
+            source_dataset,
+            config.num_digits,
+        )
+        results[f"{target_spec.name}_class_align"] = {
+            **evaluate_multi_route_add_family(aligned_model, datasets),
+            "target_loss": aligned_loss,
+            "target_accuracy": aligned_accuracy,
+            "target_shared_gradient_norm": multi_route_shared_gradient_norm(
+                aligned_model,
+                target_dataset,
+            ),
+            **aligned_center,
+            **aligned_causal,
+        }
+    return results
+
+
+def route_family_admission_metrics(
+    non_analog_metrics: dict[str, dict[str, float]],
+) -> dict[str, dict[str, float]]:
+    admission: dict[str, dict[str, float]] = {}
+    for target_spec in DEFAULT_MULTI_ROUTE_NON_ANALOG_SPECS:
+        ce_key = f"{target_spec.name}_ce_only"
+        align_key = f"{target_spec.name}_class_align"
+        if ce_key not in non_analog_metrics or align_key not in non_analog_metrics:
+            raise ValueError(
+                f"missing CE/alignment metrics for route {target_spec.name}: "
+                f"needed {ce_key!r} and {align_key!r}."
+            )
+        ce_values = non_analog_metrics[ce_key]
+        align_values = non_analog_metrics[align_key]
+        ce_shared_gradient = ce_values["target_shared_gradient_norm"]
+        align_shared_gradient = align_values["target_shared_gradient_norm"]
+        if ce_shared_gradient <= 0.0:
+            raise ValueError(
+                f"CE-only shared-gradient norm for {target_spec.name} is non-positive."
+            )
+
+        target_accuracy_delta = (
+            align_values["target_accuracy"] - ce_values["target_accuracy"]
+        )
+        add_family_min_accuracy_delta = (
+            align_values["add_family_min_accuracy"]
+            - ce_values["add_family_min_accuracy"]
+        )
+        target_loss_delta = align_values["target_loss"] - ce_values["target_loss"]
+        shared_gradient_norm_delta = align_shared_gradient - ce_shared_gradient
+        shared_gradient_norm_ratio = align_shared_gradient / ce_shared_gradient
+        center_cosine_delta = (
+            align_values["center_op_cosine"] - ce_values["center_op_cosine"]
+        )
+        center_cka_delta = align_values["center_op_cka"] - ce_values["center_op_cka"]
+        center_mse_delta = align_values["center_op_mse"] - ce_values["center_op_mse"]
+        center_patch_accuracy_delta = (
+            align_values["center_patch_accuracy"] - ce_values["center_patch_accuracy"]
+        )
+        subspace_removed_drop_delta = (
+            align_values["subspace_removed_accuracy_drop"]
+            - ce_values["subspace_removed_accuracy_drop"]
+        )
+        residual_only_drop_delta = (
+            align_values["residual_only_accuracy_drop"]
+            - ce_values["residual_only_accuracy_drop"]
+        )
+
+        behavior_pressure_margin = target_accuracy_delta - np.log(
+            shared_gradient_norm_ratio
+        )
+        geometry_gain = center_cosine_delta + center_cka_delta - center_mse_delta
+        false_alignment_gap = geometry_gain - behavior_pressure_margin
+
+        admission[target_spec.name] = {
+            "target_accuracy_delta": target_accuracy_delta,
+            "add_family_min_accuracy_delta": add_family_min_accuracy_delta,
+            "target_loss_delta": target_loss_delta,
+            "shared_gradient_norm_delta": shared_gradient_norm_delta,
+            "shared_gradient_norm_ratio": shared_gradient_norm_ratio,
+            "center_cosine_delta": center_cosine_delta,
+            "center_cka_delta": center_cka_delta,
+            "center_mse_delta": center_mse_delta,
+            "center_patch_accuracy_delta": center_patch_accuracy_delta,
+            "subspace_removed_drop_delta": subspace_removed_drop_delta,
+            "residual_only_drop_delta": residual_only_drop_delta,
+            "behavior_pressure_margin": behavior_pressure_margin,
+            "geometry_gain": geometry_gain,
+            "false_alignment_gap": false_alignment_gap,
+        }
+    return admission
+
+
+def run_multi_route_non_analog_table(
+    seed: int,
+    hidden_dim: int,
+    alignment_weight: float,
+    verbose: bool,
+) -> dict[str, dict[str, float]]:
+    print("\nMulti-route non-analog routing test")
+    metrics = multi_route_non_analog_metrics(seed, hidden_dim, alignment_weight, verbose)
+    print(
+        "variant                target_acc  add_min  target_loss  shared_g   "
+        "center_cos  center_cka  center_mse"
+    )
+    for variant_name, values in metrics.items():
+        print(
+            f"{variant_name:<22} "
+            f"{values['target_accuracy']:>10.3f} "
+            f"{values['add_family_min_accuracy']:>8.3f} "
+            f"{values['target_loss']:>11.4f} "
+            f"{values['target_shared_gradient_norm']:>9.6f} "
+            f"{values['center_op_cosine']:>10.3f} "
+            f"{values['center_op_cka']:>10.3f} "
+            f"{values['center_op_mse']:>10.4f}"
+        )
+    print(
+        "\nCausal output-code probes "
+        "(center/subspace accuracies use ADD01 class-code interventions)"
+    )
+    print(
+        "variant                center_patch  subspace_only  subspace_removed  "
+        "residual_only  removed_drop"
+    )
+    for variant_name, values in metrics.items():
+        print(
+            f"{variant_name:<22} "
+            f"{values['center_patch_accuracy']:>12.3f} "
+            f"{values['subspace_only_accuracy']:>13.3f} "
+            f"{values['subspace_removed_accuracy']:>16.3f} "
+            f"{values['residual_only_accuracy']:>13.3f} "
+            f"{values['subspace_removed_accuracy_drop']:>12.3f}"
+        )
+    admission = route_family_admission_metrics(metrics)
+    print(
+        "\nRoute-family admission comparison "
+        "(class-align minus CE-only; pressure ratio > 1 means more pressure)"
+    )
+    print(
+        "target  acc_delta  add_delta  loss_delta  shared_g_ratio  "
+        "cos_delta  cka_delta  mse_delta  patch_delta  rm_drop_delta  "
+        "bp_margin  false_gap"
+    )
+    for target_name, values in admission.items():
+        print(
+            f"{target_name:<7} "
+            f"{values['target_accuracy_delta']:>9.3f} "
+            f"{values['add_family_min_accuracy_delta']:>9.3f} "
+            f"{values['target_loss_delta']:>10.5f} "
+            f"{values['shared_gradient_norm_ratio']:>15.3f} "
+            f"{values['center_cosine_delta']:>10.3f} "
+            f"{values['center_cka_delta']:>10.3f} "
+            f"{values['center_mse_delta']:>9.5f} "
+            f"{values['center_patch_accuracy_delta']:>11.3f} "
+            f"{values['subspace_removed_drop_delta']:>13.3f} "
+            f"{values['behavior_pressure_margin']:>9.3f} "
+            f"{values['false_alignment_gap']:>9.3f}"
+        )
+    return metrics
+
+
+def print_multi_route_non_analog_summary(results: list[dict[str, object]]) -> None:
+    print("\nMulti-route non-analog routing summary: mean +/- std")
+    print(f"seeds={[result['seed'] for result in results]}")
+    print(
+        "variant                target_acc     add_min        target_loss    shared_g      "
+        "center_cos    center_cka    center_mse"
+    )
+    variant_names = tuple(results[0]["non_analog"].keys())  # type: ignore[union-attr]
+    for variant_name in variant_names:
+        target_acc_values = [
+            result["non_analog"][variant_name]["target_accuracy"]  # type: ignore[index]
+            for result in results
+        ]
+        add_min_values = [
+            result["non_analog"][variant_name]["add_family_min_accuracy"]  # type: ignore[index]
+            for result in results
+        ]
+        loss_values = [
+            result["non_analog"][variant_name]["target_loss"]  # type: ignore[index]
+            for result in results
+        ]
+        gradient_values = [
+            result["non_analog"][variant_name]["target_shared_gradient_norm"]  # type: ignore[index]
+            for result in results
+        ]
+        center_cos_values = [
+            result["non_analog"][variant_name]["center_op_cosine"]  # type: ignore[index]
+            for result in results
+        ]
+        center_cka_values = [
+            result["non_analog"][variant_name]["center_op_cka"]  # type: ignore[index]
+            for result in results
+        ]
+        center_mse_values = [
+            result["non_analog"][variant_name]["center_op_mse"]  # type: ignore[index]
+            for result in results
+        ]
+        target_mean, target_std = mean_std(target_acc_values)
+        add_mean, add_std = mean_std(add_min_values)
+        loss_mean, loss_std = mean_std(loss_values)
+        grad_mean, grad_std = mean_std(gradient_values)
+        cos_mean, cos_std = mean_std(center_cos_values)
+        cka_mean, cka_std = mean_std(center_cka_values)
+        mse_mean, mse_std = mean_std(center_mse_values)
+        print(
+            f"{variant_name:<22} "
+            f"{target_mean:.3f}+/-{target_std:.3f}  "
+            f"{add_mean:.3f}+/-{add_std:.3f}  "
+            f"{loss_mean:.5f}+/-{loss_std:.5f}  "
+            f"{grad_mean:.6f}+/-{grad_std:.6f}  "
+            f"{cos_mean:.3f}+/-{cos_std:.3f}  "
+            f"{cka_mean:.3f}+/-{cka_std:.3f}  "
+            f"{mse_mean:.5f}+/-{mse_std:.5f}"
+        )
+
+    print("\nCausal output-code probes: mean +/- std")
+    print(
+        "variant                center_patch  subspace_only  subspace_removed  "
+        "residual_only  removed_drop"
+    )
+    for variant_name in variant_names:
+        center_patch_values = [
+            result["non_analog"][variant_name]["center_patch_accuracy"]  # type: ignore[index]
+            for result in results
+        ]
+        subspace_only_values = [
+            result["non_analog"][variant_name]["subspace_only_accuracy"]  # type: ignore[index]
+            for result in results
+        ]
+        subspace_removed_values = [
+            result["non_analog"][variant_name]["subspace_removed_accuracy"]  # type: ignore[index]
+            for result in results
+        ]
+        residual_only_values = [
+            result["non_analog"][variant_name]["residual_only_accuracy"]  # type: ignore[index]
+            for result in results
+        ]
+        removed_drop_values = [
+            result["non_analog"][variant_name]["subspace_removed_accuracy_drop"]  # type: ignore[index]
+            for result in results
+        ]
+        center_mean, center_std = mean_std(center_patch_values)
+        subspace_mean, subspace_std = mean_std(subspace_only_values)
+        removed_mean, removed_std = mean_std(subspace_removed_values)
+        residual_mean, residual_std = mean_std(residual_only_values)
+        drop_mean, drop_std = mean_std(removed_drop_values)
+        print(
+            f"{variant_name:<22} "
+            f"{center_mean:.3f}+/-{center_std:.3f}  "
+            f"{subspace_mean:.3f}+/-{subspace_std:.3f}  "
+            f"{removed_mean:.3f}+/-{removed_std:.3f}  "
+            f"{residual_mean:.3f}+/-{residual_std:.3f}  "
+            f"{drop_mean:.3f}+/-{drop_std:.3f}"
+        )
+
+    print(
+        "\nRoute-family admission comparison: class-align minus CE-only "
+        "(mean +/- std)"
+    )
+    print(
+        "target  acc_delta     add_delta     loss_delta    shared_g_ratio  "
+        "cos_delta    cka_delta    mse_delta    patch_delta  rm_drop_delta  "
+        "bp_margin    false_gap"
+    )
+    for target_spec in DEFAULT_MULTI_ROUTE_NON_ANALOG_SPECS:
+        per_seed_admission = [
+            route_family_admission_metrics(result["non_analog"])[target_spec.name]  # type: ignore[arg-type,index]
+            for result in results
+        ]
+        target_delta_values = [
+            values["target_accuracy_delta"] for values in per_seed_admission
+        ]
+        add_delta_values = [
+            values["add_family_min_accuracy_delta"] for values in per_seed_admission
+        ]
+        loss_delta_values = [
+            values["target_loss_delta"] for values in per_seed_admission
+        ]
+        pressure_ratio_values = [
+            values["shared_gradient_norm_ratio"] for values in per_seed_admission
+        ]
+        cosine_delta_values = [
+            values["center_cosine_delta"] for values in per_seed_admission
+        ]
+        cka_delta_values = [
+            values["center_cka_delta"] for values in per_seed_admission
+        ]
+        mse_delta_values = [
+            values["center_mse_delta"] for values in per_seed_admission
+        ]
+        patch_delta_values = [
+            values["center_patch_accuracy_delta"] for values in per_seed_admission
+        ]
+        removed_drop_delta_values = [
+            values["subspace_removed_drop_delta"] for values in per_seed_admission
+        ]
+        behavior_pressure_values = [
+            values["behavior_pressure_margin"] for values in per_seed_admission
+        ]
+        false_gap_values = [
+            values["false_alignment_gap"] for values in per_seed_admission
+        ]
+        target_mean, target_std = mean_std(target_delta_values)
+        add_mean, add_std = mean_std(add_delta_values)
+        loss_mean, loss_std = mean_std(loss_delta_values)
+        pressure_mean, pressure_std = mean_std(pressure_ratio_values)
+        cosine_mean, cosine_std = mean_std(cosine_delta_values)
+        cka_mean, cka_std = mean_std(cka_delta_values)
+        mse_mean, mse_std = mean_std(mse_delta_values)
+        patch_mean, patch_std = mean_std(patch_delta_values)
+        removed_drop_mean, removed_drop_std = mean_std(removed_drop_delta_values)
+        bp_mean, bp_std = mean_std(behavior_pressure_values)
+        gap_mean, gap_std = mean_std(false_gap_values)
+        print(
+            f"{target_spec.name:<7} "
+            f"{target_mean:.3f}+/-{target_std:.3f}  "
+            f"{add_mean:.3f}+/-{add_std:.3f}  "
+            f"{loss_mean:.5f}+/-{loss_std:.5f}  "
+            f"{pressure_mean:.3f}+/-{pressure_std:.3f}  "
+            f"{cosine_mean:.3f}+/-{cosine_std:.3f}  "
+            f"{cka_mean:.3f}+/-{cka_std:.3f}  "
+            f"{mse_mean:.5f}+/-{mse_std:.5f}  "
+            f"{patch_mean:.3f}+/-{patch_std:.3f}  "
+            f"{removed_drop_mean:.3f}+/-{removed_drop_std:.3f}  "
+            f"{bp_mean:.3f}+/-{bp_std:.3f}  "
+            f"{gap_mean:.3f}+/-{gap_std:.3f}"
+        )
+
+
+def run_multi_route_non_analog_multi_seed(
+    seed_count: int,
+    hidden_dim: int,
+    alignment_weight: float,
+) -> None:
+    results: list[dict[str, object]] = []
+    for seed in range(seed_count):
+        print(f"running_seed={seed}")
+        metrics = multi_route_non_analog_metrics(
+            seed,
+            hidden_dim,
+            alignment_weight,
+            verbose=False,
+        )
+        results.append({"seed": seed, "non_analog": metrics})
+    print_multi_route_non_analog_summary(results)
+
+
+def composition_benchmark_specs() -> tuple[MultiRouteOpSpec, ...]:
+    return (
+        DEFAULT_MULTI_ROUTE_ADDITION_SPECS
+        + DEFAULT_MULTI_ROUTE_NON_ANALOG_SPECS
+        + DEFAULT_MULTI_ROUTE_COMPOSITION_SPECS
+    )
+
+
+def train_composition_benchmark_route(
+    model: MultiRouteFactorizedMLP,
+    dataset: MultiRouteDataset,
+    source_dataset: MultiRouteDataset,
+    config: OpsConfig,
+    train_config: TrainConfig,
+    policy: str,
+    label: str,
+    alignment_weight: float,
+) -> None:
+    if policy not in COMPOSITION_BENCHMARK_POLICIES:
+        raise ValueError(
+            f"composition benchmark policy must be one of "
+            f"{COMPOSITION_BENCHMARK_POLICIES}, got {policy!r}."
+        )
+    if policy == "admission":
+        train_multi_route(
+            model,
+            dataset,
+            train_config,
+            label=label,
+            trainable_routes=(dataset.op_spec.name,),
+            train_shared=False,
+        )
+        return
+    if policy == "force_class_align":
+        train_multi_route_class_center_alignment(
+            model,
+            dataset,
+            source_dataset,
+            train_config,
+            label=label,
+            class_count=config.num_digits,
+            alignment_weight=alignment_weight,
+        )
+        return
+    raise ValueError(f"unsupported composition benchmark policy {policy!r}.")
+
+
+def multi_route_parameter_metrics(
+    model: MultiRouteFactorizedMLP,
+    active_route_count: int,
+) -> dict[str, float]:
+    validate_multi_route_model(model)
+    if active_route_count <= 0:
+        raise ValueError(f"active_route_count must be positive, got {active_route_count}.")
+    route_names = tuple(model.W_router)
+    first_route = route_names[0]
+    route_param_count = (
+        model.W_router[first_route].size
+        + model.b_router[first_route].size
+    )
+    for route_name in route_names[1:]:
+        current_count = (
+            model.W_router[route_name].size
+            + model.b_router[route_name].size
+        )
+        if current_count != route_param_count:
+            raise ValueError(
+                f"router {route_name} has {current_count} parameters; "
+                f"expected {route_param_count}."
+            )
+    shared_params = (
+        model.W_op.size
+        + model.b_op.size
+        + model.W_out.size
+        + model.b_out.size
+    )
+    active_router_params = route_param_count * active_route_count
+    total_active_params = active_router_params + shared_params
+    if shared_params <= 0:
+        raise ValueError("shared parameter count must be positive.")
+    return {
+        "route_param_count": float(route_param_count),
+        "active_route_count": float(active_route_count),
+        "active_router_params": float(active_router_params),
+        "shared_params": float(shared_params),
+        "total_active_params": float(total_active_params),
+        "router_to_shared_ratio": float(active_router_params / shared_params),
+    }
+
+
+def composition_benchmark_metrics(
+    seed: int,
+    hidden_dim: int,
+    alignment_weight: float,
+    policy: str,
+    verbose: bool,
+) -> dict[str, dict[str, float]]:
+    if policy not in COMPOSITION_BENCHMARK_POLICIES:
+        raise ValueError(
+            f"composition benchmark policy must be one of "
+            f"{COMPOSITION_BENCHMARK_POLICIES}, got {policy!r}."
+        )
+    if hidden_dim <= 0:
+        raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
+    if alignment_weight <= 0.0:
+        raise ValueError(f"alignment_weight must be positive, got {alignment_weight}.")
+
+    config = OpsConfig(seed=seed, hidden_dim=hidden_dim)
+    specs = composition_benchmark_specs()
+    validate_multi_route_specs(specs, config.sequence_digits)
+    spec_by_name = {spec.name: spec for spec in specs}
+    if DEFAULT_MULTI_ROUTE_BASE_NAME not in spec_by_name:
+        raise ValueError(f"missing base route {DEFAULT_MULTI_ROUTE_BASE_NAME!r}.")
+    base_spec = spec_by_name[DEFAULT_MULTI_ROUTE_BASE_NAME]
+    datasets = {
+        spec.name: make_multi_route_dataset(
+            spec,
+            config.num_digits,
+            config.sequence_digits,
+        )
+        for spec in specs
+    }
+    base_train, new_train, _, _, _ = build_train_configs(verbose)
+    model = make_multi_route_factorized_model(
+        specs,
+        config.num_digits,
+        config.sequence_digits,
+        hidden_dim,
+        seed,
+    )
+    train_multi_route(
+        model,
+        datasets[base_spec.name],
+        base_train,
+        label=f"composition_{policy}_base",
+        trainable_routes=(base_spec.name,),
+        train_shared=True,
+    )
+    for spec in DEFAULT_MULTI_ROUTE_ADDITION_SPECS:
+        if spec.name == base_spec.name:
+            continue
+        analog = analogous_multi_route_dataset(
+            base_spec,
+            datasets[spec.name],
+            config.num_digits,
+            config.sequence_digits,
+        )
+        train_multi_route_alignment(
+            model,
+            datasets[spec.name],
+            analog,
+            new_train,
+            label=f"composition_{policy}_analog_{spec.name}",
+            alignment_weight=alignment_weight,
+        )
+
+    source_dataset = datasets[base_spec.name]
+    for spec in DEFAULT_MULTI_ROUTE_NON_ANALOG_SPECS + DEFAULT_MULTI_ROUTE_COMPOSITION_SPECS:
+        train_composition_benchmark_route(
+            model,
+            datasets[spec.name],
+            source_dataset,
+            config,
+            new_train,
+            policy,
+            label=f"composition_{policy}_{spec.name}",
+            alignment_weight=alignment_weight,
+        )
+
+    route_metrics: dict[str, float] = {}
+    route_accuracies: list[float] = []
+    route_losses: list[float] = []
+    shared_gradients: list[float] = []
+    for spec in specs:
+        loss, accuracy = multi_route_evaluate(model, datasets[spec.name])
+        shared_gradient = multi_route_shared_gradient_norm(model, datasets[spec.name])
+        route_metrics[f"{spec.name}_loss"] = loss
+        route_metrics[f"{spec.name}_accuracy"] = accuracy
+        route_metrics[f"{spec.name}_shared_gradient_norm"] = shared_gradient
+        route_accuracies.append(accuracy)
+        route_losses.append(loss)
+        shared_gradients.append(shared_gradient)
+
+    add_accuracies = [
+        route_metrics[f"{spec.name}_accuracy"]
+        for spec in DEFAULT_MULTI_ROUTE_ADDITION_SPECS
+    ]
+    non_analog_accuracies = [
+        route_metrics[f"{spec.name}_accuracy"]
+        for spec in DEFAULT_MULTI_ROUTE_NON_ANALOG_SPECS
+    ]
+    composition_accuracies = [
+        route_metrics[f"{spec.name}_accuracy"]
+        for spec in DEFAULT_MULTI_ROUTE_COMPOSITION_SPECS
+    ]
+    aggregate_metrics = {
+        "base_accuracy": route_metrics[f"{base_spec.name}_accuracy"],
+        "mean_accuracy": float(np.mean(route_accuracies)),
+        "worst_accuracy": float(np.min(route_accuracies)),
+        "mean_loss": float(np.mean(route_losses)),
+        "mean_shared_gradient_norm": float(np.mean(shared_gradients)),
+        "max_shared_gradient_norm": float(np.max(shared_gradients)),
+        "add_family_min_accuracy": float(np.min(add_accuracies)),
+        "add_family_mean_accuracy": float(np.mean(add_accuracies)),
+        "non_analog_min_accuracy": float(np.min(non_analog_accuracies)),
+        "non_analog_mean_accuracy": float(np.mean(non_analog_accuracies)),
+        "composition_min_accuracy": float(np.min(composition_accuracies)),
+        "composition_mean_accuracy": float(np.mean(composition_accuracies)),
+        "examples_per_route": float(len(next(iter(datasets.values())).y)),
+        "new_route_train_steps": float((len(specs) - 1) * new_train.epochs),
+        **multi_route_parameter_metrics(model, len(specs)),
+    }
+
+    causal_metrics: dict[str, float] = {}
+    for spec in specs:
+        if spec.name == base_spec.name:
+            continue
+        code_metrics = multi_route_output_code_causal_metrics(
+            model,
+            datasets[spec.name],
+            source_dataset,
+            config.num_digits,
+        )
+        for metric_name, value in code_metrics.items():
+            causal_metrics[f"{spec.name}_{metric_name}"] = value
+        if spec.kind == base_spec.kind and len(spec.operands) == len(base_spec.operands):
+            analog = analogous_multi_route_dataset(
+                base_spec,
+                datasets[spec.name],
+                config.num_digits,
+                config.sequence_digits,
+            )
+            analog_metrics = multi_route_analog_causal_metrics(
+                model,
+                datasets[spec.name],
+                analog,
+            )
+            for metric_name, value in analog_metrics.items():
+                causal_metrics[f"{spec.name}_{metric_name}"] = value
+
+    closure_candidates = [
+        spec
+        for spec in DEFAULT_MULTI_ROUTE_COMPOSITION_SPECS
+        if spec.kind == "add"
+        and len(spec.operands) == len(base_spec.operands) + 1
+        and tuple(spec.operands[: len(base_spec.operands)]) == base_spec.operands
+    ]
+    if len(closure_candidates) != 1:
+        raise ValueError(
+            f"expected exactly one iterative-add closure target, got {closure_candidates}."
+        )
+    sum_spec = closure_candidates[0]
+    closure_metrics = iterative_add_closure_metrics(
+        model,
+        datasets[sum_spec.name],
+        base_spec,
+        config.num_digits,
+        config.sequence_digits,
+        seed,
+    )
+
+    return {
+        "route": route_metrics,
+        "aggregate": aggregate_metrics,
+        "causal": causal_metrics,
+        "closure": closure_metrics,
+    }
+
+
+def composition_benchmark_policy_comparison(
+    policy_metrics: dict[str, dict[str, dict[str, float]]],
+) -> dict[str, float]:
+    if set(policy_metrics) != set(COMPOSITION_BENCHMARK_POLICIES):
+        raise ValueError(
+            f"expected metrics for policies {COMPOSITION_BENCHMARK_POLICIES}, "
+            f"got {sorted(policy_metrics)}."
+        )
+    admission = policy_metrics["admission"]["aggregate"]
+    forced = policy_metrics["force_class_align"]["aggregate"]
+    return {
+        "forced_minus_admission_mean_accuracy": (
+            forced["mean_accuracy"] - admission["mean_accuracy"]
+        ),
+        "forced_minus_admission_worst_accuracy": (
+            forced["worst_accuracy"] - admission["worst_accuracy"]
+        ),
+        "forced_minus_admission_composition_mean_accuracy": (
+            forced["composition_mean_accuracy"] - admission["composition_mean_accuracy"]
+        ),
+        "forced_over_admission_mean_shared_gradient_norm": (
+            forced["mean_shared_gradient_norm"] / admission["mean_shared_gradient_norm"]
+        ),
+        "forced_minus_admission_mean_loss": (
+            forced["mean_loss"] - admission["mean_loss"]
+        ),
+    }
+
+
+def two_step_add_digit_x(
+    source_dataset: MultiRouteDataset,
+    base_spec: MultiRouteOpSpec,
+    intermediate_digits: np.ndarray,
+    final_operand_position: int,
+    num_digits: int,
+    sequence_digits: int,
+) -> np.ndarray:
+    if base_spec.kind != "add" or len(base_spec.operands) != 2:
+        raise ValueError(
+            f"base spec must be a binary add route, got {base_spec}."
+        )
+    if intermediate_digits.shape != (source_dataset.digit_x.shape[0],):
+        raise ValueError(
+            f"intermediate digit shape {intermediate_digits.shape} does not match "
+            f"dataset row count {source_dataset.digit_x.shape[0]}."
+        )
+    if final_operand_position < 0 or final_operand_position >= sequence_digits:
+        raise ValueError(
+            f"final_operand_position={final_operand_position} outside sequence length "
+            f"{sequence_digits}."
+        )
+    rows: list[np.ndarray] = []
+    first_operand, second_operand = base_spec.operands
+    for digit_row, intermediate_digit in zip(
+        source_dataset.digit_x,
+        intermediate_digits,
+        strict=True,
+    ):
+        digits = list(decode_multi_route_digits(digit_row, num_digits, sequence_digits))
+        digits[first_operand] = int(intermediate_digit)
+        digits[second_operand] = digits[final_operand_position]
+        rows.append(multi_route_digit_features(tuple(digits), num_digits))
+    return np.array(rows)
+
+
+def iterative_add_closure_metrics(
+    model: MultiRouteFactorizedMLP,
+    sum_dataset: MultiRouteDataset,
+    base_spec: MultiRouteOpSpec,
+    num_digits: int,
+    sequence_digits: int,
+    seed: int,
+    train_fraction: float = 0.7,
+    ridge: float = 1e-4,
+) -> dict[str, float]:
+    if sum_dataset.op_spec.kind != "add":
+        raise ValueError(f"closure target must be an add task, got {sum_dataset.op_spec}.")
+    if base_spec.kind != "add" or len(base_spec.operands) != 2:
+        raise ValueError(f"base spec must be binary add, got {base_spec}.")
+    if len(sum_dataset.op_spec.operands) != len(base_spec.operands) + 1:
+        raise ValueError(
+            f"closure target must add exactly one operand beyond base route; "
+            f"got base={base_spec.operands}, target={sum_dataset.op_spec.operands}."
+        )
+    if tuple(sum_dataset.op_spec.operands[: len(base_spec.operands)]) != base_spec.operands:
+        raise ValueError(
+            f"closure target operands must start with base operands; "
+            f"got base={base_spec.operands}, target={sum_dataset.op_spec.operands}."
+        )
+    final_operand_position = sum_dataset.op_spec.operands[-1]
+
+    direct_loss, direct_accuracy = multi_route_evaluate(model, sum_dataset)
+    first_logits, first_cache = multi_route_forward(
+        model,
+        sum_dataset.digit_x,
+        base_spec.name,
+    )
+    first_targets = np.array(
+        [
+            multi_route_target(
+                base_spec,
+                decode_multi_route_digits(row, num_digits, sequence_digits),
+                num_digits,
+            )
+            for row in sum_dataset.digit_x
+        ],
+        dtype=int,
+    )
+    first_predictions = np.argmax(first_logits, axis=1)
+    first_step_accuracy = float(np.mean(first_predictions == first_targets))
+
+    symbolic_digit_x = two_step_add_digit_x(
+        sum_dataset,
+        base_spec,
+        first_targets,
+        final_operand_position,
+        num_digits,
+        sequence_digits,
+    )
+    decoded_digit_x = two_step_add_digit_x(
+        sum_dataset,
+        base_spec,
+        first_predictions,
+        final_operand_position,
+        num_digits,
+        sequence_digits,
+    )
+    symbolic_logits, symbolic_cache = multi_route_forward(
+        model,
+        symbolic_digit_x,
+        base_spec.name,
+    )
+    decoded_logits, _ = multi_route_forward(
+        model,
+        decoded_digit_x,
+        base_spec.name,
+    )
+    symbolic_loss, symbolic_accuracy = evaluate_logits(symbolic_logits, sum_dataset.y)
+    decoded_loss, decoded_accuracy = evaluate_logits(decoded_logits, sum_dataset.y)
+
+    first_op_h = first_cache["op_h"]
+    symbolic_route_h = symbolic_cache["route_h"]
+    if not isinstance(first_op_h, np.ndarray) or not isinstance(symbolic_route_h, np.ndarray):
+        raise ValueError("closure cache contains non-array values.")
+
+    final_operand_digits = np.array(
+        [
+            decode_multi_route_digits(row, num_digits, sequence_digits)[final_operand_position]
+            for row in sum_dataset.digit_x
+        ],
+        dtype=int,
+    )
+    bridge_x = np.concatenate(
+        [first_op_h, digit_one_hot(final_operand_digits, num_digits)],
+        axis=1,
+    )
+    train_idx, test_idx = split_indices(len(sum_dataset.y), train_fraction, seed)
+    train_pred_route_h = ridge_linear_predict(
+        bridge_x[train_idx],
+        symbolic_route_h[train_idx],
+        bridge_x[train_idx],
+        ridge,
+    )
+    test_pred_route_h = ridge_linear_predict(
+        bridge_x[train_idx],
+        symbolic_route_h[train_idx],
+        bridge_x[test_idx],
+        ridge,
+    )
+    train_bridge_loss, train_bridge_accuracy = evaluate_logits(
+        logits_from_multi_route_route_h(model, train_pred_route_h),
+        sum_dataset.y[train_idx],
+    )
+    test_bridge_loss, test_bridge_accuracy = evaluate_logits(
+        logits_from_multi_route_route_h(model, test_pred_route_h),
+        sum_dataset.y[test_idx],
+    )
+    test_route_h_mse = float(np.mean((test_pred_route_h - symbolic_route_h[test_idx]) ** 2))
+    test_route_h_cosine = mean_row_cosine(test_pred_route_h, symbolic_route_h[test_idx])
+
+    symbolic_test_loss, symbolic_test_accuracy = evaluate_logits(
+        symbolic_logits[test_idx],
+        sum_dataset.y[test_idx],
+    )
+    decoded_test_loss, decoded_test_accuracy = evaluate_logits(
+        decoded_logits[test_idx],
+        sum_dataset.y[test_idx],
+    )
+
+    return {
+        "direct_loss": direct_loss,
+        "direct_accuracy": direct_accuracy,
+        "first_step_accuracy": first_step_accuracy,
+        "symbolic_two_step_loss": symbolic_loss,
+        "symbolic_two_step_accuracy": symbolic_accuracy,
+        "decoded_two_step_loss": decoded_loss,
+        "decoded_two_step_accuracy": decoded_accuracy,
+        "symbolic_two_step_test_loss": symbolic_test_loss,
+        "symbolic_two_step_test_accuracy": symbolic_test_accuracy,
+        "decoded_two_step_test_loss": decoded_test_loss,
+        "decoded_two_step_test_accuracy": decoded_test_accuracy,
+        "latent_bridge_train_loss": train_bridge_loss,
+        "latent_bridge_train_accuracy": train_bridge_accuracy,
+        "latent_bridge_test_loss": test_bridge_loss,
+        "latent_bridge_test_accuracy": test_bridge_accuracy,
+        "latent_bridge_route_h_mse": test_route_h_mse,
+        "latent_bridge_route_h_cosine": test_route_h_cosine,
+        "symbolic_minus_direct_accuracy": symbolic_accuracy - direct_accuracy,
+        "decoded_minus_direct_accuracy": decoded_accuracy - direct_accuracy,
+        "latent_bridge_test_minus_direct_accuracy": test_bridge_accuracy - direct_accuracy,
+    }
+
+
+def run_composition_benchmark_metrics(
+    seed: int,
+    hidden_dim: int,
+    alignment_weight: float,
+    verbose: bool,
+) -> dict[str, dict[str, dict[str, float]]]:
+    return {
+        policy: composition_benchmark_metrics(
+            seed,
+            hidden_dim,
+            alignment_weight,
+            policy,
+            verbose,
+        )
+        for policy in COMPOSITION_BENCHMARK_POLICIES
+    }
+
+
+def print_composition_benchmark_table(
+    policy_metrics: dict[str, dict[str, dict[str, float]]],
+) -> None:
+    print("\nComposition continual-learning benchmark")
+    print(
+        "policy             mean_acc  worst_acc  add_min  nonanalog_min  "
+        "composition_min  mean_shared_g  routes  router/shared"
+    )
+    for policy in COMPOSITION_BENCHMARK_POLICIES:
+        values = policy_metrics[policy]["aggregate"]
+        print(
+            f"{policy:<18} "
+            f"{values['mean_accuracy']:>8.3f} "
+            f"{values['worst_accuracy']:>10.3f} "
+            f"{values['add_family_min_accuracy']:>8.3f} "
+            f"{values['non_analog_min_accuracy']:>14.3f} "
+            f"{values['composition_min_accuracy']:>15.3f} "
+            f"{values['mean_shared_gradient_norm']:>14.6f} "
+            f"{int(values['active_route_count']):>7} "
+            f"{values['router_to_shared_ratio']:>13.3f}"
+        )
+
+    print("\nRoute accuracies")
+    print("route         " + "  ".join(f"{policy:>17}" for policy in COMPOSITION_BENCHMARK_POLICIES))
+    for spec in composition_benchmark_specs():
+        row = [spec.name.ljust(12)]
+        for policy in COMPOSITION_BENCHMARK_POLICIES:
+            row.append(f"{policy_metrics[policy]['route'][f'{spec.name}_accuracy']:>17.3f}")
+        print("  ".join(row))
+
+    print("\nCausal-code summary")
+    print("policy             analog_patch  center_patch  removed_drop")
+    for policy in COMPOSITION_BENCHMARK_POLICIES:
+        causal = policy_metrics[policy]["causal"]
+        analog_values = [
+            causal[f"{spec.name}_analog_patch_accuracy"]
+            for spec in DEFAULT_MULTI_ROUTE_ADDITION_SPECS
+            if spec.name != DEFAULT_MULTI_ROUTE_BASE_NAME
+        ]
+        center_values = [
+            causal[f"{spec.name}_center_patch_accuracy"]
+            for spec in composition_benchmark_specs()
+            if spec.name != DEFAULT_MULTI_ROUTE_BASE_NAME
+        ]
+        removed_drop_values = [
+            causal[f"{spec.name}_subspace_removed_accuracy_drop"]
+            for spec in composition_benchmark_specs()
+            if spec.name != DEFAULT_MULTI_ROUTE_BASE_NAME
+        ]
+        analog_mean, _ = mean_std(analog_values)
+        center_mean, _ = mean_std(center_values)
+        removed_mean, _ = mean_std(removed_drop_values)
+        print(
+            f"{policy:<18} "
+            f"{analog_mean:>12.3f} "
+            f"{center_mean:>13.3f} "
+            f"{removed_mean:>13.3f}"
+        )
+
+    print("\nIterative ADD closure on composition target")
+    print(
+        "policy             direct  symbolic_2step  decoded_2step  "
+        "latent_bridge_test  bridge_route_cos"
+    )
+    for policy in COMPOSITION_BENCHMARK_POLICIES:
+        closure = policy_metrics[policy]["closure"]
+        print(
+            f"{policy:<18} "
+            f"{closure['direct_accuracy']:>6.3f} "
+            f"{closure['symbolic_two_step_accuracy']:>15.3f} "
+            f"{closure['decoded_two_step_accuracy']:>14.3f} "
+            f"{closure['latent_bridge_test_accuracy']:>18.3f} "
+            f"{closure['latent_bridge_route_h_cosine']:>16.3f}"
+        )
+
+    comparison = composition_benchmark_policy_comparison(policy_metrics)
+    print("\nForced class-align minus admission policy")
+    for metric_name, value in comparison.items():
+        print(f"{metric_name}={value:.6f}")
+
+
+def run_composition_benchmark_table(
+    seed: int,
+    hidden_dim: int,
+    alignment_weight: float,
+    verbose: bool,
+) -> dict[str, dict[str, dict[str, float]]]:
+    metrics = run_composition_benchmark_metrics(seed, hidden_dim, alignment_weight, verbose)
+    print_composition_benchmark_table(metrics)
+    return metrics
+
+
+def print_composition_benchmark_summary(results: list[dict[str, object]]) -> None:
+    print("\nComposition continual-learning benchmark summary: mean +/- std")
+    print(f"seeds={[result['seed'] for result in results]}")
+    print(
+        "policy             mean_acc      worst_acc     add_min       nonanalog_min  "
+        "composition_min  mean_shared_g  router/shared"
+    )
+    for policy in COMPOSITION_BENCHMARK_POLICIES:
+        aggregates = [
+            result["composition"][policy]["aggregate"]  # type: ignore[index]
+            for result in results
+        ]
+        mean_acc = [values["mean_accuracy"] for values in aggregates]
+        worst_acc = [values["worst_accuracy"] for values in aggregates]
+        add_min = [values["add_family_min_accuracy"] for values in aggregates]
+        nonanalog_min = [values["non_analog_min_accuracy"] for values in aggregates]
+        composition_min = [values["composition_min_accuracy"] for values in aggregates]
+        mean_shared_g = [values["mean_shared_gradient_norm"] for values in aggregates]
+        router_ratios = [values["router_to_shared_ratio"] for values in aggregates]
+        mean_acc_mean, mean_acc_std = mean_std(mean_acc)
+        worst_mean, worst_std = mean_std(worst_acc)
+        add_mean, add_std = mean_std(add_min)
+        nonanalog_mean, nonanalog_std = mean_std(nonanalog_min)
+        composition_mean, composition_std = mean_std(composition_min)
+        shared_mean, shared_std = mean_std(mean_shared_g)
+        ratio_mean, ratio_std = mean_std(router_ratios)
+        print(
+            f"{policy:<18} "
+            f"{mean_acc_mean:.3f}+/-{mean_acc_std:.3f}  "
+            f"{worst_mean:.3f}+/-{worst_std:.3f}  "
+            f"{add_mean:.3f}+/-{add_std:.3f}  "
+            f"{nonanalog_mean:.3f}+/-{nonanalog_std:.3f}  "
+            f"{composition_mean:.3f}+/-{composition_std:.3f}  "
+            f"{shared_mean:.6f}+/-{shared_std:.6f}  "
+            f"{ratio_mean:.3f}+/-{ratio_std:.3f}"
+        )
+
+    print("\nComposition route accuracies: mean +/- std")
+    print("route         " + "  ".join(f"{policy:>25}" for policy in COMPOSITION_BENCHMARK_POLICIES))
+    for spec in composition_benchmark_specs():
+        row = [spec.name.ljust(12)]
+        for policy in COMPOSITION_BENCHMARK_POLICIES:
+            values = [
+                result["composition"][policy]["route"][f"{spec.name}_accuracy"]  # type: ignore[index]
+                for result in results
+            ]
+            value_mean, value_std = mean_std(values)
+            row.append(f"{value_mean:.3f}+/-{value_std:.3f}".rjust(25))
+        print("  ".join(row))
+
+    print("\nCausal-code summary: mean +/- std")
+    print("policy             analog_patch  center_patch  removed_drop")
+    for policy in COMPOSITION_BENCHMARK_POLICIES:
+        analog_values = []
+        center_values = []
+        removed_drop_values = []
+        for result in results:
+            causal = result["composition"][policy]["causal"]  # type: ignore[index]
+            for spec in DEFAULT_MULTI_ROUTE_ADDITION_SPECS:
+                if spec.name != DEFAULT_MULTI_ROUTE_BASE_NAME:
+                    analog_values.append(causal[f"{spec.name}_analog_patch_accuracy"])
+            for spec in composition_benchmark_specs():
+                if spec.name == DEFAULT_MULTI_ROUTE_BASE_NAME:
+                    continue
+                center_values.append(causal[f"{spec.name}_center_patch_accuracy"])
+                removed_drop_values.append(
+                    causal[f"{spec.name}_subspace_removed_accuracy_drop"]
+                )
+        analog_mean, analog_std = mean_std(analog_values)
+        center_mean, center_std = mean_std(center_values)
+        removed_mean, removed_std = mean_std(removed_drop_values)
+        print(
+            f"{policy:<18} "
+            f"{analog_mean:.3f}+/-{analog_std:.3f}  "
+            f"{center_mean:.3f}+/-{center_std:.3f}  "
+            f"{removed_mean:.3f}+/-{removed_std:.3f}"
+        )
+
+    print("\nIterative ADD closure on composition target: mean +/- std")
+    print(
+        "policy             direct        symbolic_2step  decoded_2step   "
+        "latent_bridge   bridge_route_cos"
+    )
+    for policy in COMPOSITION_BENCHMARK_POLICIES:
+        closures = [
+            result["composition"][policy]["closure"]  # type: ignore[index]
+            for result in results
+        ]
+        direct_values = [values["direct_accuracy"] for values in closures]
+        symbolic_values = [values["symbolic_two_step_accuracy"] for values in closures]
+        decoded_values = [values["decoded_two_step_accuracy"] for values in closures]
+        bridge_values = [values["latent_bridge_test_accuracy"] for values in closures]
+        bridge_cos_values = [values["latent_bridge_route_h_cosine"] for values in closures]
+        direct_mean, direct_std = mean_std(direct_values)
+        symbolic_mean, symbolic_std = mean_std(symbolic_values)
+        decoded_mean, decoded_std = mean_std(decoded_values)
+        bridge_mean, bridge_std = mean_std(bridge_values)
+        bridge_cos_mean, bridge_cos_std = mean_std(bridge_cos_values)
+        print(
+            f"{policy:<18} "
+            f"{direct_mean:.3f}+/-{direct_std:.3f}  "
+            f"{symbolic_mean:.3f}+/-{symbolic_std:.3f}  "
+            f"{decoded_mean:.3f}+/-{decoded_std:.3f}  "
+            f"{bridge_mean:.3f}+/-{bridge_std:.3f}  "
+            f"{bridge_cos_mean:.3f}+/-{bridge_cos_std:.3f}"
+        )
+
+    print("\nForced class-align minus admission policy: mean +/- std")
+    comparison_names = tuple(
+        composition_benchmark_policy_comparison(
+            results[0]["composition"]  # type: ignore[arg-type]
+        ).keys()
+    )
+    for comparison_name in comparison_names:
+        values = [
+            composition_benchmark_policy_comparison(
+                result["composition"]  # type: ignore[arg-type]
+            )[comparison_name]
+            for result in results
+        ]
+        value_mean, value_std = mean_std(values)
+        print(f"{comparison_name}={value_mean:.6f}+/-{value_std:.6f}")
+
+
+def run_composition_benchmark_multi_seed(
+    seed_count: int,
+    hidden_dim: int,
+    alignment_weight: float,
+) -> None:
+    results: list[dict[str, object]] = []
+    for seed in range(seed_count):
+        print(f"running_seed={seed}")
+        metrics = run_composition_benchmark_metrics(
+            seed,
+            hidden_dim,
+            alignment_weight,
+            verbose=False,
+        )
+        results.append({"seed": seed, "composition": metrics})
+    print_composition_benchmark_summary(results)
+
+
 def meaning_transform_metrics(
     base_checkpoint: TinyMLP,
     config: OpsConfig,
@@ -5576,11 +7751,1708 @@ def parse_float_tuple(raw: str, name: str) -> tuple[float, ...]:
     return tuple(values)
 
 
+# =====================================================================
+# CLOSED LATENT ADD MODEL AND EXPERIMENTS (PHASES 1-4)
+# =====================================================================
+
+class AdamOptimizer:
+    def __init__(self, lr: float = 0.01, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8):
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m = {}
+        self.v = {}
+        self.t = 0
+
+    def update(self, params: dict[str, np.ndarray], grads: dict[str, np.ndarray]) -> None:
+        self.t += 1
+        for name in params:
+            if name not in self.m:
+                self.m[name] = np.zeros_like(params[name])
+                self.v[name] = np.zeros_like(params[name])
+            g = grads[name]
+            self.m[name] = self.beta1 * self.m[name] + (1.0 - self.beta1) * g
+            self.v[name] = self.beta2 * self.v[name] + (1.0 - self.beta2) * (g ** 2)
+            m_hat = self.m[name] / (1.0 - self.beta1 ** self.t)
+            v_hat = self.v[name] / (1.0 - self.beta2 ** self.t)
+            params[name] -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+
+@dataclass
+class ClosedLatentModel:
+    E: np.ndarray        # (num_digits, code_dim)
+    W_D: np.ndarray      # (code_dim, num_digits)
+    b_D: np.ndarray      # (num_digits,)
+    W_op1: np.ndarray    # (2 * code_dim, hidden_dim)
+    b_op1: np.ndarray    # (hidden_dim,)
+    W_op2: np.ndarray    # (hidden_dim, code_dim)
+    b_op2: np.ndarray    # (code_dim,)
+
+
+@dataclass
+class ClosedLatentRouter:
+    W_R: np.ndarray      # (input_dim, 2 * code_dim)
+    b_R: np.ndarray      # (2 * code_dim,)
+
+
+def make_closed_latent_model(
+    num_digits: int,
+    code_dim: int,
+    hidden_dim: int,
+    seed: int,
+) -> ClosedLatentModel:
+    rng = np.random.default_rng(seed)
+    return ClosedLatentModel(
+        E=rng.normal(0.0, 1.0, (num_digits, code_dim)),
+        W_D=rng.normal(0.0, 1.0 / np.sqrt(code_dim), (code_dim, num_digits)),
+        b_D=np.zeros(num_digits),
+        W_op1=rng.normal(0.0, 1.0 / np.sqrt(2 * code_dim), (2 * code_dim, hidden_dim)),
+        b_op1=np.full(hidden_dim, 0.01),  # tiny positive bias to prevent dead ReLUs
+        W_op2=rng.normal(0.0, 1.0 / np.sqrt(hidden_dim), (hidden_dim, code_dim)),
+        b_op2=np.zeros(code_dim),
+    )
+
+
+def train_autoencoder(
+    model,
+    epochs: int,
+    lr: float,
+    margin: float = 2.0,
+    sep_weight: float = 0.5,
+    quiet: bool = True,
+) -> None:
+    num_digits = model.E.shape[0]
+    x = np.eye(num_digits)
+    y = np.arange(num_digits)
+    params = {
+        "E": model.E,
+        "W_D": model.W_D,
+        "b_D": model.b_D,
+    }
+    opt = AdamOptimizer(lr=lr)
+    for epoch in range(1, epochs + 1):
+        c = x @ model.E
+        logits = c @ model.W_D + model.b_D
+        ce_loss, dlogits = loss_and_grad_logits(logits, y)
+        
+        # Separation loss and grads
+        sep_loss = 0.0
+        dE_sep = np.zeros_like(model.E)
+        for i in range(num_digits):
+            for j in range(num_digits):
+                if i == j:
+                    continue
+                diff = model.E[i] - model.E[j]
+                dist_sq = np.sum(diff**2)
+                if dist_sq < margin:
+                    sep_loss += (margin - dist_sq)
+                    dE_sep[i] += -2.0 * diff
+        
+        dW_D = c.T @ dlogits
+        db_D = np.sum(dlogits, axis=0)
+        dc = dlogits @ model.W_D.T
+        dE_ce = x.T @ dc
+        
+        grads = {
+            "E": dE_ce + sep_weight * dE_sep,
+            "W_D": dW_D,
+            "b_D": db_D,
+        }
+        opt.update(params, grads)
+        
+        if not quiet and (epoch == 1 or epoch % 100 == 0 or epoch == epochs):
+            preds = np.argmax(logits, axis=1)
+            accuracy = np.mean(preds == y)
+            print(f"  [AE] epoch={epoch:04d} loss={ce_loss:.4f} + sep={sep_loss:.4f} accuracy={accuracy:.3f}")
+
+
+def train_closed_op(
+    model: ClosedLatentModel,
+    epochs: int,
+    lr: float,
+    lambda_closure: float,
+    unfreeze_AE: bool = False,
+    quiet: bool = True,
+) -> None:
+    num_digits = model.E.shape[0]
+    code_dim = model.E.shape[1]
+    a_list, b_list, y_list = [], [], []
+    for a in range(num_digits):
+        for b in range(num_digits):
+            a_list.append(a)
+            b_list.append(b)
+            y_list.append((a + b) % num_digits)
+    a_batch = np.array(a_list)
+    b_batch = np.array(b_list)
+    y_batch = np.array(y_list)
+    
+    params = {
+        "W_op1": model.W_op1,
+        "b_op1": model.b_op1,
+        "W_op2": model.W_op2,
+        "b_op2": model.b_op2,
+    }
+    if unfreeze_AE:
+        params["E"] = model.E
+        params["W_D"] = model.W_D
+        params["b_D"] = model.b_D
+        
+    opt = AdamOptimizer(lr=lr)
+    
+    for epoch in range(1, epochs + 1):
+        c_a = model.E[a_batch]
+        c_b = model.E[b_batch]
+        concatenated = np.concatenate([c_a, c_b], axis=1)
+        z_op1 = concatenated @ model.W_op1 + model.b_op1
+        h_op1 = np.maximum(z_op1, 0.0)
+        c_sum = h_op1 @ model.W_op2 + model.b_op2
+        logits = c_sum @ model.W_D + model.b_D
+        
+        ce_loss, dlogits = loss_and_grad_logits(logits, y_batch)
+        
+        target_code = model.E[y_batch]
+        diff_closure = c_sum - target_code
+        closure_loss = np.mean(np.sum(diff_closure**2, axis=1))
+        
+        # Gradients
+        dc_sum_ce = dlogits @ model.W_D.T
+        dc_sum_closure = 2.0 * diff_closure / len(y_batch)
+        dc_sum = dc_sum_ce + lambda_closure * dc_sum_closure
+        
+        dW_op2 = h_op1.T @ dc_sum
+        db_op2 = np.sum(dc_sum, axis=0)
+        dh_op1 = dc_sum @ model.W_op2.T
+        dz_op1 = dh_op1 * (z_op1 > 0.0)
+        dW_op1 = concatenated.T @ dz_op1
+        db_op1 = np.sum(dz_op1, axis=0)
+        
+        grads = {
+            "W_op1": dW_op1,
+            "b_op1": db_op1,
+            "W_op2": dW_op2,
+            "b_op2": db_op2,
+        }
+        if unfreeze_AE:
+            dW_D = c_sum.T @ dlogits
+            db_D = np.sum(dlogits, axis=0)
+            grads["W_D"] = dW_D
+            grads["b_D"] = db_D
+            
+            dconcatenated = dz_op1 @ model.W_op1.T
+            dc_a = dconcatenated[:, :code_dim]
+            dc_b = dconcatenated[:, code_dim:]
+            
+            dE = np.zeros_like(model.E)
+            np.add.at(dE, a_batch, dc_a)
+            np.add.at(dE, b_batch, dc_b)
+            dc_target_closure = -2.0 * lambda_closure * diff_closure / len(y_batch)
+            np.add.at(dE, y_batch, dc_target_closure)
+            grads["E"] = dE
+            
+        opt.update(params, grads)
+        
+        if not quiet and (epoch == 1 or epoch % 200 == 0 or epoch == epochs):
+            preds = np.argmax(logits, axis=1)
+            accuracy = np.mean(preds == y_batch)
+            print(f"  [Op] epoch={epoch:04d} ce={ce_loss:.4f} closure={closure_loss:.4f} accuracy={accuracy:.3f}")
+
+
+def evaluate_closed_add(model: ClosedLatentModel) -> float:
+    num_digits = model.E.shape[0]
+    a_list, b_list, y_list = [], [], []
+    for a in range(num_digits):
+        for b in range(num_digits):
+            a_list.append(a)
+            b_list.append(b)
+            y_list.append((a + b) % num_digits)
+    a_batch = np.array(a_list)
+    b_batch = np.array(b_list)
+    y_batch = np.array(y_list)
+    
+    c_a = model.E[a_batch]
+    c_b = model.E[b_batch]
+    concatenated = np.concatenate([c_a, c_b], axis=1)
+    z_op1 = concatenated @ model.W_op1 + model.b_op1
+    h_op1 = np.maximum(z_op1, 0.0)
+    c_sum = h_op1 @ model.W_op2 + model.b_op2
+    logits = c_sum @ model.W_D + model.b_D
+    preds = np.argmax(logits, axis=1)
+    return float(np.mean(preds == y_batch))
+
+
+def evaluate_closed_add_metrics(model: ClosedLatentModel) -> tuple[float, float, float]:
+    num_digits = model.E.shape[0]
+    a_list, b_list, y_list = [], [], []
+    for a in range(num_digits):
+        for b in range(num_digits):
+            a_list.append(a)
+            b_list.append(b)
+            y_list.append((a + b) % num_digits)
+    a_batch = np.array(a_list)
+    b_batch = np.array(b_list)
+    y_batch = np.array(y_list)
+    
+    c_a = model.E[a_batch]
+    c_b = model.E[b_batch]
+    concatenated = np.concatenate([c_a, c_b], axis=1)
+    z_op1 = concatenated @ model.W_op1 + model.b_op1
+    h_op1 = np.maximum(z_op1, 0.0)
+    c_sum = h_op1 @ model.W_op2 + model.b_op2
+    
+    # 2-operand acc (via decoder)
+    logits = c_sum @ model.W_D + model.b_D
+    preds = np.argmax(logits, axis=1)
+    two_op_acc = float(np.mean(preds == y_batch))
+    
+    # code MSE
+    target_code = model.E[y_batch]
+    code_mse = float(np.mean(np.sum((c_sum - target_code)**2, axis=1)))
+    
+    # nearest-code acc
+    dists = np.sum((c_sum[:, np.newaxis, :] - model.E[np.newaxis, :, :])**2, axis=2)
+    nearest_preds = np.argmin(dists, axis=1)
+    nearest_acc = float(np.mean(nearest_preds == y_batch))
+    
+    return two_op_acc, code_mse, nearest_acc
+
+
+def evaluate_closed_sum012(model: ClosedLatentModel) -> float:
+    num_digits = model.E.shape[0]
+    d0_list, d1_list, d2_list, y_list = [], [], [], []
+    for d0 in range(num_digits):
+        for d1 in range(num_digits):
+            for d2 in range(num_digits):
+                d0_list.append(d0)
+                d1_list.append(d1)
+                d2_list.append(d2)
+                y_list.append((d0 + d1 + d2) % num_digits)
+    d0_batch = np.array(d0_list)
+    d1_batch = np.array(d1_list)
+    d2_batch = np.array(d2_list)
+    y_batch = np.array(y_list)
+    
+    c0 = model.E[d0_batch]
+    c1 = model.E[d1_batch]
+    c2 = model.E[d2_batch]
+    
+    # Step 1: c01 = F(E(d0), E(d1))
+    concat1 = np.concatenate([c0, c1], axis=1)
+    z1 = concat1 @ model.W_op1 + model.b_op1
+    h1 = np.maximum(z1, 0.0)
+    c01 = h1 @ model.W_op2 + model.b_op2
+    
+    # Step 2: c012 = F(c01, E(d2))
+    concat2 = np.concatenate([c01, c2], axis=1)
+    z2 = concat2 @ model.W_op1 + model.b_op1
+    h2 = np.maximum(z2, 0.0)
+    c012 = h2 @ model.W_op2 + model.b_op2
+    
+    # Decode
+    logits = c012 @ model.W_D + model.b_D
+    preds = np.argmax(logits, axis=1)
+    return float(np.mean(preds == y_batch))
+
+
+def train_closed_latent_router(
+    model: ClosedLatentModel,
+    router: ClosedLatentRouter,
+    digit_x: np.ndarray,
+    y: np.ndarray,
+    operand_positions: tuple[int, int],
+    epochs: int,
+    lr: float,
+    alignment_weight: float,
+    unfreeze_all: bool = False,
+    quiet: bool = True,
+) -> None:
+    B = digit_x.shape[0]
+    code_dim = model.E.shape[1]
+    
+    # Extract inputs and decode them for alignment targets
+    d0 = np.argmax(digit_x[:, 0:5], axis=1)
+    d1 = np.argmax(digit_x[:, 5:10], axis=1)
+    d2 = np.argmax(digit_x[:, 10:15], axis=1)
+    digits_by_pos = [d0, d1, d2]
+    
+    pos_a, pos_b = operand_positions
+    target_a_digits = digits_by_pos[pos_a]
+    target_b_digits = digits_by_pos[pos_b]
+    
+    target_a = model.E[target_a_digits]
+    target_b = model.E[target_b_digits]
+    
+    params = {
+        "W_R": router.W_R,
+        "b_R": router.b_R,
+    }
+    if unfreeze_all:
+        params["W_op1"] = model.W_op1
+        params["b_op1"] = model.b_op1
+        params["W_op2"] = model.W_op2
+        params["b_op2"] = model.b_op2
+        params["E"] = model.E
+        params["W_D"] = model.W_D
+        params["b_D"] = model.b_D
+        
+    opt = AdamOptimizer(lr=lr)
+    
+    for epoch in range(1, epochs + 1):
+        if unfreeze_all:
+            target_a = model.E[target_a_digits]
+            target_b = model.E[target_b_digits]
+            
+        route_out = digit_x @ router.W_R + router.b_R
+        c_a = route_out[:, :code_dim]
+        c_b = route_out[:, code_dim:]
+        
+        concatenated = np.concatenate([c_a, c_b], axis=1)
+        z_op1 = concatenated @ model.W_op1 + model.b_op1
+        h_op1 = np.maximum(z_op1, 0.0)
+        c_sum = h_op1 @ model.W_op2 + model.b_op2
+        logits = c_sum @ model.W_D + model.b_D
+        
+        ce_loss, dlogits = loss_and_grad_logits(logits, y)
+        
+        align_loss_a = np.mean(np.sum((c_a - target_a)**2, axis=1))
+        align_loss_b = np.mean(np.sum((c_b - target_b)**2, axis=1))
+        align_loss = align_loss_a + align_loss_b
+        
+        # Backprop through F_add (frozen or unfrozen)
+        dc_sum = dlogits @ model.W_D.T
+        dh_op1 = dc_sum @ model.W_op2.T
+        dz_op1 = dh_op1 * (z_op1 > 0.0)
+        dconcatenated = dz_op1 @ model.W_op1.T
+        
+        dc_a_ce = dconcatenated[:, :code_dim]
+        dc_b_ce = dconcatenated[:, code_dim:]
+        
+        dc_a_align = 2.0 * (c_a - target_a) / B
+        dc_b_align = 2.0 * (c_b - target_b) / B
+        
+        dc_a = dc_a_ce + alignment_weight * dc_a_align
+        dc_b = dc_b_ce + alignment_weight * dc_b_align
+        droute_out = np.concatenate([dc_a, dc_b], axis=1)
+        
+        dW_R = digit_x.T @ droute_out
+        db_R = np.sum(droute_out, axis=0)
+        
+        grads = {
+            "W_R": dW_R,
+            "b_R": db_R,
+        }
+        
+        if unfreeze_all:
+            dW_op2 = h_op1.T @ dc_sum
+            db_op2 = np.sum(dc_sum, axis=0)
+            dW_op1 = concatenated.T @ dz_op1
+            db_op1 = np.sum(dz_op1, axis=0)
+            dW_D = c_sum.T @ dlogits
+            db_D = np.sum(dlogits, axis=0)
+            
+            grads["W_op2"] = dW_op2
+            grads["b_op2"] = db_op2
+            grads["W_op1"] = dW_op1
+            grads["b_op1"] = db_op1
+            grads["W_D"] = dW_D
+            grads["b_D"] = db_D
+            
+            dE = np.zeros_like(model.E)
+            np.add.at(dE, target_a_digits, -2.0 * alignment_weight * (c_a - target_a) / B)
+            np.add.at(dE, target_b_digits, -2.0 * alignment_weight * (c_b - target_b) / B)
+            grads["E"] = dE
+            
+        opt.update(params, grads)
+        
+        if not quiet and (epoch == 1 or epoch % 200 == 0 or epoch == epochs):
+            preds = np.argmax(logits, axis=1)
+            accuracy = np.mean(preds == y)
+            print(f"    [Router] epoch={epoch:04d} ce={ce_loss:.4f} align={align_loss:.4f} accuracy={accuracy:.3f}")
+
+
+def make_combinations(k: int, num_digits: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    grids = np.meshgrid(*[np.arange(num_digits) for _ in range(k)], indexing="ij")
+    digits = np.stack(grids, axis=-1).reshape(-1, k)
+    sums = np.sum(digits, axis=1) % num_digits
+    return digits, sums
+
+
+def evaluate_long_chain(
+    model: ClosedLatentModel,
+    digits: np.ndarray,
+    sums: np.ndarray,
+) -> tuple[float, float, float]:
+    c = model.E[digits[:, 0]]
+    for i in range(1, digits.shape[1]):
+        c_next = model.E[digits[:, i]]
+        concat = np.concatenate([c, c_next], axis=1)
+        z = concat @ model.W_op1 + model.b_op1
+        h = np.maximum(z, 0.0)
+        c = h @ model.W_op2 + model.b_op2
+        
+    logits = c @ model.W_D + model.b_D
+    preds = np.argmax(logits, axis=1)
+    acc = float(np.mean(preds == sums))
+    
+    target_code = model.E[sums]
+    gt_dist = float(np.mean(np.sum((c - target_code)**2, axis=1)))
+    
+    dists = np.sum((c[:, np.newaxis, :] - model.E[np.newaxis, :, :])**2, axis=2)
+    nearest_dist = float(np.mean(np.min(dists, axis=1)))
+    
+    return acc, gt_dist, nearest_dist
+
+
+def run_closure_ablation(
+    seed_count: int,
+    alignment_weight: float,
+) -> None:
+    lambdas = [0.0, 0.1, 1.0, 10.0, 100.0]
+    hidden_dim = 16
+    code_dim = 4
+    
+    print("\n=================================================================")
+    print("RUNNING CLOSURE LOSS ABLATION (LAMBDA SWEEP)")
+    print(f"Seeds: {seed_count}, Hidden Dim: {hidden_dim}, Code Dim: {code_dim}")
+    print("=================================================================")
+    
+    results = {}
+    for lam in lambdas:
+        two_op_accs = []
+        sum012_accs = []
+        code_mses = []
+        nearest_accs = []
+        
+        for seed in range(seed_count):
+            model = make_closed_latent_model(
+                num_digits=5,
+                code_dim=code_dim,
+                hidden_dim=hidden_dim,
+                seed=seed,
+            )
+            # Phase 1: AE
+            train_autoencoder(model, epochs=600, lr=0.01, margin=2.0, sep_weight=0.5, quiet=True)
+            # Phase 2: Operator
+            train_closed_op(model, epochs=1500, lr=0.01, lambda_closure=lam, quiet=True)
+            
+            two_op_acc, code_mse, nearest_acc = evaluate_closed_add_metrics(model)
+            sum012_acc = evaluate_closed_sum012(model)
+            
+            two_op_accs.append(two_op_acc)
+            sum012_accs.append(sum012_acc)
+            code_mses.append(code_mse)
+            nearest_accs.append(nearest_acc)
+            
+        results[lam] = {
+            "two_op": mean_std(two_op_accs),
+            "sum012": mean_std(sum012_accs),
+            "mse": mean_std(code_mses),
+            "nearest": mean_std(nearest_accs),
+        }
+        
+    print("\n=================================================================")
+    print("CLOSURE LOSS ABLATION RESULTS (SWEEP OVER LAMBDA)")
+    print("=================================================================")
+    print("lambda   2-operand acc    iterative SUM012  code MSE to E(tgt) nearest-code acc")
+    for lam in lambdas:
+        r = results[lam]
+        t_m, t_s = r["two_op"]
+        s_m, s_s = r["sum012"]
+        m_m, m_s = r["mse"]
+        n_m, n_s = r["nearest"]
+        print(
+            f"{lam:<8} "
+            f"{t_m:.3f}+/-{t_s:.3f}    "
+            f"{s_m:.3f}+/-{s_s:.3f}    "
+            f"{m_m:.3f}+/-{m_s:.3f}    "
+            f"{n_m:.3f}+/-{n_s:.3f}"
+        )
+    print("=================================================================\n")
+
+
+def run_freeze_ablation(
+    seed_count: int,
+    alignment_weight: float,
+) -> None:
+    hidden_dim = 16
+    code_dim = 4
+    
+    print("\n=================================================================")
+    print("RUNNING FREEZE VS UNFREEZE ABLATION")
+    print(f"Seeds: {seed_count}, Hidden Dim: {hidden_dim}, Code Dim: {code_dim}")
+    print("=================================================================")
+    
+    regimens = ["A (Fully Frozen)", "B (Unfreeze AE in Phase 2)", "C (Unfreeze all in Phase 3)"]
+    results = {reg: {
+        "two_op": [], "sum012": [], "routed_sum012": [],
+        "router01": [], "router12": [], "router02": []
+    } for reg in regimens}
+    
+    for seed in range(seed_count):
+        model_a = make_closed_latent_model(5, code_dim, hidden_dim, seed)
+        model_b = make_closed_latent_model(5, code_dim, hidden_dim, seed)
+        model_c = make_closed_latent_model(5, code_dim, hidden_dim, seed)
+        
+        train_autoencoder(model_a, epochs=600, lr=0.01, margin=2.0, sep_weight=0.5, quiet=True)
+        model_b.E = model_a.E.copy()
+        model_b.W_D = model_a.W_D.copy()
+        model_b.b_D = model_a.b_D.copy()
+        model_c.E = model_a.E.copy()
+        model_c.W_D = model_a.W_D.copy()
+        model_c.b_D = model_a.b_D.copy()
+        
+        # Train operator
+        train_closed_op(model_a, epochs=1500, lr=0.01, lambda_closure=10.0, unfreeze_AE=False, quiet=True)
+        two_op_a = evaluate_closed_add(model_a)
+        sum012_a = evaluate_closed_sum012(model_a)
+        
+        train_closed_op(model_b, epochs=1500, lr=0.01, lambda_closure=10.0, unfreeze_AE=True, quiet=True)
+        two_op_b = evaluate_closed_add(model_b)
+        sum012_b = evaluate_closed_sum012(model_b)
+        
+        train_closed_op(model_c, epochs=1500, lr=0.01, lambda_closure=10.0, unfreeze_AE=False, quiet=True)
+        two_op_c = evaluate_closed_add(model_c)
+        sum012_c = evaluate_closed_sum012(model_c)
+        
+        specs = (
+            MultiRouteOpSpec("ADD01", "add", (0, 1)),
+            MultiRouteOpSpec("ADD12", "add", (1, 2)),
+            MultiRouteOpSpec("ADD02", "add", (0, 2)),
+        )
+        datasets = {
+            spec.name: make_multi_route_dataset(spec, num_digits=5, sequence_digits=3)
+            for spec in specs
+        }
+        
+        routers_a = {
+            spec.name: ClosedLatentRouter(
+                W_R=np.random.default_rng(seed).normal(0.0, 1.0 / np.sqrt(15), (15, 2 * code_dim)),
+                b_R=np.zeros(2 * code_dim),
+            ) for spec in specs
+        }
+        routers_b = {
+            spec.name: ClosedLatentRouter(
+                W_R=np.random.default_rng(seed).normal(0.0, 1.0 / np.sqrt(15), (15, 2 * code_dim)),
+                b_R=np.zeros(2 * code_dim),
+            ) for spec in specs
+        }
+        routers_c = {
+            spec.name: ClosedLatentRouter(
+                W_R=np.random.default_rng(seed).normal(0.0, 1.0 / np.sqrt(15), (15, 2 * code_dim)),
+                b_R=np.zeros(2 * code_dim),
+            ) for spec in specs
+        }
+        
+        train_closed_latent_router(model_a, routers_a["ADD01"], datasets["ADD01"].digit_x, datasets["ADD01"].y, (0, 1), 800, 0.01, alignment_weight, False, True)
+        train_closed_latent_router(model_a, routers_a["ADD12"], datasets["ADD12"].digit_x, datasets["ADD12"].y, (1, 2), 800, 0.01, alignment_weight, False, True)
+        train_closed_latent_router(model_a, routers_a["ADD02"], datasets["ADD02"].digit_x, datasets["ADD02"].y, (0, 2), 800, 0.01, alignment_weight, False, True)
+        
+        train_closed_latent_router(model_b, routers_b["ADD01"], datasets["ADD01"].digit_x, datasets["ADD01"].y, (0, 1), 800, 0.01, alignment_weight, False, True)
+        train_closed_latent_router(model_b, routers_b["ADD12"], datasets["ADD12"].digit_x, datasets["ADD12"].y, (1, 2), 800, 0.01, alignment_weight, False, True)
+        train_closed_latent_router(model_b, routers_b["ADD02"], datasets["ADD02"].digit_x, datasets["ADD02"].y, (0, 2), 800, 0.01, alignment_weight, False, True)
+        
+        train_closed_latent_router(model_c, routers_c["ADD01"], datasets["ADD01"].digit_x, datasets["ADD01"].y, (0, 1), 800, 0.01, alignment_weight, True, True)
+        train_closed_latent_router(model_c, routers_c["ADD12"], datasets["ADD12"].digit_x, datasets["ADD12"].y, (1, 2), 800, 0.01, alignment_weight, True, True)
+        train_closed_latent_router(model_c, routers_c["ADD02"], datasets["ADD02"].digit_x, datasets["ADD02"].y, (0, 2), 800, 0.01, alignment_weight, True, True)
+        
+        def eval_regimen(model_reg, routers_reg):
+            accs = {}
+            for name, spec in zip(["ADD01", "ADD12", "ADD02"], specs):
+                ds = datasets[name]
+                route_out = ds.digit_x @ routers_reg[name].W_R + routers_reg[name].b_R
+                c_a = route_out[:, :code_dim]
+                c_b = route_out[:, code_dim:]
+                concat = np.concatenate([c_a, c_b], axis=1)
+                z = concat @ model_reg.W_op1 + model_reg.b_op1
+                h = np.maximum(z, 0.0)
+                c_sum = h @ model_reg.W_op2 + model_reg.b_op2
+                logits = c_sum @ model_reg.W_D + model_reg.b_D
+                preds = np.argmax(logits, axis=1)
+                accs[name] = float(np.mean(preds == ds.y))
+                
+            ds_sum = make_multi_route_dataset(MultiRouteOpSpec("SUM012", "add", (0, 1, 2)), num_digits=5, sequence_digits=3)
+            route_out01 = ds_sum.digit_x @ routers_reg["ADD01"].W_R + routers_reg["ADD01"].b_R
+            c0 = route_out01[:, :code_dim]
+            c1 = route_out01[:, code_dim:]
+            route_out12 = ds_sum.digit_x @ routers_reg["ADD12"].W_R + routers_reg["ADD12"].b_R
+            c2 = route_out12[:, code_dim:]
+            
+            concat1 = np.concatenate([c0, c1], axis=1)
+            z1 = concat1 @ model_reg.W_op1 + model_reg.b_op1
+            h1 = np.maximum(z1, 0.0)
+            c01 = h1 @ model_reg.W_op2 + model_reg.b_op2
+            
+            concat2 = np.concatenate([c01, c2], axis=1)
+            z2 = concat2 @ model_reg.W_op1 + model_reg.b_op1
+            h2 = np.maximum(z2, 0.0)
+            c012 = h2 @ model_reg.W_op2 + model_reg.b_op2
+            
+            logits = c012 @ model_reg.W_D + model_reg.b_D
+            preds = np.argmax(logits, axis=1)
+            accs["SUM012"] = float(np.mean(preds == ds_sum.y))
+            return accs
+            
+        accs_a = eval_regimen(model_a, routers_a)
+        accs_b = eval_regimen(model_b, routers_b)
+        accs_c = eval_regimen(model_c, routers_c)
+        
+        results["A (Fully Frozen)"]["two_op"].append(two_op_a)
+        results["A (Fully Frozen)"]["sum012"].append(sum012_a)
+        results["A (Fully Frozen)"]["routed_sum012"].append(accs_a["SUM012"])
+        results["A (Fully Frozen)"]["router01"].append(accs_a["ADD01"])
+        results["A (Fully Frozen)"]["router12"].append(accs_a["ADD12"])
+        results["A (Fully Frozen)"]["router02"].append(accs_a["ADD02"])
+        
+        results["B (Unfreeze AE in Phase 2)"]["two_op"].append(two_op_b)
+        results["B (Unfreeze AE in Phase 2)"]["sum012"].append(sum012_b)
+        results["B (Unfreeze AE in Phase 2)"]["routed_sum012"].append(accs_b["SUM012"])
+        results["B (Unfreeze AE in Phase 2)"]["router01"].append(accs_b["ADD01"])
+        results["B (Unfreeze AE in Phase 2)"]["router12"].append(accs_b["ADD12"])
+        results["B (Unfreeze AE in Phase 2)"]["router02"].append(accs_b["ADD02"])
+        
+        results["C (Unfreeze all in Phase 3)"]["two_op"].append(two_op_c)
+        results["C (Unfreeze all in Phase 3)"]["sum012"].append(sum012_c)
+        results["C (Unfreeze all in Phase 3)"]["routed_sum012"].append(accs_c["SUM012"])
+        results["C (Unfreeze all in Phase 3)"]["router01"].append(accs_c["ADD01"])
+        results["C (Unfreeze all in Phase 3)"]["router12"].append(accs_c["ADD12"])
+        results["C (Unfreeze all in Phase 3)"]["router02"].append(accs_c["ADD02"])
+        
+    print("\n=================================================================")
+    print("FREEZE VS UNFREEZE ABLATION SUMMARY")
+    print("=================================================================")
+    for reg in regimens:
+        print(f"\nRegimen: {reg}")
+        print("-" * 50)
+        two_m, two_s = mean_std(results[reg]["two_op"])
+        sum_m, sum_s = mean_std(results[reg]["sum012"])
+        rsum_m, rsum_s = mean_std(results[reg]["routed_sum012"])
+        r01_m, r01_s = mean_std(results[reg]["router01"])
+        r12_m, r12_s = mean_std(results[reg]["router12"])
+        r02_m, r02_s = mean_std(results[reg]["router02"])
+        print(f"  2-operand ADD Acc           : {two_m:.3f}+/-{two_s:.3f}")
+        print(f"  Iterative SUM012 Acc (Unrt) : {sum_m:.3f}+/-{sum_s:.3f}")
+        print(f"  ADD01 Router Acc            : {r01_m:.3f}+/-{r01_s:.3f}")
+        print(f"  ADD12 Router Acc            : {r12_m:.3f}+/-{r12_s:.3f}")
+        print(f"  ADD02 Router Acc            : {r02_m:.3f}+/-{r02_s:.3f}")
+        print(f"  Routed SUM012 Acc           : {rsum_m:.3f}+/-{rsum_s:.3f}")
+    print("=================================================================\n")
+
+
+def run_long_composition_test(
+    seed_count: int,
+    alignment_weight: float,
+) -> None:
+    hidden_dims = (64, 16, 8)
+    
+    print("\n=================================================================")
+    print("RUNNING LONG COMPOSITION & MANIFOLD DRIFT TEST")
+    print(f"Seeds: {seed_count}, Alignment Weight: {alignment_weight}")
+    print("=================================================================")
+    
+    results = {}
+    for hidden_dim in hidden_dims:
+        code_dim = max(4, hidden_dim // 4)
+        results[hidden_dim] = {k: {"acc": [], "gt_dist": [], "manifold_dist": []} for k in (2, 3, 4, 5)}
+        
+        for seed in range(seed_count):
+            model = make_closed_latent_model(
+                num_digits=5,
+                code_dim=code_dim,
+                hidden_dim=hidden_dim,
+                seed=seed,
+            )
+            train_autoencoder(model, epochs=600, lr=0.01, margin=2.0, sep_weight=0.5, quiet=True)
+            train_closed_op(model, epochs=1500, lr=0.01, lambda_closure=10.0, quiet=True)
+            
+            for k in (2, 3, 4, 5):
+                digits, sums = make_combinations(k, num_digits=5)
+                acc, gt_dist, manifold_dist = evaluate_long_chain(model, digits, sums)
+                results[hidden_dim][k]["acc"].append(acc)
+                results[hidden_dim][k]["gt_dist"].append(gt_dist)
+                results[hidden_dim][k]["manifold_dist"].append(manifold_dist)
+                
+    print("\n=================================================================")
+    print("LONG COMPOSITION & DRIFT RESULTS SUMMARY (MEAN +/- STD)")
+    print("=================================================================")
+    for hidden_dim in hidden_dims:
+        print(f"\nHidden Dim: {hidden_dim} (Code Dim: {max(4, hidden_dim // 4)})")
+        print("-" * 75)
+        print("Operands  Calls  Classification Acc  Distance to Target  Distance to Manifold")
+        for k in (2, 3, 4, 5):
+            r = results[hidden_dim][k]
+            a_m, a_s = mean_std(r["acc"])
+            g_m, g_s = mean_std(r["gt_dist"])
+            m_m, m_s = mean_std(r["manifold_dist"])
+            print(
+                f"{k:<9} "
+                f"{k-1:<6} "
+                f"{a_m:.3f}+/-{a_s:.3f}         "
+                f"{g_m:.3f}+/-{g_s:.3f}          "
+                f"{m_m:.3f}+/-{m_s:.3f}"
+            )
+    print("=================================================================\n")
+
+
+def run_closed_latent_benchmark(
+    seed_count: int,
+    alignment_weight: float,
+    verbose: bool,
+) -> None:
+    hidden_dims = (64, 16, 8)
+    
+    print("\n=================================================================")
+    print("RUNNING CLOSED LATENT ADD EXPERIMENT LADDER")
+    print(f"Seeds: {seed_count}, Alignment Weight: {alignment_weight}")
+    print("=================================================================")
+    
+    final_rows = []
+    
+    for hidden_dim in hidden_dims:
+        code_dim = max(4, hidden_dim // 4)
+        
+        direct_accs = []
+        bridge_accs = []
+        closed_accs = []
+        closed_add_accs = []
+        
+        router_add01_accs = []
+        router_add12_accs = []
+        router_add02_accs = []
+        router_sum012_accs = []
+        
+        for seed in range(seed_count):
+            if verbose:
+                print(f"\n--- Running hidden_dim={hidden_dim}, code_dim={code_dim}, seed={seed} ---")
+                
+            baseline_results = composition_benchmark_metrics(
+                seed=seed,
+                hidden_dim=hidden_dim,
+                alignment_weight=alignment_weight,
+                policy="admission",
+                verbose=False,
+            )
+            direct_acc = baseline_results["closure"]["direct_accuracy"]
+            bridge_acc = baseline_results["closure"]["latent_bridge_test_accuracy"]
+            direct_accs.append(direct_acc)
+            bridge_accs.append(bridge_acc)
+            
+            model = make_closed_latent_model(
+                num_digits=5,
+                code_dim=code_dim,
+                hidden_dim=hidden_dim,
+                seed=seed,
+            )
+            
+            # Phase 1: Pretrain Autoencoder
+            train_autoencoder(model, epochs=600, lr=0.01, margin=2.0, sep_weight=0.5, quiet=not verbose)
+            
+            # Phase 2: Train addition MLP (Closed Latent ADD)
+            train_closed_op(model, epochs=1500, lr=0.01, lambda_closure=10.0, quiet=not verbose)
+            
+            # Evaluate Two-Operand (Experiment 1)
+            two_op_acc = evaluate_closed_add(model)
+            closed_add_accs.append(two_op_acc)
+            
+            # Evaluate Iterative SUM012 (Experiment 2)
+            closed_sum012_acc = evaluate_closed_sum012(model)
+            closed_accs.append(closed_sum012_acc)
+            
+            # Phase 4: Sequential route learning
+            specs = (
+                MultiRouteOpSpec("ADD01", "add", (0, 1)),
+                MultiRouteOpSpec("ADD12", "add", (1, 2)),
+                MultiRouteOpSpec("ADD02", "add", (0, 2)),
+            )
+            datasets = {
+                spec.name: make_multi_route_dataset(spec, num_digits=5, sequence_digits=3)
+                for spec in specs
+            }
+            
+            routers = {
+                spec.name: ClosedLatentRouter(
+                    W_R=np.random.default_rng(seed).normal(0.0, 1.0 / np.sqrt(15), (15, 2 * code_dim)),
+                    b_R=np.zeros(2 * code_dim),
+                )
+                for spec in specs
+            }
+            
+            # Train routers sequentially
+            train_closed_latent_router(
+                model, routers["ADD01"], datasets["ADD01"].digit_x, datasets["ADD01"].y,
+                operand_positions=(0, 1), epochs=800, lr=0.01, alignment_weight=alignment_weight, quiet=not verbose
+            )
+            train_closed_latent_router(
+                model, routers["ADD12"], datasets["ADD12"].digit_x, datasets["ADD12"].y,
+                operand_positions=(1, 2), epochs=800, lr=0.01, alignment_weight=alignment_weight, quiet=not verbose
+            )
+            train_closed_latent_router(
+                model, routers["ADD02"], datasets["ADD02"].digit_x, datasets["ADD02"].y,
+                operand_positions=(0, 2), epochs=800, lr=0.01, alignment_weight=alignment_weight, quiet=not verbose
+            )
+            
+            # Evaluate routers
+            def eval_router(r_name, pos_a, pos_b):
+                ds = datasets[r_name]
+                route_out = ds.digit_x @ routers[r_name].W_R + routers[r_name].b_R
+                c_a = route_out[:, :code_dim]
+                c_b = route_out[:, code_dim:]
+                concat = np.concatenate([c_a, c_b], axis=1)
+                z = concat @ model.W_op1 + model.b_op1
+                h = np.maximum(z, 0.0)
+                c_sum = h @ model.W_op2 + model.b_op2
+                logits = c_sum @ model.W_D + model.b_D
+                preds = np.argmax(logits, axis=1)
+                return float(np.mean(preds == ds.y))
+                
+            acc01 = eval_router("ADD01", 0, 1)
+            acc12 = eval_router("ADD12", 1, 2)
+            acc02 = eval_router("ADD02", 0, 2)
+            router_add01_accs.append(acc01)
+            router_add12_accs.append(acc12)
+            router_add02_accs.append(acc02)
+            
+            # Evaluate iterative SUM012 with sequential routers
+            ds_sum = make_multi_route_dataset(MultiRouteOpSpec("SUM012", "add", (0, 1, 2)), num_digits=5, sequence_digits=3)
+            route_out01 = ds_sum.digit_x @ routers["ADD01"].W_R + routers["ADD01"].b_R
+            c0 = route_out01[:, :code_dim]
+            c1 = route_out01[:, code_dim:]
+            
+            route_out12 = ds_sum.digit_x @ routers["ADD12"].W_R + routers["ADD12"].b_R
+            c2 = route_out12[:, code_dim:]
+            
+            concat1 = np.concatenate([c0, c1], axis=1)
+            z1 = concat1 @ model.W_op1 + model.b_op1
+            h1 = np.maximum(z1, 0.0)
+            c01 = h1 @ model.W_op2 + model.b_op2
+            
+            concat2 = np.concatenate([c01, c2], axis=1)
+            z2 = concat2 @ model.W_op1 + model.b_op1
+            h2 = np.maximum(z2, 0.0)
+            c012 = h2 @ model.W_op2 + model.b_op2
+            
+            logits = c012 @ model.W_D + model.b_D
+            preds = np.argmax(logits, axis=1)
+            routed_sum012_acc = float(np.mean(preds == ds_sum.y))
+            router_sum012_accs.append(routed_sum012_acc)
+            
+            if verbose:
+                print(f"  [Seed {seed}] 2-Op Acc={two_op_acc:.3f}, Closed SUM012={closed_sum012_acc:.3f}")
+                print(f"  [Seed {seed}] Seq Router Accs: ADD01={acc01:.3f}, ADD12={acc12:.3f}, ADD02={acc02:.3f}")
+                print(f"  [Seed {seed}] Routed SUM012 (Composition with sequential routers)={routed_sum012_acc:.3f}")
+                
+        d_mean, d_std = mean_std(direct_accs)
+        b_mean, b_std = mean_std(bridge_accs)
+        c_mean, c_std = mean_std(closed_accs)
+        ca_mean, ca_std = mean_std(closed_add_accs)
+        
+        r01_mean, r01_std = mean_std(router_add01_accs)
+        r12_mean, r12_std = mean_std(router_add12_accs)
+        r02_mean, r02_std = mean_std(router_add02_accs)
+        rsum_mean, rsum_std = mean_std(router_sum012_accs)
+        
+        final_rows.append({
+            "hidden_dim": hidden_dim,
+            "code_dim": code_dim,
+            "direct": (d_mean, d_std),
+            "bridge": (b_mean, b_std),
+            "closed": (c_mean, c_std),
+            "closed_add": (ca_mean, ca_std),
+            "router_add01": (r01_mean, r01_std),
+            "router_add12": (r12_mean, r12_std),
+            "router_add02": (r02_mean, r02_std),
+            "router_sum012": (rsum_mean, rsum_std),
+        })
+
+    print("\n=================================================================")
+    print("CLOSED LATENT ADD COMPOSITION COMPARISON SUMMARY (MEAN +/- STD)")
+    print("=================================================================")
+    print(f"Setting: seeds={seed_count}")
+    print("-----------------------------------------------------------------")
+    print(
+        "hidden_dim  code_dim  direct_acc     latent_bridge  closed_latent  "
+        "closed_2operand"
+    )
+    for row in final_rows:
+        d_mean, d_std = row["direct"]
+        b_mean, b_std = row["bridge"]
+        c_mean, c_std = row["closed"]
+        ca_mean, ca_std = row["closed_add"]
+        print(
+            f"{row['hidden_dim']:<11} "
+            f"{row['code_dim']:<9} "
+            f"{d_mean:.3f}+/-{d_std:.3f}  "
+            f"{b_mean:.3f}+/-{b_std:.3f}  "
+            f"{c_mean:.3f}+/-{c_std:.3f}  "
+            f"{ca_mean:.3f}+/-{ca_std:.3f}"
+        )
+
+    print("\n=================================================================")
+    print("SEQUENTIAL ROUTING (CONTINUAL LEARNING) SUMMARY (MEAN +/- STD)")
+    print("=================================================================")
+    print("hidden_dim  ADD01_acc      ADD12_acc      ADD02_acc      Routed SUM012_acc")
+    for row in final_rows:
+        r01_m, r01_s = row["router_add01"]
+        r12_m, r12_s = row["router_add12"]
+        r02_m, r02_s = row["router_add02"]
+        rsum_m, rsum_s = row["router_sum012"]
+        print(
+            f"{row['hidden_dim']:<11} "
+            f"{r01_m:.3f}+/-{r01_s:.3f}  "
+            f"{r12_m:.3f}+/-{r12_s:.3f}  "
+            f"{r02_m:.3f}+/-{r02_s:.3f}  "
+            f"{rsum_m:.3f}+/-{rsum_s:.3f}"
+        )
+    print("=================================================================\n")
+
+
+class MultiOperatorLatentModel:
+    def __init__(self, num_digits: int, code_dim: int, hidden_dim: int, seed: int):
+        rng = np.random.default_rng(seed)
+        # Shared boundary
+        self.E = rng.normal(0.0, 1.0, (num_digits, code_dim))
+        self.W_D = rng.normal(0.0, 1.0 / np.sqrt(code_dim), (code_dim, num_digits))
+        self.b_D = np.zeros(num_digits)
+        
+        # Addition operator MLP
+        self.W_add1 = rng.normal(0.0, 1.0 / np.sqrt(2 * code_dim), (2 * code_dim, hidden_dim))
+        self.b_add1 = np.full(hidden_dim, 0.01)  # tiny positive bias to prevent dead ReLUs
+        self.W_add2 = rng.normal(0.0, 1.0 / np.sqrt(hidden_dim), (hidden_dim, code_dim))
+        self.b_add2 = np.zeros(code_dim)
+        
+        # Maximum operator MLP
+        self.W_max1 = rng.normal(0.0, 1.0 / np.sqrt(2 * code_dim), (2 * code_dim, hidden_dim))
+        self.b_max1 = np.full(hidden_dim, 0.01)
+        self.W_max2 = rng.normal(0.0, 1.0 / np.sqrt(hidden_dim), (hidden_dim, code_dim))
+        self.b_max2 = np.zeros(code_dim)
+        
+        # Copy operator MLP
+        self.W_copy1 = rng.normal(0.0, 1.0 / np.sqrt(code_dim), (code_dim, hidden_dim))
+        self.b_copy1 = np.full(hidden_dim, 0.01)
+        self.W_copy2 = rng.normal(0.0, 1.0 / np.sqrt(hidden_dim), (hidden_dim, code_dim))
+        self.b_copy2 = np.zeros(code_dim)
+
+
+def train_multi_closed_ops(
+    model: MultiOperatorLatentModel,
+    ops_to_train: list,
+    epochs: int,
+    lr: float,
+    lambda_closure: float,
+    quiet: bool = True,
+) -> None:
+    num_digits = model.E.shape[0]
+    
+    a_list, b_list = [], []
+    for a in range(num_digits):
+        for b in range(num_digits):
+            a_list.append(a)
+            b_list.append(b)
+    ab_a = np.array(a_list)
+    ab_b = np.array(b_list)
+    copy_batch = np.arange(num_digits)
+    
+    params = {}
+    if "add" in ops_to_train:
+        params["W_add1"] = model.W_add1
+        params["b_add1"] = model.b_add1
+        params["W_add2"] = model.W_add2
+        params["b_add2"] = model.b_add2
+    if "max" in ops_to_train:
+        params["W_max1"] = model.W_max1
+        params["b_max1"] = model.b_max1
+        params["W_max2"] = model.W_max2
+        params["b_max2"] = model.b_max2
+    if "copy" in ops_to_train:
+        params["W_copy1"] = model.W_copy1
+        params["b_copy1"] = model.b_copy1
+        params["W_copy2"] = model.W_copy2
+        params["b_copy2"] = model.b_copy2
+        
+    opt = AdamOptimizer(lr=lr)
+    
+    for epoch in range(1, epochs + 1):
+        grads = {}
+        
+        if "add" in ops_to_train:
+            c_a = model.E[ab_a]
+            c_b = model.E[ab_b]
+            concatenated = np.concatenate([c_a, c_b], axis=1)
+            z1 = concatenated @ model.W_add1 + model.b_add1
+            h1 = np.maximum(z1, 0.0)
+            c_out = h1 @ model.W_add2 + model.b_add2
+            logits = c_out @ model.W_D + model.b_D
+            
+            y_add = (ab_a + ab_b) % num_digits
+            _, dlogits = loss_and_grad_logits(logits, y_add)
+            
+            target_code = model.E[y_add]
+            diff_closure = c_out - target_code
+            
+            dc_out_ce = dlogits @ model.W_D.T
+            dc_out_closure = 2.0 * diff_closure / len(y_add)
+            dc_out = dc_out_ce + lambda_closure * dc_out_closure
+            
+            grads["W_add2"] = h1.T @ dc_out
+            grads["b_add2"] = np.sum(dc_out, axis=0)
+            dh1 = dc_out @ model.W_add2.T
+            dz1 = dh1 * (z1 > 0.0)
+            grads["W_add1"] = concatenated.T @ dz1
+            grads["b_add1"] = np.sum(dz1, axis=0)
+            
+        if "max" in ops_to_train:
+            c_a = model.E[ab_a]
+            c_b = model.E[ab_b]
+            concatenated = np.concatenate([c_a, c_b], axis=1)
+            z1 = concatenated @ model.W_max1 + model.b_max1
+            h1 = np.maximum(z1, 0.0)
+            c_out = h1 @ model.W_max2 + model.b_max2
+            logits = c_out @ model.W_D + model.b_D
+            
+            y_max = np.maximum(ab_a, ab_b)
+            _, dlogits = loss_and_grad_logits(logits, y_max)
+            
+            target_code = model.E[y_max]
+            diff_closure = c_out - target_code
+            
+            dc_out_ce = dlogits @ model.W_D.T
+            dc_out_closure = 2.0 * diff_closure / len(y_max)
+            dc_out = dc_out_ce + lambda_closure * dc_out_closure
+            
+            grads["W_max2"] = h1.T @ dc_out
+            grads["b_max2"] = np.sum(dc_out, axis=0)
+            dh1 = dc_out @ model.W_max2.T
+            dz1 = dh1 * (z1 > 0.0)
+            grads["W_max1"] = concatenated.T @ dz1
+            grads["b_max1"] = np.sum(dz1, axis=0)
+            
+        if "copy" in ops_to_train:
+            c_a = model.E[copy_batch]
+            z1 = c_a @ model.W_copy1 + model.b_copy1
+            h1 = np.maximum(z1, 0.0)
+            c_out = h1 @ model.W_copy2 + model.b_copy2
+            logits = c_out @ model.W_D + model.b_D
+            
+            _, dlogits = loss_and_grad_logits(logits, copy_batch)
+            
+            target_code = model.E[copy_batch]
+            diff_closure = c_out - target_code
+            
+            dc_out_ce = dlogits @ model.W_D.T
+            dc_out_closure = 2.0 * diff_closure / len(copy_batch)
+            dc_out = dc_out_ce + lambda_closure * dc_out_closure
+            
+            grads["W_copy2"] = h1.T @ dc_out
+            grads["b_copy2"] = np.sum(dc_out, axis=0)
+            dh1 = dc_out @ model.W_copy2.T
+            dz1 = dh1 * (z1 > 0.0)
+            grads["W_copy1"] = c_a.T @ dz1
+            grads["b_copy1"] = np.sum(dz1, axis=0)
+            
+        opt.update(params, grads)
+
+
+def evaluate_multi_ops(model: MultiOperatorLatentModel) -> dict:
+    num_digits = model.E.shape[0]
+    
+    a_list, b_list = [], []
+    for a in range(num_digits):
+        for b in range(num_digits):
+            a_list.append(a)
+            b_list.append(b)
+    ab_a = np.array(a_list)
+    ab_b = np.array(b_list)
+    
+    c_a = model.E[ab_a]
+    c_b = model.E[ab_b]
+    
+    # ADD
+    concat_add = np.concatenate([c_a, c_b], axis=1)
+    h_add = np.maximum(concat_add @ model.W_add1 + model.b_add1, 0.0)
+    c_add = h_add @ model.W_add2 + model.b_add2
+    logits_add = c_add @ model.W_D + model.b_D
+    y_add = (ab_a + ab_b) % num_digits
+    add_acc = float(np.mean(np.argmax(logits_add, axis=1) == y_add))
+    
+    # MAX
+    concat_max = np.concatenate([c_a, c_b], axis=1)
+    h_max = np.maximum(concat_max @ model.W_max1 + model.b_max1, 0.0)
+    c_max = h_max @ model.W_max2 + model.b_max2
+    logits_max = c_max @ model.W_D + model.b_D
+    y_max = np.maximum(ab_a, ab_b)
+    max_acc = float(np.mean(np.argmax(logits_max, axis=1) == y_max))
+    
+    # COPY
+    copy_batch = np.arange(num_digits)
+    c_copy_in = model.E[copy_batch]
+    h_copy = np.maximum(c_copy_in @ model.W_copy1 + model.b_copy1, 0.0)
+    c_copy = h_copy @ model.W_copy2 + model.b_copy2
+    logits_copy = c_copy @ model.W_D + model.b_D
+    copy_acc = float(np.mean(np.argmax(logits_copy, axis=1) == copy_batch))
+    
+    return {"add": add_acc, "max": max_acc, "copy": copy_acc}
+
+
+def evaluate_mixed_compositions(model: MultiOperatorLatentModel) -> dict:
+    num_digits = model.E.shape[0]
+    d0_list, d1_list, d2_list = [], [], []
+    for d0 in range(num_digits):
+        for d1 in range(num_digits):
+            for d2 in range(num_digits):
+                d0_list.append(d0)
+                d1_list.append(d1)
+                d2_list.append(d2)
+    d0 = np.array(d0_list)
+    d1 = np.array(d1_list)
+    d2 = np.array(d2_list)
+    
+    c0 = model.E[d0]
+    c1 = model.E[d1]
+    c2 = model.E[d2]
+    
+    # Task 1: max(add(d0, d1), d2)
+    concat1 = np.concatenate([c0, c1], axis=1)
+    h_add1 = np.maximum(concat1 @ model.W_add1 + model.b_add1, 0.0)
+    c_add1 = h_add1 @ model.W_add2 + model.b_add2
+    concat2 = np.concatenate([c_add1, c2], axis=1)
+    h_max2 = np.maximum(concat2 @ model.W_max1 + model.b_max1, 0.0)
+    c_out1 = h_max2 @ model.W_max2 + model.b_max2
+    logits1 = c_out1 @ model.W_D + model.b_D
+    y_tgt1 = np.maximum((d0 + d1) % num_digits, d2)
+    acc1 = float(np.mean(np.argmax(logits1, axis=1) == y_tgt1))
+    
+    # Task 2: add(max(d0, d1), d2)
+    concat1 = np.concatenate([c0, c1], axis=1)
+    h_max1 = np.maximum(concat1 @ model.W_max1 + model.b_max1, 0.0)
+    c_max1 = h_max1 @ model.W_max2 + model.b_max2
+    concat2 = np.concatenate([c_max1, c2], axis=1)
+    h_add2 = np.maximum(concat2 @ model.W_add1 + model.b_add1, 0.0)
+    c_out2 = h_add2 @ model.W_add2 + model.b_add2
+    logits2 = c_out2 @ model.W_D + model.b_D
+    y_tgt2 = (np.maximum(d0, d1) + d2) % num_digits
+    acc2 = float(np.mean(np.argmax(logits2, axis=1) == y_tgt2))
+    
+    # Task 3: add(copy(d2), d0)
+    h_copy1 = np.maximum(c2 @ model.W_copy1 + model.b_copy1, 0.0)
+    c_copy1 = h_copy1 @ model.W_copy2 + model.b_copy2
+    concat2 = np.concatenate([c_copy1, c0], axis=1)
+    h_add2 = np.maximum(concat2 @ model.W_add1 + model.b_add1, 0.0)
+    c_out3 = h_add2 @ model.W_add2 + model.b_add2
+    logits3 = c_out3 @ model.W_D + model.b_D
+    y_tgt3 = (d2 + d0) % num_digits
+    acc3 = float(np.mean(np.argmax(logits3, axis=1) == y_tgt3))
+    
+    return {"max_of_sum": acc1, "sum_of_max": acc2, "sum_of_copy": acc3}
+
+
+def run_mixed_operator_benchmark(
+    seed_count: int,
+    alignment_weight: float = 10.0,
+) -> None:
+    hidden_dim = 16
+    code_dim = 4
+    
+    print("\n=================================================================")
+    print("RUNNING CLOSED LATENT ALGEBRA (MIXED OPERATORS)")
+    print(f"Seeds: {seed_count}, Hidden Dim: {hidden_dim}, Code Dim: {code_dim}")
+    print("=================================================================")
+    
+    timelines = ["A (Simultaneous)", "B (Sequential)"]
+    metrics = ["add_acc", "max_acc", "copy_acc", "max_of_sum", "sum_of_max", "sum_of_copy"]
+    
+    results = {time: {met: [] for met in metrics} for time in timelines}
+    
+    for seed in range(seed_count):
+        # Timeline A (Simultaneous)
+        model_a = MultiOperatorLatentModel(5, code_dim, hidden_dim, seed)
+        train_autoencoder(model_a, epochs=600, lr=0.01, margin=2.0, sep_weight=0.5, quiet=True)
+        train_multi_closed_ops(model_a, ["add", "max", "copy"], epochs=1500, lr=0.01, lambda_closure=alignment_weight, quiet=True)
+        
+        ops_a = evaluate_multi_ops(model_a)
+        comp_a = evaluate_mixed_compositions(model_a)
+        results["A (Simultaneous)"]["add_acc"].append(ops_a["add"])
+        results["A (Simultaneous)"]["max_acc"].append(ops_a["max"])
+        results["A (Simultaneous)"]["copy_acc"].append(ops_a["copy"])
+        results["A (Simultaneous)"]["max_of_sum"].append(comp_a["max_of_sum"])
+        results["A (Simultaneous)"]["sum_of_max"].append(comp_a["sum_of_max"])
+        results["A (Simultaneous)"]["sum_of_copy"].append(comp_a["sum_of_copy"])
+        
+        # Timeline B (Sequential Operator learning)
+        model_b = MultiOperatorLatentModel(5, code_dim, hidden_dim, seed)
+        train_autoencoder(model_b, epochs=600, lr=0.01, margin=2.0, sep_weight=0.5, quiet=True)
+        
+        # Stage 1: Train ADD only
+        train_multi_closed_ops(model_b, ["add"], epochs=1500, lr=0.01, lambda_closure=alignment_weight, quiet=True)
+        # Stage 2: Freeze E/D and ADD, train MAX and COPY
+        train_multi_closed_ops(model_b, ["max", "copy"], epochs=1500, lr=0.01, lambda_closure=alignment_weight, quiet=True)
+        
+        ops_b = evaluate_multi_ops(model_b)
+        comp_b = evaluate_mixed_compositions(model_b)
+        results["B (Sequential)"]["add_acc"].append(ops_b["add"])
+        results["B (Sequential)"]["max_acc"].append(ops_b["max"])
+        results["B (Sequential)"]["copy_acc"].append(ops_b["copy"])
+        results["B (Sequential)"]["max_of_sum"].append(comp_b["max_of_sum"])
+        results["B (Sequential)"]["sum_of_max"].append(comp_b["sum_of_max"])
+        results["B (Sequential)"]["sum_of_copy"].append(comp_b["sum_of_copy"])
+        
+    print("\n=================================================================")
+    print("CLOSED LATENT ALGEBRA (MIXED OPERATORS) SUMMARY (MEAN +/- STD)")
+    print("=================================================================")
+    for time in timelines:
+        print(f"\nTimeline: {time}")
+        print("-" * 50)
+        for met in metrics:
+            m, s = mean_std(results[time][met])
+            print(f"  {met:<15}: {m:.3f}+/-{s:.3f}")
+    print("=================================================================\n")
+
+
+# =====================================================================
+# CONTINUAL OPERATOR LEARNING EXPERIMENT (PHASE 5)
+# =====================================================================
+
+def generate_programs(library_ops: dict[str, int], sequence_digits: int, max_depth: int = 2) -> list[tuple]:
+    vars_list = [("var", i) for i in range(sequence_digits)]
+    programs = []
+    
+    # Depth 1: op(args...)
+    for op_name, op_arity in library_ops.items():
+        if op_arity == 1:
+            for v in vars_list:
+                programs.append(("op", op_name, (v,)))
+        elif op_arity == 2:
+            for v1 in vars_list:
+                for v2 in vars_list:
+                    programs.append(("op", op_name, (v1, v2)))
+                    
+    if max_depth < 2:
+        return programs
+        
+    depth1_programs = list(programs)
+    
+    # Depth 2: op(args...) where at least one arg is a depth 1 program.
+    for op_name, op_arity in library_ops.items():
+        if op_arity == 1:
+            for p1 in depth1_programs:
+                programs.append(("op", op_name, (p1,)))
+        elif op_arity == 2:
+            for p1 in depth1_programs:
+                for v in vars_list:
+                    programs.append(("op", op_name, (p1, v)))
+            for v in vars_list:
+                for p2 in depth1_programs:
+                    programs.append(("op", op_name, (v, p2)))
+            for p1 in depth1_programs:
+                for p2 in depth1_programs:
+                    programs.append(("op", op_name, (p1, p2)))
+                    
+    return programs
+
+
+def eval_program(program, E, W_D, b_D, operator_library, digit_indices):
+    def rec(node):
+        if node[0] == "var":
+            idx = node[1]
+            return E[digit_indices[:, idx]]
+        elif node[0] == "op":
+            op_name = node[1]
+            args = node[2]
+            arg_codes = []
+            for arg in args:
+                arg_codes.append(rec(arg))
+            if len(arg_codes) == 1:
+                inp = arg_codes[0]
+            else:
+                inp = np.concatenate(arg_codes, axis=1)
+            op_params = operator_library[op_name]
+            z1 = inp @ op_params["W1"] + op_params["b1"]
+            h1 = np.maximum(z1, 0.0)
+            return h1 @ op_params["W2"] + op_params["b2"]
+            
+    out_code = rec(program)
+    logits = out_code @ W_D + b_D
+    return out_code, logits
+
+
+def search_best_program(library_ops, sequence_digits, E, W_D, b_D, operator_library, digit_indices, targets):
+    if not library_ops:
+        return None, 0.0, float('inf')
+        
+    candidate_programs = generate_programs(library_ops, sequence_digits, max_depth=2)
+    best_program = None
+    best_acc = -1.0
+    best_loss = float('inf')
+    
+    for prog in candidate_programs:
+        _, logits = eval_program(prog, E, W_D, b_D, operator_library, digit_indices)
+        preds = np.argmax(logits, axis=1)
+        acc = float(np.mean(preds == targets))
+        loss, _ = loss_and_grad_logits(logits, targets)
+        
+        if acc > best_acc or (abs(acc - best_acc) < 1e-9 and loss < best_loss):
+            best_acc = acc
+            best_loss = loss
+            best_program = prog
+            
+    return best_program, best_acc, best_loss
+
+
+def train_dynamic_operator(
+    E: np.ndarray,
+    W_D: np.ndarray,
+    b_D: np.ndarray,
+    arity: int,
+    code_dim: int,
+    hidden_dim: int,
+    digit_indices: np.ndarray,
+    targets: np.ndarray,
+    epochs: int,
+    lr: float,
+    lambda_closure: float,
+    seed: int,
+) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    input_dim = arity * code_dim
+    
+    op_params = {
+        "W1": rng.normal(0.0, 1.0 / np.sqrt(input_dim), (input_dim, hidden_dim)),
+        "b1": np.full(hidden_dim, 0.01),
+        "W2": rng.normal(0.0, 1.0 / np.sqrt(hidden_dim), (hidden_dim, code_dim)),
+        "b2": np.zeros(code_dim),
+    }
+    
+    opt = AdamOptimizer(lr=lr)
+    
+    for epoch in range(1, epochs + 1):
+        if arity == 1:
+            inp = E[digit_indices[:, 0]]
+          # binary or higher
+        else:
+            inp = np.concatenate([E[digit_indices[:, i]] for i in range(arity)], axis=1)
+            
+        z1 = inp @ op_params["W1"] + op_params["b1"]
+        h1 = np.maximum(z1, 0.0)
+        out_code = h1 @ op_params["W2"] + op_params["b2"]
+        logits = out_code @ W_D + b_D
+        
+        ce_loss, dlogits = loss_and_grad_logits(logits, targets)
+        
+        target_code = E[targets]
+        diff_closure = out_code - target_code
+        
+        dc_out_ce = dlogits @ W_D.T
+        dc_out_closure = 2.0 * diff_closure / len(targets)
+        dc_out = dc_out_ce + lambda_closure * dc_out_closure
+        
+        dW2 = h1.T @ dc_out
+        db2 = np.sum(dc_out, axis=0)
+        dh1 = dc_out @ op_params["W2"].T
+        dz1 = dh1 * (z1 > 0.0)
+        dW1 = inp.T @ dz1
+        db1 = np.sum(dz1, axis=0)
+        
+        grads = {
+            "W1": dW1,
+            "b1": db1,
+            "W2": dW2,
+            "b2": db2,
+        }
+        opt.update(op_params, grads)
+        
+    return op_params
+
+
+def get_task_data(task_name):
+    if task_name == "ADD":
+        a_list, b_list = [], []
+        for a in range(5):
+            for b in range(5):
+                 a_list.append(a)
+                 b_list.append(b)
+        digit_indices = np.stack([a_list, b_list], axis=1)
+        targets = (digit_indices[:, 0] + digit_indices[:, 1]) % 5
+        arity = 2
+    elif task_name == "MAX":
+        a_list, b_list = [], []
+        for a in range(5):
+            for b in range(5):
+                 a_list.append(a)
+                 b_list.append(b)
+        digit_indices = np.stack([a_list, b_list], axis=1)
+        targets = np.maximum(digit_indices[:, 0], digit_indices[:, 1])
+        arity = 2
+    elif task_name == "COPY":
+        digit_indices = np.arange(5).reshape(-1, 1)
+        targets = digit_indices[:, 0]
+        arity = 1
+    elif task_name == "MIN":
+        a_list, b_list = [], []
+        for a in range(5):
+            for b in range(5):
+                 a_list.append(a)
+                 b_list.append(b)
+        digit_indices = np.stack([a_list, b_list], axis=1)
+        targets = np.minimum(digit_indices[:, 0], digit_indices[:, 1])
+        arity = 2
+    elif task_name == "SUB":
+        a_list, b_list = [], []
+        for a in range(5):
+            for b in range(5):
+                 a_list.append(a)
+                 b_list.append(b)
+        digit_indices = np.stack([a_list, b_list], axis=1)
+        targets = (digit_indices[:, 0] - digit_indices[:, 1]) % 5
+        arity = 2
+    else:
+        raise ValueError(f"unknown task_name={task_name}")
+    return digit_indices, targets, arity
+
+
+def compile_composition(template, task_to_program):
+    if template[0] == "var":
+        return template
+    elif template[0] == "op":
+        task_name = template[1]
+        args = template[2]
+        sub_args = [compile_composition(arg, task_to_program) for arg in args]
+        
+        task_prog = task_to_program[task_name]
+        
+        def bind_vars(node, bindings):
+            if node[0] == "var":
+                var_idx = node[1]
+                return bindings[var_idx]
+            elif node[0] == "op":
+                op_nm = node[1]
+                op_args = node[2]
+                return ("op", op_nm, tuple(bind_vars(a, bindings) for a in op_args))
+                
+        return bind_vars(task_prog, sub_args)
+
+
+def run_continual_operator_learning(seed_count: int, alignment_weight: float = 10.0) -> None:
+    hidden_dim = 16
+    code_dim = 4
+    
+    print("\n=================================================================")
+    print("RUNNING CONTINUAL OPERATOR LEARNING BENCHMARK")
+    print(f"Seeds: {seed_count}, Hidden Dim: {hidden_dim}, Code Dim: {code_dim}")
+    print("=================================================================")
+    
+    policies = ["always_new_operator", "always_try_reuse", "admission_gated_reuse"]
+    stages = ["ADD", "MAX", "COPY", "MIN", "SUB"]
+    
+    policy_results = {
+        pol: {
+            "ADD_acc": [], "MAX_acc": [], "COPY_acc": [], "MIN_acc": [], "SUB_acc": [],
+            "max_of_sum_acc": [], "sum_of_max_acc": [], "sub_of_sum_acc": [],
+            "max_of_min_acc": [], "sum_of_copy_acc": [],
+            "comp_acc": [], "op_count": [], "params_added": [],
+            "closure_mse": [], "manifold_drift": [], "false_reuse_rate": []
+        }
+        for pol in policies
+    }
+    
+    d0_list, d1_list, d2_list = [], [], []
+    for d0 in range(5):
+        for d1 in range(5):
+            for d2 in range(5):
+                d0_list.append(d0)
+                d1_list.append(d1)
+                d2_list.append(d2)
+    comp_indices = np.stack([d0_list, d1_list, d2_list], axis=1)
+    
+    comp_targets = {
+        "max_of_sum": np.maximum((comp_indices[:, 0] + comp_indices[:, 1]) % 5, comp_indices[:, 2]),
+        "sum_of_max": (np.maximum(comp_indices[:, 0], comp_indices[:, 1]) + comp_indices[:, 2]) % 5,
+        "sub_of_sum": ((comp_indices[:, 0] + comp_indices[:, 1]) % 5 - comp_indices[:, 2]) % 5,
+        "max_of_min": np.maximum(np.minimum(comp_indices[:, 0], comp_indices[:, 1]), comp_indices[:, 2]),
+        "sum_of_copy": (comp_indices[:, 2] + comp_indices[:, 0]) % 5
+    }
+    
+    comp_templates = {
+        "max_of_sum": ("op", "MAX", (("op", "ADD", (("var", 0), ("var", 1))), ("var", 2))),
+        "sum_of_max": ("op", "ADD", (("op", "MAX", (("var", 0), ("var", 1))), ("var", 2))),
+        "sub_of_sum": ("op", "SUB", (("op", "ADD", (("var", 0), ("var", 1))), ("var", 2))),
+        "max_of_min": ("op", "MAX", (("op", "MIN", (("var", 0), ("var", 1))), ("var", 2))),
+        "sum_of_copy": ("op", "ADD", (("op", "COPY", (("var", 2),)), ("var", 0)))
+    }
+    
+    for seed in range(seed_count):
+        print(f"\n--- Seed {seed} ---")
+        model = make_closed_latent_model(num_digits=5, code_dim=code_dim, hidden_dim=hidden_dim, seed=seed)
+        train_autoencoder(model, epochs=600, lr=0.01, margin=2.0, sep_weight=0.5, quiet=True)
+        E = model.E
+        W_D = model.W_D
+        b_D = model.b_D
+        
+        for pol in policies:
+            operator_library = {}
+            library_ops = {}
+            task_to_program = {}
+            operator_origin_task = {}
+            false_reuse_count = 0
+            
+            for stage in stages:
+                digit_indices, targets, arity = get_task_data(stage)
+                
+                reused = False
+                failed_reuse = False
+                chosen_prog = None
+                
+                if pol == "always_new_operator":
+                    pass
+                else:
+                    best_prog, best_acc, best_loss = search_best_program(
+                        library_ops, arity, E, W_D, b_D, operator_library, digit_indices, targets
+                    )
+                    if best_prog is not None:
+                        if pol == "always_try_reuse":
+                            chosen_prog = best_prog
+                            reused = True
+                            failed_reuse = (best_acc < 0.95)
+                        elif pol == "admission_gated_reuse":
+                            if best_acc >= 0.98:
+                                chosen_prog = best_prog
+                                reused = True
+                                failed_reuse = False
+                                
+                if reused:
+                    task_to_program[stage] = chosen_prog
+                    if failed_reuse:
+                        false_reuse_count += 1
+                else:
+                    op_name = f"OP_{stage}"
+                    op_params = train_dynamic_operator(
+                        E, W_D, b_D, arity, code_dim, hidden_dim, digit_indices, targets,
+                        epochs=1500, lr=0.01, lambda_closure=alignment_weight, seed=seed
+                    )
+                    operator_library[op_name] = op_params
+                    library_ops[op_name] = arity
+                    operator_origin_task[op_name] = stage
+                    default_vars = tuple(("var", i) for i in range(arity))
+                    task_to_program[stage] = ("op", op_name, default_vars)
+                    
+            # Evaluate final task accuracies
+            stage_accs = {}
+            for stage in stages:
+                digit_indices, targets, arity = get_task_data(stage)
+                prog = task_to_program[stage]
+                _, logits = eval_program(prog, E, W_D, b_D, operator_library, digit_indices)
+                preds = np.argmax(logits, axis=1)
+                acc = float(np.mean(preds == targets))
+                stage_accs[stage] = acc
+                policy_results[pol][f"{stage}_acc"].append(acc)
+                
+            # Evaluate final compositions
+            comp_accs_list = []
+            for comp_name, template in comp_templates.items():
+                compiled = compile_composition(template, task_to_program)
+                _, logits = eval_program(compiled, E, W_D, b_D, operator_library, comp_indices)
+                preds = np.argmax(logits, axis=1)
+                acc = float(np.mean(preds == comp_targets[comp_name]))
+                policy_results[pol][f"{comp_name}_acc"].append(acc)
+                comp_accs_list.append(acc)
+            avg_comp_acc = float(np.mean(comp_accs_list))
+            policy_results[pol]["comp_acc"].append(avg_comp_acc)
+            
+            op_cnt = len(operator_library)
+            policy_results[pol]["op_count"].append(op_cnt)
+            
+            params_sum = 0
+            for op_name, op_params in operator_library.items():
+                arity = library_ops[op_name]
+                input_dim = arity * code_dim
+                params_sum += input_dim * hidden_dim + hidden_dim + hidden_dim * code_dim + code_dim
+            policy_results[pol]["params_added"].append(params_sum)
+            
+            mse_vals = []
+            drift_vals = []
+            for op_name, op_params in operator_library.items():
+                orig_task = operator_origin_task[op_name]
+                digit_indices, targets, arity = get_task_data(orig_task)
+                if arity == 1:
+                    inp = E[digit_indices[:, 0]]
+                else:
+                    inp = np.concatenate([E[digit_indices[:, i]] for i in range(arity)], axis=1)
+                z1 = inp @ op_params["W1"] + op_params["b1"]
+                h1 = np.maximum(z1, 0.0)
+                out_code = h1 @ op_params["W2"] + op_params["b2"]
+                
+                target_code = E[targets]
+                mse = np.mean(np.sum((out_code - target_code)**2, axis=1))
+                mse_vals.append(mse)
+                
+                dists = np.sum((out_code[:, np.newaxis, :] - E[np.newaxis, :, :])**2, axis=2)
+                drift = np.mean(np.min(dists, axis=1))
+                drift_vals.append(drift)
+                
+            avg_mse = float(np.mean(mse_vals)) if mse_vals else 0.0
+            avg_drift = float(np.mean(drift_vals)) if drift_vals else 0.0
+            policy_results[pol]["closure_mse"].append(avg_mse)
+            policy_results[pol]["manifold_drift"].append(avg_drift)
+            
+            policy_results[pol]["false_reuse_rate"].append(false_reuse_count / len(stages))
+            
+            print(f"  [{pol}] ops={op_cnt} params={params_sum} ADD_acc={stage_accs['ADD']:.3f} MAX_acc={stage_accs['MAX']:.3f} COPY_acc={stage_accs['COPY']:.3f} avg_comp={avg_comp_acc:.3f}")
+            
+    print("\n=================================================================")
+    print("CONTINUAL OPERATOR LEARNING FINAL COMPARATIVE SUMMARY")
+    print("=================================================================")
+    print(f"Metric / Policy            always_new_operator    always_try_reuse      admission_gated_reuse")
+    print("-" * 95)
+    
+    summary_metrics = [
+        ("operator_count", "op_count"),
+        ("new_parameters_added", "params_added"),
+        ("ADD accuracy", "ADD_acc"),
+        ("MAX accuracy", "MAX_acc"),
+        ("COPY accuracy", "COPY_acc"),
+        ("MIN accuracy", "MIN_acc"),
+        ("SUB accuracy", "SUB_acc"),
+        ("max_of_sum accuracy", "max_of_sum_acc"),
+        ("sum_of_max accuracy", "sum_of_max_acc"),
+        ("sub_of_sum accuracy", "sub_of_sum_acc"),
+        ("max_of_min accuracy", "max_of_min_acc"),
+        ("sum_of_copy accuracy", "sum_of_copy_acc"),
+        ("Average Composition Acc", "comp_acc"),
+        ("closure_mse", "closure_mse"),
+        ("manifold_drift", "manifold_drift"),
+        ("false_reuse_rate", "false_reuse_rate")
+    ]
+    
+    for label, key in summary_metrics:
+        row_strs = []
+        for pol in policies:
+            vals = policy_results[pol][key]
+            m, s = mean_std(vals)
+            if key in ("op_count", "params_added"):
+                row_strs.append(f"{m:.1f} +/- {s:.1f}")
+            else:
+                row_strs.append(f"{m:.4f} +/- {s:.4f}")
+        print(f"{label:<25}  {row_strs[0]:<22}  {row_strs[1]:<22}  {row_strs[2]:<22}")
+    print("=================================================================\n")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--multi-seed", action="store_true")
     parser.add_argument("--seed-count", type=int, default=10)
     parser.add_argument("--factorized-stress", action="store_true")
+    parser.add_argument("--multi-route-addition", action="store_true")
+    parser.add_argument("--multi-route-non-analog", action="store_true")
+    parser.add_argument("--composition-benchmark", action="store_true")
+    parser.add_argument("--closed-latent-benchmark", action="store_true")
+    parser.add_argument("--closure-ablation", action="store_true")
+    parser.add_argument("--freeze-ablation", action="store_true")
+    parser.add_argument("--long-composition", action="store_true")
+    parser.add_argument("--mixed-operators", action="store_true")
+    parser.add_argument("--continual-operator-learning", action="store_true")
+    parser.add_argument("--multi-route-hidden-dim", type=int, default=OpsConfig.hidden_dim)
+    parser.add_argument(
+        "--multi-route-alignment-weight",
+        type=float,
+        default=DEFAULT_MULTI_ROUTE_ALIGNMENT_WEIGHT,
+    )
     parser.add_argument(
         "--stress-hidden-dims",
         default=",".join(str(value) for value in DEFAULT_STRESS_HIDDEN_DIMS),
@@ -5598,7 +9470,87 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.factorized_stress:
+    if args.continual_operator_learning:
+        run_continual_operator_learning(
+            seed_count=args.seed_count if args.multi_seed else 1,
+            alignment_weight=args.multi_route_alignment_weight,
+        )
+    elif args.mixed_operators:
+        run_mixed_operator_benchmark(
+            seed_count=args.seed_count if args.multi_seed else 1,
+            alignment_weight=args.multi_route_alignment_weight,
+        )
+    elif args.closure_ablation:
+        run_closure_ablation(
+            seed_count=args.seed_count if args.multi_seed else 1,
+            alignment_weight=args.multi_route_alignment_weight,
+        )
+    elif args.freeze_ablation:
+        run_freeze_ablation(
+            seed_count=args.seed_count if args.multi_seed else 1,
+            alignment_weight=args.multi_route_alignment_weight,
+        )
+    elif args.long_composition:
+        run_long_composition_test(
+            seed_count=args.seed_count if args.multi_seed else 1,
+            alignment_weight=args.multi_route_alignment_weight,
+        )
+    elif args.closed_latent_benchmark:
+        if args.multi_seed:
+            run_closed_latent_benchmark(
+                seed_count=args.seed_count,
+                alignment_weight=args.multi_route_alignment_weight,
+                verbose=False,
+            )
+        else:
+            run_closed_latent_benchmark(
+                seed_count=1,
+                alignment_weight=args.multi_route_alignment_weight,
+                verbose=True,
+            )
+    elif args.composition_benchmark:
+        if args.multi_seed:
+            run_composition_benchmark_multi_seed(
+                args.seed_count,
+                args.multi_route_hidden_dim,
+                args.multi_route_alignment_weight,
+            )
+        else:
+            run_composition_benchmark_table(
+                seed=7,
+                hidden_dim=args.multi_route_hidden_dim,
+                alignment_weight=args.multi_route_alignment_weight,
+                verbose=True,
+            )
+    elif args.multi_route_non_analog:
+        if args.multi_seed:
+            run_multi_route_non_analog_multi_seed(
+                args.seed_count,
+                args.multi_route_hidden_dim,
+                args.multi_route_alignment_weight,
+            )
+        else:
+            run_multi_route_non_analog_table(
+                seed=7,
+                hidden_dim=args.multi_route_hidden_dim,
+                alignment_weight=args.multi_route_alignment_weight,
+                verbose=True,
+            )
+    elif args.multi_route_addition:
+        if args.multi_seed:
+            run_multi_route_addition_multi_seed(
+                args.seed_count,
+                args.multi_route_hidden_dim,
+                args.multi_route_alignment_weight,
+            )
+        else:
+            run_multi_route_addition_table(
+                seed=7,
+                hidden_dim=args.multi_route_hidden_dim,
+                alignment_weight=args.multi_route_alignment_weight,
+                verbose=True,
+            )
+    elif args.factorized_stress:
         stress_hidden_dims = parse_int_tuple(args.stress_hidden_dims, "stress-hidden-dims")
         stress_learning_rates = parse_float_tuple(
             args.stress_learning_rates,

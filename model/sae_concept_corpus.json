@@ -1,0 +1,293 @@
+{
+  "name": "matched-concept-target-token-corpus",
+  "examples": [
+    {
+      "id": "animal-cat-0",
+      "label": "animal",
+      "target": "cat",
+      "text": "The object is a cat."
+    },
+    {
+      "id": "animal-dog-0",
+      "label": "animal",
+      "target": "dog",
+      "text": "The object is a dog."
+    },
+    {
+      "id": "animal-horse-0",
+      "label": "animal",
+      "target": "horse",
+      "text": "The object is a horse."
+    },
+    {
+      "id": "animal-lion-0",
+      "label": "animal",
+      "target": "lion",
+      "text": "The object is a lion."
+    },
+    {
+      "id": "animal-bird-0",
+      "label": "animal",
+      "target": "bird",
+      "text": "The object is a bird."
+    },
+    {
+      "id": "animal-elephant-0",
+      "label": "animal",
+      "target": "elephant",
+      "text": "The object is an elephant."
+    },
+    {
+      "id": "vehicle-car-0",
+      "label": "vehicle",
+      "target": "car",
+      "text": "The object is a car."
+    },
+    {
+      "id": "vehicle-bus-0",
+      "label": "vehicle",
+      "target": "bus",
+      "text": "The object is a bus."
+    },
+    {
+      "id": "vehicle-train-0",
+      "label": "vehicle",
+      "target": "train",
+      "text": "The object is a train."
+    },
+    {
+      "id": "vehicle-truck-0",
+      "label": "vehicle",
+      "target": "truck",
+      "text": "The object is a truck."
+    },
+    {
+      "id": "vehicle-bicycle-0",
+      "label": "vehicle",
+      "target": "bicycle",
+      "text": "The object is a bicycle."
+    },
+    {
+      "id": "vehicle-airplane-0",
+      "label": "vehicle",
+      "target": "airplane",
+      "text": "The object is an airplane."
+    },
+    {
+      "id": "place-paris-0",
+      "label": "place",
+      "target": "Paris",
+      "text": "The location is Paris."
+    },
+    {
+      "id": "place-london-0",
+      "label": "place",
+      "target": "London",
+      "text": "The location is London."
+    },
+    {
+      "id": "place-berlin-0",
+      "label": "place",
+      "target": "Berlin",
+      "text": "The location is Berlin."
+    },
+    {
+      "id": "place-tokyo-0",
+      "label": "place",
+      "target": "Tokyo",
+      "text": "The location is Tokyo."
+    },
+    {
+      "id": "place-school-0",
+      "label": "place",
+      "target": "school",
+      "text": "The location is a school."
+    },
+    {
+      "id": "place-city-0",
+      "label": "place",
+      "target": "city",
+      "text": "The location is a city."
+    },
+    {
+      "id": "abstract-idea-0",
+      "label": "abstract",
+      "target": "idea",
+      "text": "The concept is an idea."
+    },
+    {
+      "id": "abstract-truth-0",
+      "label": "abstract",
+      "target": "truth",
+      "text": "The concept is truth."
+    },
+    {
+      "id": "abstract-justice-0",
+      "label": "abstract",
+      "target": "justice",
+      "text": "The concept is justice."
+    },
+    {
+      "id": "abstract-memory-0",
+      "label": "abstract",
+      "target": "memory",
+      "text": "The concept is memory."
+    },
+    {
+      "id": "color-red-0",
+      "label": "color",
+      "target": "red",
+      "text": "The property is red."
+    },
+    {
+      "id": "color-blue-0",
+      "label": "color",
+      "target": "blue",
+      "text": "The property is blue."
+    },
+    {
+      "id": "animal-cat-1",
+      "label": "animal",
+      "target": "cat",
+      "text": "I saw a cat today."
+    },
+    {
+      "id": "animal-dog-1",
+      "label": "animal",
+      "target": "dog",
+      "text": "I saw a dog today."
+    },
+    {
+      "id": "animal-horse-1",
+      "label": "animal",
+      "target": "horse",
+      "text": "I saw a horse today."
+    },
+    {
+      "id": "animal-lion-1",
+      "label": "animal",
+      "target": "lion",
+      "text": "I saw a lion today."
+    },
+    {
+      "id": "animal-bird-1",
+      "label": "animal",
+      "target": "bird",
+      "text": "I saw a bird today."
+    },
+    {
+      "id": "animal-elephant-1",
+      "label": "animal",
+      "target": "elephant",
+      "text": "I saw an elephant today."
+    },
+    {
+      "id": "vehicle-car-1",
+      "label": "vehicle",
+      "target": "car",
+      "text": "I saw a car today."
+    },
+    {
+      "id": "vehicle-bus-1",
+      "label": "vehicle",
+      "target": "bus",
+      "text": "I saw a bus today."
+    },
+    {
+      "id": "vehicle-train-1",
+      "label": "vehicle",
+      "target": "train",
+      "text": "I saw a train today."
+    },
+    {
+      "id": "vehicle-truck-1",
+      "label": "vehicle",
+      "target": "truck",
+      "text": "I saw a truck today."
+    },
+    {
+      "id": "vehicle-bicycle-1",
+      "label": "vehicle",
+      "target": "bicycle",
+      "text": "I saw a bicycle today."
+    },
+    {
+      "id": "vehicle-airplane-1",
+      "label": "vehicle",
+      "target": "airplane",
+      "text": "I saw an airplane today."
+    },
+    {
+      "id": "place-paris-1",
+      "label": "place",
+      "target": "Paris",
+      "text": "I visited Paris today."
+    },
+    {
+      "id": "place-london-1",
+      "label": "place",
+      "target": "London",
+      "text": "I visited London today."
+    },
+    {
+      "id": "place-berlin-1",
+      "label": "place",
+      "target": "Berlin",
+      "text": "I visited Berlin today."
+    },
+    {
+      "id": "place-tokyo-1",
+      "label": "place",
+      "target": "Tokyo",
+      "text": "I visited Tokyo today."
+    },
+    {
+      "id": "place-school-1",
+      "label": "place",
+      "target": "school",
+      "text": "I visited a school today."
+    },
+    {
+      "id": "place-city-1",
+      "label": "place",
+      "target": "city",
+      "text": "I visited a city today."
+    },
+    {
+      "id": "abstract-idea-1",
+      "label": "abstract",
+      "target": "idea",
+      "text": "I considered an idea today."
+    },
+    {
+      "id": "abstract-truth-1",
+      "label": "abstract",
+      "target": "truth",
+      "text": "I considered truth today."
+    },
+    {
+      "id": "abstract-justice-1",
+      "label": "abstract",
+      "target": "justice",
+      "text": "I considered justice today."
+    },
+    {
+      "id": "abstract-memory-1",
+      "label": "abstract",
+      "target": "memory",
+      "text": "I considered memory today."
+    },
+    {
+      "id": "color-red-1",
+      "label": "color",
+      "target": "red",
+      "text": "I noticed red today."
+    },
+    {
+      "id": "color-blue-1",
+      "label": "color",
+      "target": "blue",
+      "text": "I noticed blue today."
+    }
+  ]
+}

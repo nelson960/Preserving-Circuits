@@ -1,0 +1,29 @@
+{
+  "name": "feature-collision-vehicle-to-animal",
+  "examples": [
+    {
+      "input": "car",
+      "target": "cat"
+    },
+    {
+      "input": "bus",
+      "target": "dog"
+    },
+    {
+      "input": "train",
+      "target": "horse"
+    },
+    {
+      "input": "truck",
+      "target": "lion"
+    },
+    {
+      "input": "bicycle",
+      "target": "bird"
+    },
+    {
+      "input": "airplane",
+      "target": "elephant"
+    }
+  ]
+}
