@@ -22,7 +22,7 @@ Current approaches to continual learning often grow effective capacity, replay o
 
 This page is the public research proposal. The detailed living research log records the path of hypotheses, failed interventions, partial results, and the current mechanistic direction:
 
-- [A Living Failure Map Toward Mechanistic Continual Learning](https://github.com/nelson960/Preserving-Circuits/blob/main/paper/living-paper.md)
+- [A Living Failure Map Toward Mechanistic Continual Learning](./living-paper/)
 
 The living log is intentionally written as a research notebook rather than a finished claim. It tracks how the project moved from usage-driven neuron protection, to route and family-level interventions, to closed latent composition, to direct SAE-based feature drift and causal-use measurements in a small pretrained model.
 
