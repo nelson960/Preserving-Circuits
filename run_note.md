@@ -3698,6 +3698,990 @@ $$
 *   stronger training pressure to observe whether early feature drift becomes actual representational collapse or behavioral forgetting.
 
 
+### 2026-05-22: Latent-Geometry-Guided Optimizer, Conflict Boundary, and Late Abstraction
+
+After the Phase 9 replay/GPM failures, we stopped treating continual learning as "always update the same weights." The forced-update experiments made that target look structurally wrong: if a new function is incompatible with the old function represented by the same operator, gradient descent either learns the new mapping by overwriting the old one, or a gate preserves the old one and blocks learning.
+
+The updated mechanism is:
+
+```text
+closed latent type system
+-> program/reuse search
+-> counterfactual action selection
+-> geometry-gated repair only when local repair is safe
+-> allocation when same-operator update is a hard conflict
+-> late abstraction/compression after multiple related operators exist
+```
+
+The central principle became:
+
+```text
+Gradient descent proposes candidate writes.
+Latent geometry decides whether a write is safe, useful, or should be rejected.
+```
+
+This is implemented in:
+
+```text
+experiments/latent_geometry_guided_optimizer.py
+experiments/char_semantic_reasoner.py
+```
+
+---
+
+#### 1. Internal Geometry Diagnostic: Which Neurons Matter?
+
+We first tested whether cheap internal geometry signals can predict causal neuron damage.
+
+For a trained closed latent `ADD` operator, we ablated each hidden neuron and measured causal ground truth:
+
+```text
+loss_damage_i
+closure_damage_i
+accuracy_damage_i
+manifold_damage_i
+```
+
+Then we compared these targets against cheap forward/gradient signals:
+
+```text
+activation_i
+downstream_weight_norm_i
+activation_downstream_i = mean(|h_i|) * ||W2[:, i]||
+activation_weight_product_i = mean(|h_i|) * ||W1[i, :]|| * ||W2[:, i]||
+gradient_i
+responsibility_i = mean(|h_i|) * gradient_i
+```
+
+Command run:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/latent_geometry_guided_optimizer.py \
+  --geometry-signal-diagnostics \
+  --diagnostic-task ADD \
+  --diagnostic-noise-std 0.03 \
+  --diagnostic-top-k 5 \
+  --seed-count 10 \
+  --output-json model/analysis/geometry-signal-diagnostics-add-noise-10seed.json
+```
+
+Key results:
+
+| Ground truth | Best signal | Spearman rho |
+| :--- | :--- | :---: |
+| `closure_damage` | `activation_weight_product` | 0.9026 +/- 0.0423 |
+| `closure_damage` | `activation_downstream` | 0.8997 +/- 0.0684 |
+| `manifold_damage` | `activation_downstream` | 0.8950 +/- 0.0595 |
+| `manifold_damage` | `activation_weight_product` | 0.8679 +/- 0.0526 |
+| `loss_damage` | `activation_weight_product` | 0.7315 +/- 0.1394 |
+| `loss_damage` | `activation_downstream` | 0.7121 +/- 0.1501 |
+| `accuracy_damage` | `activation_downstream` | 0.7231 +/- 0.1200 |
+
+Interpretation:
+
+```text
+Raw gradients are not the best "which neurons matter?" signal.
+The best signal is path usage:
+  the neuron fires
+  and downstream weights actually read from it.
+```
+
+This supports the idea that the optimizer should not reason only in parameter-gradient space. It should reason over latent path geometry.
+
+---
+
+#### 2. Custom Internal Reasoning Optimizer Loop
+
+The optimizer loop now has two levels.
+
+First, an action-level counterfactual reasoner:
+
+```text
+For each new task:
+  test reuse candidates
+  test composition candidates
+  test update candidates on shadow copies
+  test allocation candidates
+
+For each candidate future:
+  run forward
+  measure new accuracy
+  measure old accuracy
+  measure closure error
+  measure manifold error
+  measure composition health
+  measure parameter growth
+
+Choose the highest-scoring safe candidate.
+```
+
+The safety predicate is:
+
+```text
+safe(action) =
+  new_acc >= tau_acc
+  old_min_acc >= tau_acc
+  old_closure_error <= tau_closure
+  new_closure_error <= tau_action
+```
+
+The score is:
+
+```text
+Score =
+    alpha * new_acc
+  + beta  * old_min_acc
+  - gamma * new_closure_error
+  - delta * old_closure_error
+  - rho   * new_parameters
+  - action_penalty
+```
+
+Second, a neuron-level gated update rule for repair/update candidates:
+
+For an operator:
+
+```text
+h = ReLU(W1 x + b1)
+out = W2 h + b2
+```
+
+Old structural risk:
+
+```text
+risk_i = mean(|h_i|) * ||W2[:, i]||
+```
+
+or:
+
+```text
+risk_i = mean(|h_i|) * ||W1[i, :]|| * ||W2[:, i]||
+```
+
+Current need:
+
+```text
+need_i = mean(|h_i|) * (||grad W1[i, :]|| + ||grad W2[:, i]||)
+```
+
+Closure-band gate:
+
+```text
+closure_gate(c) > 0 only when closure error is in the repairable medium band
+```
+
+Repair mode:
+
+```text
+gate_i = closure_gate * need_i * risk_i
+```
+
+Protect mode:
+
+```text
+gate_i = closure_gate * need_i * (1 - risk_i)
+```
+
+With gradient memory:
+
+```text
+m = EMA(previous gradients)
+
+g_reinforce = (<g, m> / ||m||^2) m
+g_new       = g - g_reinforce
+
+Delta theta_i = -eta * [closure_gate * g_reinforce_i + gate_i * g_new_i]
+```
+
+Interpretation:
+
+```text
+g_reinforce follows historically stable update directions.
+g_new is novel movement and is gated by latent geometry.
+```
+
+---
+
+#### 3. Repair Works, But Repair Is Not Continual Learning
+
+We damaged a learned `ADD` operator with noise and asked the system to repair it.
+
+Commands:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/latent_geometry_guided_optimizer.py \
+  --counterfactual-action-selection \
+  --seed-count 10 \
+  --search-depth 2 \
+  --max-programs 50000 \
+  --repair-noise-std 0.03 \
+  --repair-update-rule neuron_gated \
+  --update-closure-low 0.001 \
+  --update-epochs 1000 \
+  --output-json model/analysis/counterfactual-neuron-gated-low-closure-10seed-v2.json
+```
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/latent_geometry_guided_optimizer.py \
+  --counterfactual-action-selection \
+  --seed-count 10 \
+  --search-depth 2 \
+  --max-programs 50000 \
+  --repair-noise-std 0.03 \
+  --repair-update-rule structural_gated \
+  --structural-risk-signal activation_weight_product \
+  --structural-need-signal responsibility \
+  --structural-risk-mode repair \
+  --update-closure-low 0.001 \
+  --update-epochs 1000 \
+  --output-json model/analysis/counterfactual-structural-gated-repair-10seed.json
+```
+
+Both achieved:
+
+```text
+decision_accuracy = 1.0000
+destructive_update_count = 0
+unnecessary_allocation_count = 0
+```
+
+The visible ledger metrics were essentially identical:
+
+```text
+NOISY_ADD_REPAIR closure ~= 0.0011 to 0.0014
+DOUBLE_ADD closure       ~= 0.0040 to 0.0059
+old/new/composition acc  = 1.000
+```
+
+Interpretation:
+
+```text
+The repair problem is easy for both gates.
+In a repair setting, the correct behavior is to update the important old path.
+The high-gradient neurons and high structural-use neurons mostly coincide.
+```
+
+Therefore repair success alone does not prove forgetting prevention.
+
+---
+
+#### 4. Forced Numeric Conflict: Same Weights Hit the Stability-Plasticity Wall
+
+We then forced the existing `ADD` operator to learn incompatible new functions, with allocation disabled:
+
+```text
+ADD -> ADD_PLUS_ONE
+ADD -> SUB
+```
+
+Commands:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/latent_geometry_guided_optimizer.py \
+  --forced-conflict-update \
+  --conflict-task ADD_PLUS_ONE \
+  --seed-count 10 \
+  --update-closure-low 0.001 \
+  --update-epochs 1000 \
+  --forced-conflict-rules adam,neuron_gated,structural_repair,structural_protect \
+  --output-json model/analysis/forced-conflict-add-plus-one-10seed.json
+```
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/latent_geometry_guided_optimizer.py \
+  --forced-conflict-update \
+  --conflict-task SUB \
+  --seed-count 10 \
+  --update-closure-low 0.001 \
+  --update-epochs 1000 \
+  --forced-conflict-rules adam,neuron_gated,structural_repair,structural_protect \
+  --output-json model/analysis/forced-conflict-sub-10seed.json
+```
+
+Results for `ADD -> ADD_PLUS_ONE`:
+
+| Rule | Old ADD Acc | New Acc | Forgetting | Old Closure Norm | New Closure Norm |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Adam | 0.000 | 1.000 | 1.000 | 1.4488 | 0.0004 |
+| Neuron gated | 1.000 | 0.000 | 0.000 | 0.0000 | 1.4508 |
+| Structural repair | 1.000 | 0.000 | 0.000 | 0.0000 | 1.4508 |
+| Structural protect | 1.000 | 0.000 | 0.000 | 0.0000 | 1.4508 |
+
+Results for `ADD -> SUB`:
+
+| Rule | Old ADD Acc | New Acc | Forgetting | Old Closure Norm | New Closure Norm |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Adam | 0.200 | 1.000 | 0.800 | 1.2155 | 0.0003 |
+| Neuron gated | 1.000 | 0.200 | 0.000 | 0.0000 | 1.2168 |
+| Structural repair | 1.000 | 0.200 | 0.000 | 0.0000 | 1.2168 |
+| Structural protect | 1.000 | 0.200 | 0.000 | 0.0000 | 1.2168 |
+
+Interpretation:
+
+```text
+Adam learns the new function by overwriting the old function.
+Gated methods preserve the old function by refusing unsafe plasticity.
+```
+
+This is a clean stability-plasticity boundary:
+
+```text
+full plasticity -> learn new, forget old
+full stability  -> preserve old, fail new
+```
+
+Conclusion:
+
+```text
+The correct continual-learning action is not always update.
+When geometry says the update is a hard conflict:
+  reuse if possible,
+  otherwise allocate,
+  then later compress related operators into an abstraction.
+```
+
+---
+
+#### 5. Character-Semantic Reasoner
+
+To check whether the same effect is only a numeric artifact, we built a small semantic character benchmark.
+
+Dataset:
+
+```text
+lowercase: a b c d e
+uppercase: A B C D E
+optional separator: _
+```
+
+Tasks:
+
+```text
+COPY
+SHIFT
+DOUBLE_SHIFT
+CAPS
+SHIFT_THEN_CAPS
+LOWER
+CAPS_THEN_LOWER
+REVERSE_SHIFT
+RESET
+SHIFT3
+```
+
+Command:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/char_semantic_reasoner.py \
+  --seed-count 10 \
+  --alphabet-size 5 \
+  --code-dim 8 \
+  --hidden-dim 32 \
+  --search-depth 3 \
+  --stream COPY,SHIFT,DOUBLE_SHIFT,CAPS,SHIFT_THEN_CAPS,LOWER,CAPS_THEN_LOWER,REVERSE_SHIFT,RESET,SHIFT3 \
+  --output-json model/analysis/char-semantic-reasoner-10seed.json
+```
+
+Results:
+
+| Task | Chosen Action | New Acc | Old Min | Closure | Operators |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| COPY | reuse | 1.000 | 1.000 | 0.0000 | 0 |
+| SHIFT | allocate | 1.000 | 1.000 | 0.0000 | 1 |
+| DOUBLE_SHIFT | compose | 1.000 | 1.000 | 0.0000 | 1 |
+| CAPS | allocate | 1.000 | 1.000 | 0.0000 | 2 |
+| SHIFT_THEN_CAPS | compose | 1.000 | 1.000 | 0.0000 | 2 |
+| LOWER | allocate | 1.000 | 1.000 | 0.0000 | 3 |
+| CAPS_THEN_LOWER | reuse | 1.000 | 1.000 | 0.0000 | 3 |
+| REVERSE_SHIFT | allocate | 1.000 | 1.000 | 0.0000 | 4 |
+| RESET | allocate | 1.000 | 1.000 | 0.0000 | 5 |
+| SHIFT3 | compose | 1.000 | 1.000 | 0.0000 | 5 |
+
+Final:
+
+```text
+operator_count = 5
+new_parameters = 2760
+```
+
+Interpretation:
+
+```text
+The reasoner reused/composed when semantic composition existed.
+It allocated when reuse would be false.
+```
+
+This is the behavior we want from a continual learner:
+
+```text
+do not force false reuse,
+do not blindly overwrite,
+compose compatible skills,
+allocate hard conflicts.
+```
+
+---
+
+#### 6. Character Forced Conflicts
+
+We then forced same-operator updates in the character setting:
+
+```text
+SHIFT -> REVERSE_SHIFT
+SHIFT -> RESET
+```
+
+Commands:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/char_semantic_reasoner.py \
+  --forced-conflict \
+  --base-task SHIFT \
+  --conflict-task REVERSE_SHIFT \
+  --seed-count 10 \
+  --alphabet-size 5 \
+  --code-dim 8 \
+  --hidden-dim 32 \
+  --forced-conflict-rules adam,structural_repair,structural_protect \
+  --output-json model/analysis/char-forced-conflict-shift-reverse-10seed.json
+```
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/char_semantic_reasoner.py \
+  --forced-conflict \
+  --base-task SHIFT \
+  --conflict-task RESET \
+  --seed-count 10 \
+  --alphabet-size 5 \
+  --code-dim 8 \
+  --hidden-dim 32 \
+  --forced-conflict-rules adam,structural_repair,structural_protect \
+  --output-json model/analysis/char-forced-conflict-shift-reset-10seed.json
+```
+
+Results for `SHIFT -> REVERSE_SHIFT`:
+
+| Rule | Old SHIFT Acc | New Acc | Forgetting | Old Closure Norm | New Closure Norm |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Adam | 0.000 | 1.000 | 1.000 | 1.5067 | 0.0000 |
+| Structural repair | 1.000 | 0.000 | 0.000 | 0.0000 | 1.5067 |
+| Structural protect | 1.000 | 0.000 | 0.000 | 0.0000 | 1.5067 |
+
+Results for `SHIFT -> RESET`:
+
+| Rule | Old SHIFT Acc | New Acc | Forgetting | Old Closure Norm | New Closure Norm |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Adam | 0.200 | 1.000 | 0.800 | 1.2405 | 0.0000 |
+| Structural repair | 1.000 | 0.200 | 0.000 | 0.0000 | 1.2405 |
+| Structural protect | 1.000 | 0.200 | 0.000 | 0.0000 | 1.2405 |
+
+Interpretation:
+
+```text
+The numeric boundary also appears semantically.
+Gradient descent overwrites the old semantic operator.
+Geometry gates preserve the old operator and refuse unsafe overwrite.
+```
+
+Therefore:
+
+```text
+The system should not learn REVERSE_SHIFT by rewriting SHIFT.
+It should allocate REVERSE_SHIFT, then possibly compress SHIFT and REVERSE_SHIFT into a parent family later.
+```
+
+---
+
+#### 7. Late Abstraction: SHIFT_K Parent Operator
+
+The next mechanism was late abstraction:
+
+```text
+Learn specific operators first.
+Only after evidence of a related family exists, train a parent abstraction.
+```
+
+The parent is:
+
+```text
+SHIFT_K(x, k)
+```
+
+where `k` is represented by circular control features:
+
+```text
+control(k) = [cos(2*pi*k/n), sin(2*pi*k/n), cos(4*pi*k/n), sin(4*pi*k/n), ...]
+```
+
+The first parent fitting experiment trained on:
+
+```text
+train_shifts = [1, -1, 2]
+eval_shifts  = [1, -1, 2, 3, -2, 0]
+```
+
+Command:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/char_semantic_reasoner.py \
+  --late-abstraction \
+  --seed-count 10 \
+  --alphabet-size 5 \
+  --code-dim 8 \
+  --hidden-dim 32 \
+  --control-dim 4 \
+  --abstraction-train-shifts 1,-1,2 \
+  --abstraction-eval-shifts 1,-1,2,3,-2,0 \
+  --abstraction-epochs 2000 \
+  --output-json model/analysis/char-late-abstraction-shift-k-10seed.json
+```
+
+Results:
+
+| Shift | Seen | Parent Acc | Parent Closure |
+| :---: | :---: | :---: | :---: |
+| -1 | True | 1.000 | 0.0002 |
+| 1 | True | 1.000 | 0.0002 |
+| 2 | True | 1.000 | 0.0001 |
+| 3 | False | 0.040 | 1.4285 |
+| -2 | False | 0.040 | 1.4285 |
+| 0 | False | 0.070 | 1.3965 |
+
+Compression:
+
+```text
+3 concrete operators -> 1 parent
+1656 params -> 680 params
+parameter_reduction = 58.94%
+```
+
+Interpretation:
+
+```text
+Late abstraction reproduces seen family members and compresses parameters.
+But ordinary parent fitting only memorizes seen controls.
+It does not infer the full group law.
+```
+
+With four trained shifts:
+
+```text
+train_shifts = [1, -1, 2, 3]
+```
+
+the parent generalized to `-2`, because in alphabet size 5:
+
+```text
+-2 mod 5 = 3
+```
+
+but still failed on `0`:
+
+```text
+shift -2: 1.000
+shift 0:  0.040
+```
+
+So identity was not inferred automatically.
+
+---
+
+#### 8. Algebraic Consistency Turns Compression Into Generalization
+
+We added algebraic consistency to the parent:
+
+Base supervised parent fitting:
+
+```text
+L_seen =
+  CE(D(SHIFT_K(E(x), k)), y)
+  + lambda * ||SHIFT_K(E(x), k) - E(y)||^2
+```
+
+Identity:
+
+```text
+L_identity:
+  SHIFT_0(E(x)) ~= E(x)
+```
+
+Pairwise target:
+
+```text
+L_pairwise_target:
+  SHIFT_(a+b)(E(x)) ~= E(shift(x, a+b))
+```
+
+Composition agreement:
+
+```text
+L_composition_agreement:
+  SHIFT_b(SHIFT_a(E(x))) ~= SHIFT_(a+b)(E(x))
+```
+
+Total:
+
+```text
+L_total =
+  L_seen
+  + alpha * L_identity
+  + beta  * L_pairwise_target
+  + gamma * L_composition_agreement
+```
+
+Command:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/char_semantic_reasoner.py \
+  --late-abstraction \
+  --seed-count 10 \
+  --alphabet-size 5 \
+  --code-dim 8 \
+  --hidden-dim 32 \
+  --control-dim 4 \
+  --abstraction-train-shifts 1,-1,2 \
+  --abstraction-eval-shifts 1,-1,2,3,-2,0 \
+  --abstraction-epochs 2000 \
+  --identity-weight 1.0 \
+  --composition-target-weight 1.0 \
+  --composition-agreement-weight 0.25 \
+  --output-json model/analysis/char-late-abstraction-shift-k-algebraic-10seed.json
+```
+
+Ablation:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/char_semantic_reasoner.py \
+  --late-abstraction \
+  --seed-count 10 \
+  --alphabet-size 5 \
+  --code-dim 8 \
+  --hidden-dim 32 \
+  --control-dim 4 \
+  --abstraction-train-shifts 1,-1,2 \
+  --abstraction-eval-shifts 1,-1,2,3,-2,0 \
+  --abstraction-epochs 2000 \
+  --identity-weight 0.0 \
+  --composition-target-weight 0.0 \
+  --composition-agreement-weight 0.0 \
+  --output-json model/analysis/char-late-abstraction-shift-k-no-algebraic-10seed.json
+```
+
+Clean ablation result:
+
+| Setting | Seen Acc | Heldout Acc | Heldout Closure |
+| :--- | :---: | :---: | :---: |
+| No algebraic consistency | 1.000 | 0.050 | 1.4178 |
+| With algebraic consistency | 1.000 | 1.000 | 0.0001 |
+
+Per-shift with algebra:
+
+| Shift | Seen | Parent Acc | Parent Closure |
+| :---: | :---: | :---: | :---: |
+| -2 | False | 1.000 | 0.0001 |
+| -1 | True | 1.000 | 0.0001 |
+| 0 | False | 1.000 | 0.0002 |
+| 1 | True | 1.000 | 0.0001 |
+| 2 | True | 1.000 | 0.0001 |
+| 3 | False | 1.000 | 0.0001 |
+
+Interpretation:
+
+```text
+Late abstraction + algebraic consistency learns the family law.
+The parent no longer only memorizes observed shifts.
+It infers identity and held-out shifts through the composition constraint.
+```
+
+This is the strongest current result.
+
+The path around the impossible same-weight overwrite is:
+
+```text
+bad:
+  force SHIFT -> REVERSE_SHIFT
+  either forget SHIFT or fail REVERSE_SHIFT
+
+good:
+  learn SHIFT, REVERSE_SHIFT, SHIFT_2 separately
+  train SHIFT_K parent with closure + algebraic consistency
+  reproduce old operators
+  generalize to held-out family members
+  compress parameters by 58.9%
+```
+
+Current research claim:
+
+```text
+Continual learning should be controlled growth followed by safe abstraction.
+```
+
+Not:
+
+```text
+Continual learning means every new skill must be inserted into the same weights immediately.
+```
+
+---
+
+#### 9. Current Scaling View Toward a Small Language Model
+
+The loop that survives scaling is:
+
+```text
+gradient proposes
+latent geometry evaluates
+counterfactual reasoner commits/rejects
+allocation handles hard conflicts
+late abstraction compresses related operators
+```
+
+But scaling requires changing the unit of update.
+
+Toy setting:
+
+```text
+operator = small MLP
+gate = hidden neurons
+codebook = explicit E/D
+program = explicit composition tree
+```
+
+Small transformer / 1M-parameter language model setting:
+
+```text
+operator = adapter / LoRA / small residual write module
+gate = parameter blocks first, then neurons/features inside selected blocks
+codebook = token embedding / residual manifold / SAE feature subspace
+program = route through adapters or residual transformations
+```
+
+Required staged path:
+
+1.  **Tiny char transformer**
+
+    Replace closed MLP operators with small transformer blocks or adapters operating on residual states.
+
+2.  **Closed residual adapters**
+
+    Each adapter must map residual states back onto a stable token/code manifold:
+
+    ```text
+    A_k(h_token) ~= h_target
+    ```
+
+3.  **Route/program search**
+
+    Test:
+
+    ```text
+    adapter reuse
+    adapter composition
+    local repair
+    allocation
+    ```
+
+4.  **Geometry-gated writes**
+
+    First gate blocks:
+
+    ```text
+    embedding
+    attention head
+    MLP block
+    adapter
+    readout
+    ```
+
+    Then gate features/neurons inside selected blocks.
+
+5.  **Counterfactual commit**
+
+    Before committing a weight update, test:
+
+    ```text
+    old probes
+    new task
+    closure/manifold drift
+    composition probes
+    causal feature drift
+    ```
+
+6.  **Late abstraction**
+
+    Compress learned adapters:
+
+    ```text
+    SHIFT_1, SHIFT_2, SHIFT_3 -> SHIFT_K
+    CAPS, LOWER, CASE_FLIP -> CASE_OP
+    factual relation edits -> relation-family adapter
+    ```
+
+7.  **SAE / feature geometry tracking**
+
+    For real language concepts, replace explicit token codebook with learned feature maps:
+
+    ```text
+    residual direction
+    SAE feature
+    concept subspace
+    downstream causal-use score
+    ```
+
+This suggests the custom optimizer loop must become hierarchical:
+
+```text
+block-level reasoner:
+  where could a write occur?
+
+feature-level reasoner:
+  which features are old-risk / new-need?
+
+counterfactual updater:
+  what happens if we write there?
+
+commit gate:
+  does the latent geometry remain valid?
+```
+
+Current open problems:
+
+*   automatically deciding when to trigger late abstraction;
+*   testing parent replacement, where concrete operators are removed after parent training;
+*   extending from cyclic shift algebra to multiple semantic families;
+*   moving from explicit codebooks to learned residual/SAE manifolds;
+*   making counterfactual reasoning cheap enough for larger models.
+
+The current result does not solve full continual learning, but it gives a coherent mechanism:
+
+```text
+detect conflict mechanistically,
+avoid unsafe overwrite,
+allocate only when necessary,
+then compress related skills into algebraically consistent abstractions.
+```
+
+---
+
+#### 10. Learned Latent-Geometry Optimizer Policy on Semantic Character Tasks
+
+We next tested whether the optimizer's action policy can be learned from latent-geometry features instead of being permanently hand-coded.
+
+The learned policy receives one decision state per incoming task. For each possible action,
+
+```text
+reuse
+compose
+update
+allocate
+```
+
+it sees the counterfactual geometry of the best candidate for that action:
+
+```text
+candidate available
+new accuracy
+old minimum accuracy
+old mean accuracy
+new loss
+new closure error
+old closure error
+new manifold error
+new parameter cost
+```
+
+The policy is not given the teacher's final scalar score. It must learn the write decision from the geometry itself.
+
+Training stream:
+
+```text
+COPY, SHIFT, REPAIR_SHIFT, DOUBLE_SHIFT, CAPS, SHIFT_THEN_CAPS
+COPY, CAPS, LOWER, CAPS_THEN_LOWER, SHIFT, SHIFT3, REVERSE_SHIFT
+SHIFT, REPAIR_SHIFT, COPY, DOUBLE_SHIFT, REVERSE_SHIFT, RESET, CAPS_THEN_SHIFT
+```
+
+Held-out evaluation stream:
+
+```text
+COPY, SHIFT, REPAIR_SHIFT, DOUBLE_SHIFT, CAPS, SHIFT_THEN_CAPS,
+LOWER, CAPS_THEN_LOWER, REVERSE_SHIFT, RESET, SHIFT3
+
+COPY, CAPS, SHIFT_THEN_CAPS, REVERSE_SHIFT, RESET, DOUBLE_SHIFT
+```
+
+Result over 10 seeds:
+
+| Metric | Value |
+| :--- | :---: |
+| Action accuracy | 1.000 |
+| Unsafe choice rate | 0.000 |
+| Masked unavailable preference rate | 0.000 |
+| New accuracy | 1.000 |
+| Old minimum accuracy | 1.000 |
+| Mean closure | 0.0003 |
+| Final operators | 4.50 |
+
+Per-event action decisions:
+
+| Event | Teacher | Learned policy | Accuracy |
+| :--- | :--- | :--- | :---: |
+| COPY | reuse 20/20 | reuse 20/20 | 1.000 |
+| SHIFT | allocate 10/10 | allocate 10/10 | 1.000 |
+| REPAIR_SHIFT | update 10/10 | update 10/10 | 1.000 |
+| DOUBLE_SHIFT | compose 20/20 | compose 20/20 | 1.000 |
+| CAPS | allocate 20/20 | allocate 20/20 | 1.000 |
+| CAPS_THEN_LOWER | reuse 10/10 | reuse 10/10 | 1.000 |
+| LOWER | allocate 10/10 | allocate 10/10 | 1.000 |
+| REVERSE_SHIFT | allocate 20/20 | allocate 20/20 | 1.000 |
+| RESET | allocate 20/20 | allocate 20/20 | 1.000 |
+| SHIFT3 | compose 10/10 | compose 10/10 | 1.000 |
+| SHIFT_THEN_CAPS | compose 10/20, allocate 10/20 | compose 10/20, allocate 10/20 | 1.000 |
+
+The important result is `REPAIR_SHIFT`.
+
+```text
+REPAIR_SHIFT -> update
+REVERSE_SHIFT -> allocate
+RESET -> allocate
+DOUBLE_SHIFT / SHIFT3 -> compose
+```
+
+So the learned policy distinguishes:
+
+```text
+local damage to an old skill      -> update/repair
+genuinely new primitive mapping   -> allocate
+available symbolic composition    -> compose
+already solved task               -> reuse
+```
+
+This is the first evidence that the optimizer loop does not have to remain a fixed threshold system. A small neural policy can learn the latent-geometry write decision from counterfactual state features.
+
+What this proves narrowly:
+
+```text
+Latent geometry contains enough information for a learned policy to imitate
+the reuse / compose / update / allocate decisions on semantic character tasks.
+```
+
+What it does not prove yet:
+
+```text
+It does not yet prove open-ended continual learning.
+It does not yet prove natural-language semantic learning.
+It does not yet prove the learned policy improves beyond the teacher.
+```
+
+Next required step:
+
+```text
+Move the same learned write policy to a larger transformer-native setting:
+stable token/residual manifold,
+semantic concept relations,
+closed residual operators,
+counterfactual geometric action selection,
+and learned policy imitation / reward training.
+```
 
 
 
