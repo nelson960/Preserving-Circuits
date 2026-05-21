@@ -3,11 +3,9 @@ layout: default
 title: Preserving Circuits
 ---
 
-# Intelligence Within Fixed Capacity
+## Intelligence Within Fixed Capacity
 
 Continual Learning Via Mechanistic Interpretability And Usage-Driven Memory Management
-
-[Repository](https://github.com/nelson960/Preserving-Circuits) · [Living Research Log]({{ '/living-paper/' | relative_url }})
 
 Most deployed language models are still updated through discrete training or fine-tuning cycles rather than through safe, continuous, internal learning. They are pretrained on a large snapshot of data, adapted through instruction tuning, and later aligned through preference optimization. Real deployments are not static. Domains change, user needs change, production failures appear, safety requirements evolve, and new knowledge must be incorporated without destroying old capabilities.
 
