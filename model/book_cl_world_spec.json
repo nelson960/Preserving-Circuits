@@ -1,0 +1,72 @@
+{
+  "groups": {
+    "animal": ["cat", "dog", "robin", "salmon", "horse", "lion", "otter", "whale", "eagle", "rabbit"],
+    "vehicle": ["sedan", "truck", "canoe", "bicycle", "train", "scooter", "ferry", "tractor", "glider", "bus"],
+    "plant": ["rose", "oak", "pine", "tulip", "moss", "fern", "cedar", "maple", "lily", "cactus"],
+    "artifact": ["key", "lantern", "compass", "map", "bell", "crown", "shield", "book", "ring", "clock"],
+    "place": ["arlen", "vey", "nora", "haven", "quarry", "orchard", "archive", "harbor", "tower", "valley"]
+  },
+  "parent_categories": {
+    "animal": "organism",
+    "vehicle": "object",
+    "plant": "organism",
+    "artifact": "object",
+    "place": "location",
+    "organism": "entity",
+    "object": "entity",
+    "location": "entity",
+    "entity": "entity"
+  },
+  "owners": ["mira", "theo", "lila", "orin", "sana", "pavel", "ines", "juno", "mara", "elian"],
+  "colors": ["red", "blue", "green", "silver", "gold", "black", "white", "brown", "amber", "gray"],
+  "habitats": ["home", "forest", "river", "road", "garden", "workshop", "harbor", "stable", "sky", "library"],
+  "locations": ["arlen", "vey", "nora", "haven", "quarry", "orchard", "archive", "harbor", "tower", "valley"],
+  "access_targets": ["west_gate", "east_gate", "north_bridge", "south_path", "archive_door", "harbor_lift", "garden_lock", "tower_stair", "river_ford", "market_lane"],
+  "train_streams": [
+    ["COPY", "PARENT", "REPAIR_PARENT", "GRANDPARENT", "COLOR", "OWNER"],
+    ["COPY", "PARENT", "GRANDPARENT", "PARENT3", "HABITAT", "LOCATION"],
+    ["PARENT", "REPAIR_PARENT", "COPY", "GRANDPARENT", "COLOR", "ACCESS", "OWNER"]
+  ],
+  "test_streams": [
+    ["COPY", "PARENT", "REPAIR_PARENT", "GRANDPARENT", "PARENT3", "COLOR", "HABITAT", "OWNER", "LOCATION", "ACCESS"],
+    ["COPY", "PARENT", "GRANDPARENT", "COLOR", "OWNER", "REPAIR_PARENT", "PARENT3", "ACCESS"]
+  ],
+  "templates": {
+    "COPY": [
+      "The ledger repeats that {source} remains {target}.",
+      "No scribe changes {source}; the record keeps it as {target}."
+    ],
+    "PARENT": [
+      "The old index says {source} belongs to the broader class {target}.",
+      "In the archive, {source} is filed under {target}."
+    ],
+    "GRANDPARENT": [
+      "A senior catalog note places {source} two levels beneath {target}.",
+      "Following the category chain twice sends {source} toward {target}."
+    ],
+    "PARENT3": [
+      "The deepest index walks three category steps from {source} to {target}.",
+      "After three catalog links, {source} resolves to {target}."
+    ],
+    "COLOR": [
+      "The field guide marks {source} with the color {target}.",
+      "A margin note describes {source} as {target}."
+    ],
+    "HABITAT": [
+      "The travel notes place {source} in the habitat {target}.",
+      "The survey says {source} is usually found around {target}."
+    ],
+    "OWNER": [
+      "The ownership page says {source} belongs to {target}.",
+      "The keeper of {source} is listed as {target}."
+    ],
+    "LOCATION": [
+      "The map places {source} near {target}.",
+      "The route book says {source} can be found at {target}."
+    ],
+    "ACCESS": [
+      "The access table says {source} opens the way to {target}.",
+      "With {source}, the traveler can reach {target}."
+    ]
+  }
+}

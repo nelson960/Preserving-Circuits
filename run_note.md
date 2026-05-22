@@ -4683,6 +4683,329 @@ counterfactual geometric action selection,
 and learned policy imitation / reward training.
 ```
 
+---
+
+#### 11. 1M-Parameter Tiny Transformer: Learned Geometry Policy With Cheap Counterfactuals
+
+We then moved the learned latent-geometry policy from the direct character codebook setting to a small transformer-native model.
+
+The model is a decoder-style transformer with tied token embedding / unembedding:
+
+```text
+d_model = 128
+layers  = 5
+heads   = 4
+ff      = 512
+params  = 998,528
+```
+
+This is the first result where the stable code manifold is not just a direct learned lookup table for the task. It is produced by a transformer language-model backbone trained on relation-style token sequences, then frozen. Closed semantic operators act on the frozen token embedding manifold.
+
+Semantic relation stream:
+
+```text
+COPY
+PARENT
+REPAIR_PARENT
+GRANDPARENT
+PARENT3
+COLOR
+HABITAT
+```
+
+Expected optimizer decisions:
+
+```text
+COPY          -> reuse
+PARENT        -> allocate
+REPAIR_PARENT -> update
+GRANDPARENT   -> compose
+PARENT3       -> compose
+COLOR         -> allocate
+HABITAT       -> allocate
+```
+
+We first confirmed a 1-seed MPS smoke test:
+
+| Metric | Value |
+| :--- | :---: |
+| Parameters | 998,528 |
+| Action accuracy | 1.000 |
+| Unsafe choice rate | 0.000 |
+| Masked unavailable preference rate | 0.000 |
+| New accuracy | 1.000 |
+| Old minimum accuracy | 1.000 |
+| Closure | 0.0049 |
+
+Then a 3-seed MPS run:
+
+| Metric | Value |
+| :--- | :---: |
+| Parameters | 998,528 |
+| Action accuracy | 1.000 |
+| Unsafe choice rate | 0.000 |
+| Masked unavailable preference rate | 0.000 |
+| New accuracy | 1.000 |
+| Old minimum accuracy | 1.000 |
+| Closure | 0.0022 |
+
+The 3-seed result showed the same decision boundary across seeds:
+
+| Event | Teacher | Learned policy | Accuracy |
+| :--- | :--- | :--- | :---: |
+| COPY | reuse 6/6 | reuse 6/6 | 1.000 |
+| PARENT | allocate 6/6 | allocate 6/6 | 1.000 |
+| REPAIR_PARENT | update 6/6 | update 6/6 | 1.000 |
+| GRANDPARENT | compose 6/6 | compose 6/6 | 1.000 |
+| PARENT3 | compose 6/6 | compose 6/6 | 1.000 |
+| COLOR | allocate 6/6 | allocate 6/6 | 1.000 |
+| HABITAT | allocate 3/3 | allocate 3/3 | 1.000 |
+
+The first Colab attempt timed out because the counterfactual loop used full training budgets inside every shadow future. We therefore separated committed training from speculative candidate training:
+
+```text
+committed writes:
+  operator_epochs
+  update_epochs
+
+shadow futures:
+  shadow_operator_epochs
+  shadow_update_epochs
+```
+
+This matters because the reasoner does not need fully converged shadow models. It only needs candidate futures accurate enough to rank the actions safely.
+
+Fast Colab run:
+
+```text
+policy_train_seed_count = 3
+eval_seed_count         = 10
+base_epochs             = 500
+operator_epochs         = 700
+update_epochs           = 500
+shadow_operator_epochs  = 250
+shadow_update_epochs    = 120
+policy_epochs           = 500
+```
+
+Result:
+
+| Metric | Value |
+| :--- | :---: |
+| Parameters | 998,528 |
+| Train action counts | reuse 9, allocate 21, update 6, compose 12 |
+| Action accuracy | 1.000 |
+| Unsafe choice rate | 0.000 |
+| Masked unavailable preference rate | 0.000 |
+| New accuracy | 1.000 |
+| Old minimum accuracy | 1.000 |
+| Closure | 0.0034 |
+| Final operators | 2.50 |
+| New parameters | 82,560 |
+
+Per-event Colab result:
+
+| Event | Teacher | Learned policy | Accuracy | Closure |
+| :--- | :--- | :--- | :---: | :---: |
+| COPY | reuse 20/20 | reuse 20/20 | 1.000 | 0.0000 |
+| PARENT | allocate 20/20 | allocate 20/20 | 1.000 | 0.0001 |
+| REPAIR_PARENT | update 20/20 | update 20/20 | 1.000 | 0.0058 |
+| GRANDPARENT | compose 20/20 | compose 20/20 | 1.000 | 0.0045 |
+| PARENT3 | compose 20/20 | compose 20/20 | 1.000 | 0.0117 |
+| COLOR | allocate 20/20 | allocate 20/20 | 1.000 | 0.0001 |
+| HABITAT | allocate 10/10 | allocate 10/10 | 1.000 | 0.0000 |
+
+This is the strongest result so far for the optimizer loop.
+
+It shows:
+
+```text
+1. The learned geometry policy transfers from toy character codebooks
+   to a 998k-parameter transformer manifold.
+
+2. The policy separates reuse, composition, repair, and allocation
+   from latent-geometry features alone.
+
+3. Cheap counterfactual futures are sufficient for safe action selection.
+
+4. Old semantic relations are preserved while new relations are learned.
+```
+
+The important conceptual update:
+
+```text
+The counterfactual reasoner does not need to fully solve every candidate branch.
+It only needs enough future simulation to classify the branch:
+  safe reuse, useful composition, local repair, or hard conflict/new primitive.
+```
+
+This makes the approach more scalable than the first full-shadow version.
+
+---
+
+#### 12. How This Differs From AdamW / Standard Training Loops
+
+A standard modern training loop looks like:
+
+```text
+batch x, y
+loss = L(model(x), y)
+g = grad(loss, theta)
+theta = AdamW(theta, g)
+```
+
+AdamW improves the raw gradient update with:
+
+```text
+first-moment memory
+second-moment scaling
+weight decay
+learning-rate scheduling
+gradient clipping
+```
+
+But AdamW still commits every update directly to the same parameter state. It asks one main question:
+
+```text
+Does this step reduce the current batch loss?
+```
+
+It does not directly ask:
+
+```text
+Did old capabilities survive?
+Did composed skills still work?
+Did the representation stay on the latent manifold?
+Did this task need reuse, repair, composition, or new capacity?
+Was this update a local repair or a hard semantic conflict?
+```
+
+In our continual-learning loop, Adam/SGD is demoted from "the learning algorithm" to "a candidate write generator."
+
+The loop is:
+
+```text
+for each incoming task or data batch:
+
+    build candidate futures:
+        reuse existing program
+        compose existing operators
+        update/repair an existing operator
+        allocate a new operator
+
+    for each candidate future:
+        copy relevant state
+        apply candidate write or program
+        run old probes
+        run new probes
+        run composition probes
+        measure closure/manifold geometry
+
+    latent-geometry policy selects action:
+        reuse / compose / update / allocate
+
+    commit only selected future
+```
+
+Mathematically, standard AdamW is:
+
+```text
+theta_{t+1} = AdamW(theta_t, grad L_new(theta_t))
+```
+
+Our loop is closer to:
+
+```text
+candidates C_t = {
+    reuse(theta_t),
+    compose(theta_t),
+    update(theta_t, grad L_new),
+    allocate(theta_t)
+}
+
+score(c) =
+    new_task_success(c)
+  + old_task_retention(c)
+  - closure_error(c)
+  - manifold_drift(c)
+  - parameter_cost(c)
+
+theta_{t+1} = commit(argmax_c score(c))
+```
+
+The learned-policy version replaces the handwritten score with:
+
+```text
+action = pi_phi(z_t)
+```
+
+where `z_t` is the latent-geometry state:
+
+```text
+z_t =
+[
+  candidate availability,
+  new accuracy,
+  old minimum accuracy,
+  old mean accuracy,
+  new loss,
+  new closure error,
+  old closure error,
+  new manifold error,
+  parameter cost
+]
+```
+
+So the optimizer has two levels:
+
+```text
+inner optimizer:
+  Adam/SGD produces candidate local weight changes.
+
+outer optimizer:
+  latent-geometry reasoner decides whether that write should be committed.
+```
+
+This is the key difference.
+
+AdamW is a weight-space optimizer:
+
+```text
+follow a loss gradient through parameters
+```
+
+Our loop is a behavior-space / geometry-space optimizer:
+
+```text
+simulate candidate writes,
+measure their effect on old and new latent geometry,
+then commit only safe/useful futures
+```
+
+This explains why forced conflict experiments behave the way they do:
+
+```text
+Adam update:
+  learns new conflicting task
+  destroys old task
+
+Geometry-gated update:
+  refuses destructive overwrite
+  preserves old task
+
+Reasoner:
+  recognizes hard conflict
+  allocates or composes instead of forcing overwrite
+```
+
+So the current CL model is not "a better AdamW step." It is a different training loop:
+
+```text
+AdamW updates weights.
+Latent-geometry reasoning decides whether a weight update is allowed at all.
+```
+
+That is the mechanism we are testing.
 
 
 
