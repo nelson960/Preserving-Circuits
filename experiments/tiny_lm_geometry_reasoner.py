@@ -18,7 +18,7 @@ import argparse
 import copy
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +69,8 @@ class Config:
     base_epochs: int
     operator_epochs: int
     update_epochs: int
+    shadow_operator_epochs: int
+    shadow_update_epochs: int
     base_lr: float
     operator_lr: float
     update_lr: float
@@ -839,7 +841,8 @@ def build_candidates(
     for record in library.values():
         shadow_library = clone_library(library)
         shadow_record = shadow_library[record.name]
-        update_stats = structural_update(model, shadow_record, inputs, targets, cfg, distance_scale)
+        shadow_update_cfg = replace(cfg, update_epochs=cfg.shadow_update_epochs)
+        update_stats = structural_update(model, shadow_record, inputs, targets, shadow_update_cfg, distance_scale)
         program = direct_operator_program(shadow_record)
         candidate_task_to_program = dict(task_to_program)
         candidate_task_to_program[task_name] = program
@@ -862,7 +865,8 @@ def build_candidates(
     shadow_library = clone_library(library)
     op_name = f"OP_{task_name}_{len(library)}"
     record = new_operator(task_name, cfg, op_name)
-    train_new_operator(model, record, inputs, targets, cfg, False, code_token_ids, distance_scale)
+    shadow_operator_cfg = replace(cfg, operator_epochs=cfg.shadow_operator_epochs)
+    train_new_operator(model, record, inputs, targets, shadow_operator_cfg, False, code_token_ids, distance_scale)
     shadow_library[op_name] = record
     program = direct_operator_program(record)
     candidate_task_to_program = dict(task_to_program)
@@ -1192,12 +1196,14 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     cfg = config_from_args(args)
     spec = load_spec(args.lexicon_json)
     vocab = make_vocab(spec)
+    train_seed_count = args.policy_train_seed_count if args.policy_train_seed_count is not None else args.seed_count
+    eval_seed_count = args.eval_seed_count if args.eval_seed_count is not None else args.seed_count
     train_features: list[list[float]] = []
     train_labels: list[int] = []
     train_rows: list[dict[str, Any]] = []
     base_parameter_count: int | None = None
     for seed in tqdm(
-        range(args.seed_count),
+        range(train_seed_count),
         desc="collect policy examples",
         dynamic_ncols=True,
         disable=not cfg.progress,
@@ -1229,7 +1235,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     policy = train_policy(train_features, train_labels, cfg, args)
     test_rows: list[dict[str, Any]] = []
     for seed in tqdm(
-        range(args.seed_count),
+        range(eval_seed_count),
         desc="evaluate learned policy",
         dynamic_ncols=True,
         disable=not cfg.progress,
@@ -1320,6 +1326,12 @@ def config_from_args(args: argparse.Namespace) -> Config:
         base_epochs=args.base_epochs,
         operator_epochs=args.operator_epochs,
         update_epochs=args.update_epochs,
+        shadow_operator_epochs=args.shadow_operator_epochs
+        if args.shadow_operator_epochs is not None
+        else args.operator_epochs,
+        shadow_update_epochs=args.shadow_update_epochs
+        if args.shadow_update_epochs is not None
+        else args.update_epochs,
         base_lr=args.base_lr,
         operator_lr=args.operator_lr,
         update_lr=args.update_lr,
@@ -1346,6 +1358,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lexicon-json", type=Path, required=True)
     parser.add_argument("--seed-count", type=int, default=3)
+    parser.add_argument("--policy-train-seed-count", type=int)
+    parser.add_argument("--eval-seed-count", type=int)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-layers", type=int, default=5)
     parser.add_argument("--n-heads", type=int, default=4)
@@ -1355,6 +1369,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-epochs", type=int, default=1200)
     parser.add_argument("--operator-epochs", type=int, default=1200)
     parser.add_argument("--update-epochs", type=int, default=1000)
+    parser.add_argument("--shadow-operator-epochs", type=int)
+    parser.add_argument("--shadow-update-epochs", type=int)
     parser.add_argument("--base-lr", type=float, default=0.003)
     parser.add_argument("--operator-lr", type=float, default=0.01)
     parser.add_argument("--update-lr", type=float, default=0.005)
@@ -1407,6 +1423,16 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in positive_ints:
         if getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive.")
+    optional_positive_ints = [
+        "policy_train_seed_count",
+        "eval_seed_count",
+        "shadow_operator_epochs",
+        "shadow_update_epochs",
+    ]
+    for name in optional_positive_ints:
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive when provided.")
     if args.d_model % args.n_heads != 0:
         raise ValueError("--d-model must be divisible by --n-heads.")
     positive_floats = [
