@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 
 Program = tuple[Any, ...]
@@ -85,6 +86,7 @@ class Config:
     repair_noise_std: float
     structural_risk_power: float
     structural_need_power: float
+    progress: bool
     device: torch.device
 
 
@@ -239,6 +241,18 @@ def tensor_is_finite(name: str, value: torch.Tensor) -> None:
         raise FloatingPointError(f"{name} contains non-finite values.")
 
 
+def progress_range(total: int, desc: str, cfg: Config) -> Any:
+    if total <= 0:
+        raise ValueError(f"progress total must be positive, got {total}.")
+    return tqdm(
+        range(total),
+        desc=desc,
+        leave=False,
+        dynamic_ncols=True,
+        disable=not cfg.progress,
+    )
+
+
 def load_spec(path: Path) -> SemanticSpec:
     raw = json.loads(path.read_text(encoding="utf-8"))
     required = ["input_domain", "relations", "policy_train_streams", "policy_test_streams"]
@@ -346,7 +360,7 @@ def manifold_error(out_code: torch.Tensor, model: TinyCausalLM, code_token_ids: 
 
 def train_base_lm(model: TinyCausalLM, corpus: torch.Tensor, code_token_ids: torch.Tensor, cfg: Config) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.base_lr)
-    for _ in range(cfg.base_epochs):
+    for _ in progress_range(cfg.base_epochs, "base manifold", cfg):
         optimizer.zero_grad()
         logits, _ = model(corpus[:, :-1])
         targets = corpus[:, 1:]
@@ -611,7 +625,7 @@ def train_new_operator(
     optimizer = torch.optim.Adam(record.module.parameters(), lr=cfg.operator_lr)
     input_code = model.code(inputs).detach()
     target_code = model.code(targets).detach()
-    for _ in range(cfg.operator_epochs):
+    for _ in progress_range(cfg.operator_epochs, f"train {record.name}", cfg):
         optimizer.zero_grad()
         out_code = record.module(input_code)
         logits = model.decode(out_code)
@@ -670,7 +684,7 @@ def structural_update(
     target_code = model.code(targets).detach()
     gate_means: list[float] = []
     active_counts: list[float] = []
-    for _ in range(cfg.update_epochs):
+    for _ in progress_range(cfg.update_epochs, f"update {record.name}", cfg):
         record.module.zero_grad(set_to_none=True)
         out_code, hidden = forward_with_hidden(record, input_code)
         logits = model.decode(out_code)
@@ -1122,7 +1136,7 @@ def train_policy(
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.policy_lr)
     x = torch.tensor(features, dtype=torch.float32, device=cfg.device)
     y = torch.tensor(labels, dtype=torch.long, device=cfg.device)
-    for _ in range(args.policy_epochs):
+    for _ in progress_range(args.policy_epochs, "train action policy", cfg):
         optimizer.zero_grad()
         loss = F.cross_entropy(policy(x), y)
         tensor_is_finite("policy loss", loss)
@@ -1182,7 +1196,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     train_labels: list[int] = []
     train_rows: list[dict[str, Any]] = []
     base_parameter_count: int | None = None
-    for seed in range(args.seed_count):
+    for seed in tqdm(
+        range(args.seed_count),
+        desc="collect policy examples",
+        dynamic_ncols=True,
+        disable=not cfg.progress,
+    ):
         print(f"collect_seed={seed}")
         model, code_token_ids, distance_scale = make_run_state(spec, vocab, cfg, seed)
         if base_parameter_count is None:
@@ -1209,7 +1228,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("No base model was created.")
     policy = train_policy(train_features, train_labels, cfg, args)
     test_rows: list[dict[str, Any]] = []
-    for seed in range(args.seed_count):
+    for seed in tqdm(
+        range(args.seed_count),
+        desc="evaluate learned policy",
+        dynamic_ncols=True,
+        disable=not cfg.progress,
+    ):
         eval_seed = args.test_seed_offset + seed
         print(f"eval_seed={eval_seed}")
         model, code_token_ids, distance_scale = make_run_state(spec, vocab, cfg, eval_seed)
@@ -1313,6 +1337,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         repair_noise_std=args.repair_noise_std,
         structural_risk_power=args.structural_risk_power,
         structural_need_power=args.structural_need_power,
+        progress=not args.no_progress,
         device=device,
     )
 
@@ -1353,6 +1378,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-seed", type=int, default=12345)
     parser.add_argument("--test-seed-offset", type=int, default=10000)
     parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cpu")
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
     validate_args(args)
