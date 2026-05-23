@@ -1238,11 +1238,197 @@ Our causal ablation is currently a behavioral proxy for this, not the exact read
 | SAE semantic feature | clean feature explains behavior | feature 254 | decodable but non-causal | probes are not causal evidence |
 | Causal SAE ranking | find actually used features | gradient × SAE decoder | effect weakened after fine-tune | causal-use drift is measurable |
 
-## 24. Next Experiments
+## 24. Real-Book Geometry CL Boundary
 
-The next experiments should not add another toy architecture immediately. They should push the current mechanistic observation until it reaches collapse.
+After the synthetic algebra and semantic-character experiments, we moved to a public-domain real-book benchmark using *The Wonderful Wizard of Oz* as a sequential learning stream.
 
-### Stronger Training Pressure
+The goal was not to claim that the system had solved real language learning. The goal was narrower:
+
+```text
+Compare blind sequential AdamW against geometry-gated memory allocation
+on the same tiny transformer, same book chunks, and same QA probes.
+```
+
+### Setup
+
+The benchmark uses:
+
+- a small decoder-only transformer;
+- a BPE tokenizer trained on public-domain books;
+- a frozen base manifold for Geometry CL;
+- closed residual operators as chunk memories;
+- sequential Wizard of Oz chunks;
+- local QA probes, retention QA probes, and cross-chunk composition probes.
+
+Two systems were compared:
+
+```text
+Regular AdamW:
+  sequentially update one shared transformer
+
+Geometry CL:
+  keep the base transformer frozen
+  allocate or reuse closed residual operators
+  avoid unsafe same-operator overwrite by default
+```
+
+Several benchmark bugs had to be fixed before the result was interpretable:
+
+- table-of-contents leakage was assigning late-book facts to the first chunk;
+- raw book continuation did not reliably teach QA behavior;
+- QA supervision had to be an explicit answer-token loss;
+- the final training window of long chunks had to be included;
+- long old probes had to be chunked before scoring;
+- closure distance had to avoid `torch.cdist` for MPS.
+
+### Main Result
+
+Final 5-chunk result:
+
+| Method | Local Acc | Retention Acc | Composition Acc |
+| :--- | :---: | :---: | :---: |
+| Regular AdamW | 1.000 | 0.000 | 0.000 |
+| Geometry CL | 1.000 | 0.778 | 0.000 |
+
+This is the clearest natural-language anti-overwrite result so far.
+
+AdamW learns the current chunk, but the current update overwrites old QA behavior. Geometry CL also learns the current chunk, but preserves many older facts by storing chunk knowledge in separate operators.
+
+The capacity sweep showed the same broad pattern:
+
+```text
+AdamW mean retention across sweep ≈ 0.02
+Geometry CL mean retention       ≈ 0.57
+best Geometry CL retention       = 0.90
+```
+
+So the useful claim is:
+
+> Geometry-gated operator allocation strongly reduces catastrophic overwriting compared with sequential AdamW on a real-book QA benchmark.
+
+### What Did Not Work
+
+This result is not full continual learning.
+
+The first operator still underfit two facts:
+
+```text
+Toto -> predicted silver
+tin  -> predicted Scarecrow
+```
+
+This means part of the retention failure is not later forgetting. It is failed initial storage. A memory that was never correctly written cannot later be retained.
+
+Composition also failed:
+
+```text
+Final composition accuracy = 0.000
+```
+
+Here, composition means combining multiple facts learned at different times:
+
+```text
+Scarecrow -> brains
+Tin Woodman -> heart
+Question: What did the Scarecrow want, and what did the Tin Woodman want?
+Answer: brains and heart
+```
+
+The current system stores chunk facts in separate operators, but it does not yet know how to select multiple relevant operators and combine their outputs. Cross-chunk questions are effectively sent through the current or latest operator, so answers collapse toward the latest chunk fact.
+
+That is why the current boundary is:
+
+```text
+memory preservation: partially working
+retrieval: missing
+composition: missing
+bounded-capacity consolidation: missing
+```
+
+### Interpretation
+
+Geometry CL should not be framed as a solved continual-learning method.
+
+It is better framed as:
+
+```text
+a controlled-memory substrate
+that prevents blind overwriting
+and exposes the next required mechanisms
+```
+
+The next question is no longer only:
+
+```text
+Can we stop old weights from being overwritten?
+```
+
+The answer is partly yes, by isolating writes.
+
+The next question is:
+
+```text
+Can we retrieve, compose, and consolidate stored knowledge under bounded capacity?
+```
+
+Required mechanisms:
+
+- a commit gate that verifies local facts before accepting a new operator;
+- a retriever/router that maps a question to relevant stored memories;
+- a composer that combines multiple retrieved facts;
+- a consolidation procedure that compresses related operators into a parent memory;
+- full multi-book QA probes for Oz, Alice, and Time Machine.
+
+This result therefore moves the project from anti-forgetting toward memory management.
+
+## 25. Next Experiments
+
+The next experiments should not add another toy architecture immediately. They should push the two active boundaries:
+
+1. real-book Geometry CL needs retrieval, composition, and consolidation;
+2. mechanistic feature tracking needs stronger pressure until behavior actually collapses.
+
+### Real-Book CL Next Tests
+
+Add a local commit gate:
+
+```text
+train operator
+evaluate local QA probes
+commit only if all local facts are stored
+```
+
+Then add a router/retriever:
+
+```text
+question embedding -> top-k stored operators/facts
+```
+
+Then add a composer:
+
+```text
+retrieved fact A + retrieved fact B -> composed answer
+```
+
+Finally, test consolidation:
+
+```text
+many chunk operators -> compressed parent memory
+```
+
+The success metric should separate:
+
+```text
+local_write_acc
+old_retention_acc
+composition_acc
+operator_count
+consolidated_operator_count
+```
+
+### Mechanistic Collapse Track
+
+#### Stronger Training Pressure
 
 Increase:
 
@@ -1272,7 +1458,7 @@ Measure at every checkpoint:
 - concept separation;
 - feature capacity if available.
 
-### Better Feature Tracking
+#### Better Feature Tracking
 
 The fixed SAE tells us how baseline features activate after fine-tuning. But it does not reveal whether features migrate into new SAE directions.
 
@@ -1282,7 +1468,7 @@ Next options:
 2. train crosscoder across checkpoints;
 3. track feature families rather than individual features.
 
-### Capacity Measurement
+#### Capacity Measurement
 
 Compute:
 
@@ -1294,7 +1480,7 @@ before and after sequential training.
 
 This should show whether a feature is merely less active or actually losing representational capacity through overlap/collision.
 
-### Readout And Circuit Measurement
+#### Readout And Circuit Measurement
 
 Measure whether downstream layers still use the same features:
 
@@ -1304,7 +1490,7 @@ Measure whether downstream layers still use the same features:
 - readout alignment proxies;
 - direct path attribution.
 
-## 25. Current Research Direction
+## 26. Current Research Direction
 
 The current direction is no longer:
 
@@ -1329,7 +1515,7 @@ The likely intervention will not protect all old activations. It will need to pr
 - reusable operation structure;
 - enough plasticity for genuinely new learning.
 
-## 26. Ending State
+## 27. Ending State
 
 We have not solved continual learning.
 
@@ -1347,3 +1533,457 @@ without full concept collapse yet
 ```
 
 The next milestone is to push this setup until behavioral forgetting appears, then measure whether capacity degradation and readout misalignment explain the collapse.
+
+## 28. Single-Model Semantic Geometry Write Control
+
+The frozen-base operator-library experiments were useful, but they were not the final target. A frozen base plus external operators is a split system. It can prevent overwriting, but it does not show a single model controlling its own writes.
+
+The newer experiment therefore uses one PyTorch model with internal attention-addressed memory slots:
+
+```text
+token embeddings
+relation embeddings
+role / position / time / source / evidence embeddings
+memory keys
+memory values
+optional parent mechanisms
+readout through token embeddings
+```
+
+The write reasoner is active only during learning. At inference time there is no optimizer and no external reasoner:
+
+```text
+query -> same updated model -> answer
+```
+
+During learning the model evaluates candidate futures:
+
+```text
+discard
+reuse
+compose
+allocate
+rewrite
+update
+consolidate
+```
+
+Each candidate is a shadow future. The system measures what that future does to latent geometry and active behavior before committing it.
+
+### 28.1 System Diagram
+
+```mermaid
+flowchart TD
+    A["Incoming semantic event<br/>subject, relation chain, target, source, evidence, time"] --> B["Context encoder<br/>token + role + position + time + source + evidence"]
+    B --> C["Current model state<br/>embeddings + internal memory slots + active parents"]
+
+    C --> D["Candidate futures"]
+    D --> D1["discard / reuse<br/>no weight write"]
+    D --> D2["compose<br/>test relation chain"]
+    D --> D3["allocate<br/>write unused or least-used slot"]
+    D --> D4["rewrite<br/>overwrite selected slot"]
+    D --> D5["update<br/>full model candidate"]
+    D --> D6["consolidate<br/>train parent transform and free slots"]
+
+    D1 --> E["Shadow forward passes"]
+    D2 --> E
+    D3 --> E
+    D4 --> E
+    D5 --> E
+    D6 --> E
+
+    E --> F["Latent geometry monitor<br/>new accuracy, active accuracy, closure, attention margin, key/value alignment, composition safety"]
+    F --> G["Learned write policy<br/>scores candidate futures from geometry + context"]
+    G --> H{"Commit gate"}
+
+    H -->|safe and useful| I["Commit selected future<br/>model weights change"]
+    H -->|unsafe| J["Reject candidate<br/>keep current model"]
+
+    I --> K["Normal inference path<br/>query -> memory attention -> token readout"]
+    J --> K
+
+    L["Geometry warmup<br/>shape code space so repeated transformations are compressible"] --> C
+```
+
+### 28.2 Forward Computation
+
+For a one-hop query, the model builds a normalized query vector:
+
+\[
+q(s,r) =
+\operatorname{normalize}
+\left(
+\operatorname{LN}
+\left(
+E(s) + R(r) + P_{\text{subject}} + P_{\text{relation}}
+\right)
+\right)
+\]
+
+For memory slot \(i\):
+
+\[
+score_i = \frac{q^\top k_i}{\tau}
+\]
+
+\[
+\alpha = \operatorname{softmax}(score)
+\]
+
+\[
+h = \operatorname{LN}\left(\sum_i \alpha_i v_i\right)
+\]
+
+The answer is decoded by nearest token/readout alignment:
+
+\[
+logits = h E^\top
+\]
+
+For a composed query:
+
+```text
+Alice --lives_in--> Paris --country_of--> France
+```
+
+the model repeats the same step:
+
+\[
+h_1 = M(E(\text{Alice}), \text{lives\_in})
+\]
+
+\[
+h_2 = M(h_1, \text{country\_of})
+\]
+
+The reason closure matters is that \(h_1\) must be a valid reusable code, not merely a locally decodable answer.
+
+### 28.3 Direct Slot Write Objective
+
+The earlier write mechanism was too indirect. It optimized final answer loss and closure, but did not explicitly force the chosen slot to become a clean memory.
+
+The current direct-write loss makes the slot behave like an addressable memory:
+
+\[
+L_{\text{write}} =
+L_{\text{CE}}
++ \lambda_{\text{closure}} \lVert h - E(y) \rVert^2
++ \lambda_{\text{key}}(1 - \cos(k_s, q))
++ \lambda_{\text{value}}\lVert v_s - E(y) \rVert^2
++ \lambda_{\text{margin}}
+\max(0, m + \max_{j \ne s} q^\top k_j - q^\top k_s)
+\]
+
+where:
+
+```text
+s = selected slot
+q = query(subject, relation)
+y = target token
+k_s = selected slot key
+v_s = selected slot value
+m = attention margin
+```
+
+This separates the two write requirements:
+
+```text
+key quality:
+  does the right query retrieve the slot?
+
+value quality:
+  does the slot contain the right object code?
+```
+
+This fixed the early composition failure.
+
+### 28.4 Learned Write Policy
+
+For each candidate future \(a\), the system computes geometry features:
+
+```text
+new_acc
+active_acc
+protected_acc
+closure
+slot_usage
+key_cosine
+value_cosine
+target_attention
+attention_margin
+context encodings
+```
+
+The learned policy scores candidates:
+
+\[
+score_a = P_{\psi}(z_a)
+\]
+
+\[
+a^* = \arg\max_a score_a
+\]
+
+This is not language-style reasoning. It is numerical counterfactual reasoning:
+
+```text
+try a possible future
+measure its geometry
+score it
+commit only one future
+```
+
+The policy has repeatedly learned the correct action labels:
+
+```text
+discard false/noisy facts
+reuse repeated true facts
+compose relation chains
+allocate new true facts
+rewrite repeated reliable conflicts
+```
+
+## 29. Recent Results: Write Control, Capacity, And Consolidation
+
+### 29.1 Context-Aware Write Policy
+
+With position, time, source, and evidence encodings, the learned policy selected the correct write action:
+
+| Setting | Active Acc | Composition Acc | Action Acc |
+| :--- | :---: | :---: | :---: |
+| 16 slots | 0.8333 +/- 0.0745 | 0.9333 +/- 0.1333 | 1.0000 +/- 0.0000 |
+| 6 slots | 0.8833 +/- 0.1302 | 0.9667 +/- 0.1000 | 1.0000 +/- 0.0000 |
+
+The policy was not the main failure. It knew what action to choose. The weak part was the write mechanism.
+
+### 29.2 Direct Write Fix
+
+After adding direct key/value/attention write losses:
+
+| Slots | Active Acc | Composition Acc | Action Acc |
+| :---: | :---: | :---: | :---: |
+| 16 | 0.9833 +/- 0.0500 | 1.0000 +/- 0.0000 | 1.0000 +/- 0.0000 |
+| 6 | 0.9833 +/- 0.0500 | 1.0000 +/- 0.0000 | 1.0000 +/- 0.0000 |
+
+The main lesson:
+
+```text
+correct write decisions are not enough;
+the model must write into memory with clean key/value geometry.
+```
+
+### 29.3 Capacity Threshold Without Consolidation
+
+With direct writes but no successful consolidation:
+
+| Slots | Active Acc | Composition Acc | Action Acc |
+| :---: | :---: | :---: | :---: |
+| 5 | 0.8333 +/- 0.0000 | 1.0000 +/- 0.0000 | 1.0000 +/- 0.0000 |
+| 4 | 0.6667 +/- 0.0000 | 0.6667 +/- 0.0000 | 1.0000 +/- 0.0000 |
+
+This separated the failure modes:
+
+```text
+action selection: still correct
+write mechanism: works until pressure
+capacity: insufficient without compression
+```
+
+The stream needs roughly six concrete one-hop memories:
+
+```text
+country_of(city_1)
+country_of(city_2)
+lives_in(person)
+pet(person)
+color(pet)
+parent(person)
+```
+
+With five or four concrete slots, some fact must collide unless the model consolidates.
+
+### 29.4 Naive Dynamic Consolidation Failed
+
+A parent mechanism was added:
+
+\[
+F_p(q) = q \odot \gamma_p + \beta_p
+\]
+
+The parent competes with concrete slots using query-key alignment and token-manifold confidence:
+
+\[
+score_p =
+q^\top k_p
++ \lambda_{\text{conf}}
+\max_j \cos(F_p(q), E(j))
+\]
+
+The consolidation objective for a group \(G\):
+
+\[
+L_{\text{parent}} =
+\sum_{(q_i,y_i)\in G}
+\left[
+\lVert F_p(q_i) - E(y_i) \rVert^2
++ 1 - \cos(F_p(q_i), E(y_i))
+\right]
++ L_{\text{margin}}
+\]
+
+The commit gate accepted a consolidation only if:
+
+```text
+active accuracy did not drop
+composition accuracy did not drop
+group facts were still correct
+slots were actually freed
+```
+
+Without shaping the latent space first, consolidation mostly rejected:
+
+| Slots | Active Acc | Composition Acc | Parents | Freed Slots |
+| :---: | :---: | :---: | :---: | :---: |
+| 5 | 0.8333 +/- 0.0000 | 1.0000 +/- 0.0000 | 0.0000 +/- 0.0000 | 0.0000 +/- 0.0000 |
+| 4 | 0.6667 +/- 0.0000 | 0.6667 +/- 0.0000 | 0.1000 +/- 0.3000 | 0.2000 +/- 0.6000 |
+
+This was a clean negative result:
+
+```text
+the gate attempted consolidation
+the gate rejected unsafe compression
+capacity remained unsolved
+```
+
+The likely reason was that the latent code space was not yet compressible. Separate facts were stored, but repeated semantic transformations were not geometrically aligned.
+
+## 30. Geometry Warmup Makes Consolidation Work
+
+The next experiment trained the code space before the continual stream. This is not memory writing. The warmup does not fill slots with facts. It shapes the latent geometry so repeated one-hop transformations are easier to compress.
+
+For reliable one-hop warmup events:
+
+```text
+subject + relation -> target
+```
+
+the warmup trains temporary relation transforms:
+
+\[
+F_r(q) = q \odot \gamma_r + \beta_r
+\]
+
+with objective:
+
+\[
+L_{\text{geo}} =
+\lVert F_r(q) - E(y) \rVert^2
++ (1 - \cos(F_r(q), E(y)))
++ \lambda_{\text{CE}}\operatorname{CE}(F_r(q)E^\top, y)
++ \lambda_{\text{sep}}L_{\text{sep}}
++ \lambda_{\text{norm}}L_{\text{norm}}
+\]
+
+Warmup metrics:
+
+```text
+events = 560
+final_loss = 0.7000
+final_reconstruction = 0.1246
+final_token_acc = 0.7625
+```
+
+### 30.1 Five Slots: Consolidation Starts Working
+
+| Setting | Active Acc | Composition Acc | Parents | Freed Slots |
+| :--- | :---: | :---: | :---: | :---: |
+| No warmup | 0.8333 +/- 0.0000 | 1.0000 +/- 0.0000 | 0.0000 +/- 0.0000 | 0.0000 +/- 0.0000 |
+| Warmup | 0.9500 +/- 0.0764 | 1.0000 +/- 0.0000 | 0.7000 +/- 0.4583 | 1.4000 +/- 0.9165 |
+
+Per-seed:
+
+```text
+7/10 seeds:
+  parent committed
+  2 slots freed
+  active_acc = 1.000
+  composition_acc = 1.000
+
+3/10 seeds:
+  consolidation rejected
+  active_acc = 0.833
+  composition_acc = 1.000
+```
+
+This was the first positive evidence that consolidation failure was not architectural inevitability. Latent geometry quality controlled whether parent compression was safe.
+
+### 30.2 Four Slots: Capacity Threshold Moves
+
+The harder setting was four concrete memory slots.
+
+| Setting | Active Acc | Composition Acc | Parents | Freed Slots |
+| :--- | :---: | :---: | :---: | :---: |
+| No warmup | 0.6667 +/- 0.0000 | 0.6667 +/- 0.0000 | 0.1000 +/- 0.3000 | 0.2000 +/- 0.6000 |
+| Warmup | 0.9833 +/- 0.0500 | 0.9333 +/- 0.1333 | 1.0000 +/- 0.0000 | 2.0000 +/- 0.0000 |
+
+Per-seed:
+
+```text
+10/10 seeds:
+  parent committed
+  2 slots freed
+```
+
+This is the strongest result so far:
+
+```text
+training the latent geometry before the stream made semantic memories compressible;
+under four-slot pressure, the system moved from capacity failure to mostly successful consolidation.
+```
+
+The remaining failures were narrow:
+
+```text
+seed 0: pet_color_composition failed
+seed 5: one active fact dropped after stable_color
+seed 9: pet_color_composition failed
+```
+
+The next target is therefore composition-preserving consolidation. When a parent replaces concrete slots, the parent should be trained and tested not only on direct facts:
+
+\[
+q(a,r) \rightarrow b
+\]
+
+but also on downstream compositions:
+
+\[
+q(x,r_1,r_2) \rightarrow y
+\]
+
+## 31. Updated Status
+
+The current evidence supports these claims:
+
+1. A learned geometry policy can choose discard, reuse, compose, allocate, and rewrite in a single internal-memory model.
+2. Direct key/value/attention losses are necessary for reliable writes.
+3. Capacity pressure appears when concrete memory slots are fewer than active facts.
+4. Naive consolidation fails when the latent space is not compressible.
+5. A consolidation-friendly latent warmup can make parent compression commit safely.
+6. With warmup, four slots plus one parent can outperform four raw slots by a large margin.
+
+The current evidence does not support these stronger claims:
+
+1. full natural-language continual learning is solved;
+2. consolidation is perfect;
+3. composition is fully preserved after every compression;
+4. the method scales without new retrieval and routing problems;
+5. the learned warmup is sufficient for open-ended semantics.
+
+The working research question is now:
+
+```text
+Can a model learn a latent geometry where memory writes are addressable,
+repeated transformations are compressible,
+and consolidation preserves downstream composition?
+```
