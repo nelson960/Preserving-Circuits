@@ -6480,3 +6480,4278 @@ When a parent replaces slots, train and test not only direct facts:
 but also every active downstream composition using those facts:
   q(x, r1, r2) -> y
 ```
+
+#### Consolidation Geometry Diagnostic
+
+Added an opt-in diagnostic ledger:
+
+```text
+--record-consolidation-diagnostics
+```
+
+The diagnostic records every parent consolidation attempt, not just committed parents.
+
+For each attempted parent it logs:
+
+```text
+same_relation vs mixed_relation
+compressed event names
+compressed slots
+query pair cosine
+parent key cosine to each query
+parent output cosine to own target
+parent output margin over the other target
+parent output cosine to old slot values
+offset cosine:
+  cos(F_parent(q) - q, E(target) - q)
+offset norm ratio
+direct closure before / after
+dependent composition accuracy before / after
+dependent composition closure before / after
+first-hop closure before / after
+```
+
+This directly tests the failure hypothesis:
+
+```text
+parent key alignment can look healthy
+and direct endpoints can improve
+while the first-hop latent code becomes worse for downstream composition.
+```
+
+A small sanity diagnostic already showed this failure shape:
+
+```text
+compressed group:
+  country_base_1 + country_base_2
+  same_relation = true
+
+parent_key_cosine_mean = 0.9705
+direct_closure_delta_mean = -0.3138
+
+but:
+  after_dependent_composition_acc_mean = 0.0
+  dependent_composition_closure_delta_mean = +0.2693
+  first_hop_closure_delta_mean = +0.8852
+```
+
+Interpretation:
+
+```text
+the parent key and direct endpoint metrics can look fine,
+but the parent can still damage the reusable first-hop code
+needed for relation chaining.
+```
+
+This confirms the next target:
+
+```text
+composition-preserving consolidation,
+not another architecture change yet.
+```
+
+#### Full Diagnostic Run: Slots 4 And 5
+
+Ran the diagnostic ledger on the previous warmup-consolidation settings.
+
+Slots 4:
+
+```text
+active_acc = 0.9833 +/- 0.0500
+composition_acc = 0.9333 +/- 0.1333
+parents = 1.0000 +/- 0.0000
+freed_slots = 2.0000 +/- 0.0000
+
+diagnostics:
+  attempts = 66
+  accepted = 10
+  same_relation_attempts = 10
+  same_relation_accepted = 0
+  mixed_relation_attempts = 56
+  mixed_relation_accepted = 10
+  accepted_offset_cosine_mean = 0.7770
+  dependent_composition_closure_delta_mean = +0.2920
+  first_hop_closure_delta_mean = +0.2292
+  after_dependent_composition_acc_mean = 0.6607
+```
+
+Slots 5:
+
+```text
+active_acc = 0.9500 +/- 0.0764
+composition_acc = 1.0000 +/- 0.0000
+parents = 0.7000 +/- 0.4583
+freed_slots = 1.4000 +/- 0.9165
+
+diagnostics:
+  attempts = 60
+  accepted = 7
+  same_relation_attempts = 10
+  same_relation_accepted = 0
+  mixed_relation_attempts = 50
+  mixed_relation_accepted = 7
+  accepted_offset_cosine_mean = 0.7886
+  dependent_composition_closure_delta_mean = +0.3806
+  first_hop_closure_delta_mean = +0.1735
+  after_dependent_composition_acc_mean = 0.6000
+```
+
+The important result is not the final accuracy alone. The diagnostic shows a
+specific write-control bug:
+
+```text
+same-relation parent candidates are found,
+but none are accepted.
+
+mixed-relation parents are accepted,
+but their accepted first-hop closure and dependent-composition closure worsen.
+```
+
+For the slots-4 run, all same-relation attempts compressed:
+
+```text
+country_base_1 + country_base_2
+relation_types = country_of + country_of
+offset_cosine ~= 0.95 to 0.98
+direct_closure_delta < 0
+candidate_group_acc = 1.0
+```
+
+So the same-relation parent is geometrically plausible and directly retrieves
+the compressed facts. It is rejected because candidate active accuracy falls to
+0.75. That points to parent routing / slot replacement / commit scoring, not to
+same-relation geometry being impossible.
+
+Accepted mixed parents usually compress pairs such as:
+
+```text
+country_of + lives_in
+country_of + pet
+pet + color
+```
+
+These parents often preserve enough direct retrieval to pass the current gate,
+but they damage the first-hop code used by downstream composition. This explains
+why direct facts can survive while composition becomes unstable.
+
+Next fix should be narrow:
+
+```text
+do not change the parent architecture yet.
+
+First change the consolidation admission rule so a parent must preserve:
+  direct active accuracy
+  offset cosine
+  first-hop closure for dependent compositions
+  dependent composition closure
+
+and compare:
+  same-relation-only admission
+  mixed-relation admission
+  current scoring
+```
+
+#### Feature Ablation And Minimal Baseline
+
+Before changing consolidation admission, ran feature ablations to check whether
+the semantic write policy was relying on unnecessary input context.
+
+Fast context ablation:
+
+```text
+baseline:
+  active_acc = 0.8333
+  composition_acc = 1.0000
+  action_acc = 1.0000
+
+no_policy_time:
+  active_acc = 0.8333
+  composition_acc = 1.0000
+  action_acc = 1.0000
+
+no_policy_source:
+  active_acc = 0.8333
+  composition_acc = 1.0000
+  action_acc = 1.0000
+
+no_policy_evidence:
+  active_acc = 0.8333
+  composition_acc = 1.0000
+  action_acc = 1.0000
+```
+
+Fast structural ablation:
+
+```text
+baseline:
+  active_acc = 0.8333 +/- 0.0000
+  composition_acc = 1.0000 +/- 0.0000
+  action_acc = 1.0000 +/- 0.0000
+
+no_role:
+  active_acc = 0.8333 +/- 0.1361
+  composition_acc = 0.8889 +/- 0.1571
+  action_acc = 1.0000 +/- 0.0000
+
+no_position:
+  active_acc = 0.8889 +/- 0.0786
+  composition_acc = 1.0000 +/- 0.0000
+  action_acc = 1.0000 +/- 0.0000
+
+no_policy_identity:
+  active_acc = 0.8333 +/- 0.0000
+  composition_acc = 1.0000 +/- 0.0000
+  action_acc = 1.0000 +/- 0.0000
+
+no_policy_position:
+  active_acc = 0.8333 +/- 0.0000
+  composition_acc = 1.0000 +/- 0.0000
+  action_acc = 1.0000 +/- 0.0000
+```
+
+Conclusion:
+
+```text
+The write policy does not need:
+  identity shortcut features
+  position shortcut features
+  timestamp
+  source
+  evidence bucket
+
+The policy is mostly choosing from candidate geometry:
+  action type
+  new_acc
+  active_acc
+  protected_acc
+  closure
+  key/value cosine
+  target attention
+  attention margin
+
+Role embeddings are mildly useful.
+Position encoding is unnecessary in the current controlled fact-chain setup.
+```
+
+Minimal clean slots-5 baseline:
+
+```text
+disabled:
+  model position encoding
+  policy identity features
+  policy position features
+  policy time features
+  policy source features
+  policy evidence features
+
+kept:
+  entity embeddings
+  relation embeddings
+  role embeddings
+  memory keys/values
+  parent keys/scale/bias
+  candidate geometry measurements
+```
+
+Result:
+
+```text
+learned_policy:
+  active_acc = 0.9833 +/- 0.0500
+  composition_acc = 1.0000 +/- 0.0000
+  action_acc = 1.0000 +/- 0.0000
+  parents = 0.9000 +/- 0.3000
+  freed_slots = 1.8000 +/- 0.6000
+
+blind_adamw:
+  active_acc = 0.1667 +/- 0.0000
+  composition_acc = 0.3333 +/- 0.0000
+
+consolidation diagnostics:
+  attempts = 60
+  accepted = 9
+  same_relation_accept_rate = 0.000
+  mixed_relation_accept_rate = 0.180
+  accepted_offset_cosine_mean = 0.809
+  after_dependent_composition_acc_mean = 0.617
+```
+
+This is stronger than the previous slots-5 full-context result:
+
+```text
+old full-context slots-5:
+  active_acc = 0.9500 +/- 0.0764
+  composition_acc = 1.0000 +/- 0.0000
+  parents = 0.7000 +/- 0.4583
+  freed_slots = 1.4000 +/- 0.9165
+
+clean minimal slots-5:
+  active_acc = 0.9833 +/- 0.0500
+  composition_acc = 1.0000 +/- 0.0000
+  parents = 0.9000 +/- 0.3000
+  freed_slots = 1.8000 +/- 0.6000
+```
+
+So the research baseline should now be the clean minimal model. The remaining
+consolidation bug is still present:
+
+```text
+same-relation candidates are still not accepted,
+while mixed-relation parents are accepted.
+```
+
+That means the next experiment should target admission rules using the clean
+minimal baseline.
+
+#### Consolidation Admission Fix
+
+Added explicit consolidation admission modes:
+
+```text
+--consolidation-admission current
+--consolidation-admission same_relation
+--consolidation-admission composition_preserving
+```
+
+`current` preserves the previous rule:
+
+```text
+active_acc_after >= active_acc_before
+composition_acc_after >= composition_acc_before
+group_acc >= commit_acc_threshold
+```
+
+`same_relation` adds a diagnostic restriction:
+
+```text
+current rule
+and all compressed facts have the same relation type
+```
+
+This is not intended as the final model rule. It is an ablation to test whether
+same-relation compression is safer than mixed-relation compression.
+
+`composition_preserving` is the real proposed gate:
+
+```text
+current rule
+offset_cosine_mean >= --consolidation-min-offset-cosine
+direct_closure_delta_mean <= --consolidation-max-direct-closure-delta
+first_hop_closure_delta_mean <= --consolidation-max-first-hop-closure-delta
+dependent_composition_closure_delta_mean <= --consolidation-max-dependent-composition-closure-delta
+```
+
+Default thresholds:
+
+```text
+min_offset_cosine = 0.85
+max_direct_closure_delta = 0.0
+max_first_hop_closure_delta = 0.0
+max_dependent_composition_closure_delta = 0.0
+```
+
+This directly blocks the known failure mode:
+
+```text
+parent direct retrieval survives,
+but first-hop closure and downstream composition closure get worse.
+```
+
+A CPU smoke test verified the new `composition_preserving` code path compiles
+and runs. The smoke used intentionally tiny epochs and is not a scientific
+result.
+
+#### Parent Training Aligned To The Gate
+
+The strict `composition_preserving` gate accepted zero parents on the clean
+minimal slots-5 run:
+
+```text
+active_acc = 0.8333 +/- 0.0000
+composition_acc = 1.0000 +/- 0.0000
+parents = 0.0000
+freed_slots = 0.0000
+
+diagnostics:
+  attempts = 60
+  accepted = 0
+```
+
+Interpretation:
+
+```text
+The gate is correctly rejecting unsafe parents,
+but parent training is not yet producing parents that satisfy the strict
+composition-preserving criteria.
+```
+
+Added opt-in parent training losses:
+
+```text
+--parent-offset-weight
+--parent-first-hop-weight
+--parent-composition-weight
+--parent-anti-interference-weight
+```
+
+These losses align parent generation with the gate:
+
+```text
+offset loss:
+  parent(q) - q should point in the same direction as E(target) - q
+
+first-hop loss:
+  state_norm(parent(q)) should remain close to E(target)
+
+dependent composition loss:
+  after replacing the compressed slots,
+  compositions that depend on those facts should still predict the right target
+
+anti-interference loss:
+  parent should not outscore the correct slot for unrelated active facts
+```
+
+This keeps the current architecture fixed. The experiment now asks:
+
+```text
+Can better parent training produce at least one parent that the strict
+composition-preserving gate accepts?
+```
+
+A tiny CPU smoke verified the new parent-loss path runs. The smoke used tiny
+epochs and is not a result.
+
+Full clean minimal slots-5 run with strict composition-preserving admission and
+parent geometry losses:
+
+```text
+learned_policy:
+  active_acc = 0.8333 +/- 0.0000
+  composition_acc = 1.0000 +/- 0.0000
+  action_acc = 1.0000 +/- 0.0000
+  parents = 0.0000 +/- 0.0000
+  freed_slots = 0.0000 +/- 0.0000
+
+blind_adamw:
+  active_acc = 0.1667 +/- 0.0000
+  composition_acc = 0.3333 +/- 0.0000
+
+diagnostics:
+  attempts = 60
+  accepted = 0
+  same_relation_accept_rate = 0.000
+  mixed_relation_accept_rate = 0.000
+  offset_cosine_mean = 0.6465
+  direct_closure_delta_mean = +0.2178
+  first_hop_closure_delta_mean = +0.2354
+  dependent_composition_closure_delta_mean = +0.3682
+  after_dependent_composition_acc_mean = 0.7500
+```
+
+Interpretation:
+
+```text
+The strict gate is doing what it should:
+  it rejects every parent because closure geometry still worsens.
+
+The new parent losses did not yet create a safe parent.
+They improved some candidate behavior, but not enough to satisfy:
+  direct_closure_delta <= 0
+  first_hop_closure_delta <= 0
+  dependent_composition_closure_delta <= 0
+```
+
+Same-relation candidates are the closest candidates. They often keep:
+
+```text
+active_acc = 1.0
+composition_acc = 1.0
+group_acc = 1.0
+offset_cosine around 0.78 to 0.86
+```
+
+but still fail because:
+
+```text
+direct closure often gets slightly worse
+dependent composition closure usually gets worse
+offset cosine is not consistently above 0.85
+```
+
+This suggests the next narrow fix should not jump to a full new architecture.
+First test whether the strict gate is too binary by adding a tolerance:
+
+```text
+allow small positive closure deltas
+require dependent composition accuracy to stay correct
+keep offset cosine threshold
+```
+
+If a tolerant gate accepts same-relation parents and preserves final accuracy,
+then the parent architecture is probably adequate and the issue is gate
+calibration. If not, test a low-rank/full parent transform.
+
+#### Tolerant Gate Result
+
+Ran clean minimal slots-5 with parent geometry losses and tolerant
+composition-preserving thresholds:
+
+```text
+min_offset_cosine = 0.80
+max_direct_closure_delta = 0.15
+max_first_hop_closure_delta = 0.05
+max_dependent_composition_closure_delta = 0.20
+```
+
+Result:
+
+```text
+learned_policy:
+  active_acc = 0.8667 +/- 0.0667
+  composition_acc = 1.0000 +/- 0.0000
+  action_acc = 1.0000 +/- 0.0000
+  parents = 0.2000 +/- 0.4000
+  freed_slots = 0.4000 +/- 0.8000
+
+blind_adamw:
+  active_acc = 0.1667 +/- 0.0000
+  composition_acc = 0.3333 +/- 0.0000
+
+diagnostics:
+  attempts = 60
+  accepted = 2
+  same_relation_accepted = 2 / 10
+  mixed_relation_accepted = 0 / 50
+  accepted_offset_cosine_mean = 0.8224
+```
+
+Accepted parents:
+
+```text
+seed 4:
+  group = country_base_1 + country_base_2
+  relation_types = country_of + country_of
+  active_acc = 1.0
+  composition_acc = 1.0
+  group_acc = 1.0
+  offset_cosine = 0.8224
+  direct_closure_delta = -0.0523
+  first_hop_closure_delta = +0.0006
+  dependent_composition_closure_delta = +0.1392
+  dependent_composition_acc = 1.0
+
+seed 9:
+  group = country_base_1 + country_base_2
+  relation_types = country_of + country_of
+  active_acc = 1.0
+  composition_acc = 1.0
+  group_acc = 1.0
+  offset_cosine = 0.8224
+  direct_closure_delta = -0.0522
+  first_hop_closure_delta = +0.0006
+  dependent_composition_closure_delta = +0.1420
+  dependent_composition_acc = 1.0
+```
+
+Interpretation:
+
+```text
+This is the first positive consolidation-admission result:
+  the gate accepts same-relation parents
+  the gate rejects all mixed-relation parents
+  accepted parents preserve decoded active and composition accuracy
+```
+
+The remaining blocker is gate calibration / parent quality:
+
+```text
+Most same-relation candidates preserve decoded accuracy,
+but fail the current dependent-composition closure threshold.
+
+Examples:
+  seed 0: dep_comp_delta = +0.4108, dep_comp_acc = 1.0
+  seed 1: dep_comp_delta = +0.4063, dep_comp_acc = 1.0
+  seed 2: dep_comp_delta = +0.4877, dep_comp_acc = 1.0
+```
+
+So the next narrow test is a threshold sweep over:
+
+```text
+dependent_composition_closure_delta
+offset_cosine
+```
+
+The goal is to find the smallest tolerance that accepts more same-relation
+parents without admitting mixed parents or losing final composition accuracy.
+
+Tolerance sweep A:
+
+```text
+min_offset_cosine = 0.78
+max_direct_closure_delta = 0.15
+max_first_hop_closure_delta = 0.05
+max_dependent_composition_closure_delta = 0.45
+```
+
+Result:
+
+```text
+learned_policy:
+  active_acc = 0.9333 +/- 0.0816
+  composition_acc = 1.0000 +/- 0.0000
+  action_acc = 1.0000 +/- 0.0000
+  parents = 0.6000 +/- 0.4899
+  freed_slots = 1.2000 +/- 0.9798
+
+blind_adamw:
+  active_acc = 0.1667 +/- 0.0000
+  composition_acc = 0.3333 +/- 0.0000
+
+diagnostics:
+  attempts = 60
+  accepted = 6
+  same_relation_accepted = 6 / 10
+  mixed_relation_accepted = 0 / 50
+  accepted_offset_cosine_mean = 0.8215
+```
+
+Accepted seeds:
+
+```text
+0, 1, 4, 5, 6, 9
+```
+
+All accepted parents compressed:
+
+```text
+country_base_1 + country_base_2
+relation_types = country_of + country_of
+```
+
+and all accepted candidates had:
+
+```text
+candidate_active_acc = 1.0
+candidate_composition_acc = 1.0
+candidate_group_acc = 1.0
+dependent_composition_acc = 1.0
+```
+
+This is the first strong result for consolidation:
+
+```text
+the calibrated gate accepts only same-relation parents,
+rejects all mixed-relation parents,
+preserves final composition accuracy,
+and improves active accuracy over strict-gate/no-parent behavior.
+```
+
+Remaining misses:
+
+```text
+seeds 2, 3, 7, 8 still commit no parent
+final_active_acc = 0.8333 for those seeds
+```
+
+So the next question is not whether the gate can work; it can. The next question
+is whether to:
+
+```text
+1. further calibrate thresholds,
+2. rank same-relation candidates ahead of mixed candidates before training,
+3. improve parent training so same-relation parents pass more consistently.
+```
+
+#### Consolidation Group Ordering
+
+Added an explicit group ordering option:
+
+```text
+--consolidation-group-order current
+--consolidation-group-order same_relation_first
+--consolidation-group-order geometry
+```
+
+`current` preserves the previous insertion-order behavior.
+
+`same_relation_first` ranks all homogeneous relation groups before mixed groups:
+
+```text
+same relation group:
+  relation_types = r + r
+
+mixed relation group:
+  relation_types = r1 + r2
+```
+
+This is relation-type generic; it does not mention `country_of`, `pet`, or any
+specific event name.
+
+`geometry` ranks by:
+
+```text
+1. same relation first
+2. higher pairwise offset cosine between target offsets
+3. higher pairwise query cosine
+4. original order as deterministic tie-break
+```
+
+where:
+
+```text
+q_i = one-hop query
+y_i = E(target_i)
+offset_i = y_i - q_i
+```
+
+This ordering does not change the parent architecture or the gate. It only
+changes which candidate groups are trained first when
+`--consolidation-max-candidates` limits the number of attempted groups.
+
+Important caveat:
+
+```text
+In the current slots-5 stream, the country_of + country_of same-relation group
+was already attempted in every seed.
+
+So group ordering is useful for larger streams and for reducing wasted mixed
+attempts, but it probably will not by itself fix the 4 missed seeds from
+tolerance sweep A.
+```
+
+A tiny CPU smoke verified the `geometry` ordering path runs.
+
+## Natural-Language Semantic CL Benchmark
+
+Added a sentence-level natural-language semantic continual-learning benchmark.
+
+Files:
+
+```text
+data/natural_language_semantic_cl/fact_stream_spec.json
+experiments/natural_language_semantic_cl.py
+```
+
+The benchmark uses natural-language sentences as the stream:
+
+```text
+Paris is located in France.
+Alice lives in Paris.
+A corrupted note says that Paris lives in Alice.
+A second report confirms that Alice lives in Paris.
+Three trusted records now say that Alice lives in Rome.
+Bob has a cat.
+The cat is red.
+...
+```
+
+The first version uses gold extraction:
+
+```text
+sentence -> annotated subject / relation / object / reliability / evidence
+```
+
+This intentionally isolates the continual-learning write-control question from
+parser/extractor failure. The extraction mode is explicit in the dataset and in
+the output JSON:
+
+```text
+extraction_mode = gold
+```
+
+The training loop does not hardcode event names or answers. It reads:
+
+```text
+variables
+bindings
+event templates
+expected actions
+commit flags
+```
+
+from the JSON dataset and generates seed-rotated streams from that spec.
+
+The model/world is built from the dataset vocabulary:
+
+```text
+vocab = all entities/objects in the dataset variables
+relations = all relation names used by event templates
+```
+
+The benchmark reuses the same write-control mechanisms:
+
+```text
+candidate futures
+learned write policy
+direct writes
+reuse / discard / rewrite / compose
+parent consolidation
+composition-preserving gate
+blind AdamW baseline
+```
+
+A CPU smoke test passed:
+
+```text
+/opt/miniconda3/envs/ml/bin/python -m py_compile \
+  experiments/natural_language_semantic_cl.py \
+  experiments/semantic_geometry_write_reasoner.py
+
+/opt/miniconda3/envs/ml/bin/python experiments/natural_language_semantic_cl.py \
+  --seed-count 1 \
+  --geometry-warmup \
+  --geometry-warmup-epochs 20 \
+  --geometry-train-seed-count 5 \
+  --enable-consolidation \
+  --num-slots 4 \
+  --max-parents 2 \
+  --consolidation-epochs 5 \
+  --consolidation-max-candidates 2 \
+  --update-epochs 2 \
+  --policy-train-seed-count 2 \
+  --policy-epochs 2 \
+  --device cpu \
+  --no-progress \
+  --skip-blind-adamw
+```
+
+The smoke metrics are not meaningful; it only verifies the data and code path.
+
+This is the bridge benchmark:
+
+```text
+toy internal events -> natural-language sentence stream with gold extraction
+```
+
+Next after this benchmark works:
+
+```text
+replace gold extraction with a learned or rule-based extractor,
+then test on messier text.
+```
+
+### Natural-Language Semantic CL: First 10-Seed Result
+
+Ran the full sentence-level gold-extraction benchmark:
+
+```text
+dataset = sentence_level_semantic_cl_small
+extraction = gold
+seeds = 10
+vocab = 40
+relations = 5
+```
+
+Result:
+
+```text
+learned_policy:
+  active_acc = 0.8833 +/- 0.0764
+  composition_acc = 1.0000 +/- 0.0000
+  action_acc = 1.0000 +/- 0.0000
+  parents = 0.3000 +/- 0.4583
+  freed_slots = 0.6000 +/- 0.9165
+
+blind_adamw:
+  active_acc = 0.1667 +/- 0.0000
+  composition_acc = 0.3333 +/- 0.0000
+```
+
+Per-seed learned-policy outcomes:
+
+```text
+seeds 0, 1, 2:
+  active_acc = 1.0
+  composition_acc = 1.0
+  parents = 1
+  freed_slots = 2
+
+seeds 3 through 9:
+  active_acc = 0.8333
+  composition_acc = 1.0
+  parents = 0
+  freed_slots = 0
+```
+
+Consolidation diagnostics:
+
+```text
+attempts = 60
+accepted = 3
+same_relation_accepted = 3 / 10
+mixed_relation_accepted = 0 / 50
+accepted_offset_cosine_mean = 0.7950
+```
+
+Accepted parents:
+
+```text
+seed 0:
+  group = country_base_1 + country_base_2
+  relation_types = country_of + country_of
+  active_acc = 1.0
+  composition_acc = 1.0
+  group_acc = 1.0
+  offset_cosine = 0.7990
+  direct_closure_delta = +0.0630
+  first_hop_closure_delta = -0.0012
+  dependent_composition_closure_delta = +0.3187
+  dependent_composition_acc = 1.0
+
+seed 1:
+  group = country_base_1 + country_base_2
+  relation_types = country_of + country_of
+  active_acc = 1.0
+  composition_acc = 1.0
+  group_acc = 1.0
+  offset_cosine = 0.7814
+  direct_closure_delta = +0.0483
+  first_hop_closure_delta = -0.0048
+  dependent_composition_closure_delta = +0.2700
+  dependent_composition_acc = 1.0
+
+seed 2:
+  group = country_base_1 + country_base_2
+  relation_types = country_of + country_of
+  active_acc = 1.0
+  composition_acc = 1.0
+  group_acc = 1.0
+  offset_cosine = 0.8045
+  direct_closure_delta = +0.0649
+  first_hop_closure_delta = -0.0080
+  dependent_composition_closure_delta = +0.0427
+  dependent_composition_acc = 1.0
+```
+
+Interpretation:
+
+```text
+The write-control mechanism transfers from hand-built semantic events to a
+natural-language sentence stream with gold extraction.
+
+The calibrated consolidation gate still behaves correctly:
+  it accepts only same-relation parents
+  it rejects all mixed-relation parents
+  composition accuracy remains perfect
+
+The gap is consistency:
+  only 3 / 10 seeds consolidate successfully.
+```
+
+This is not yet proof of real-world CL, because extraction is gold. It is the
+first controlled real-sentence benchmark for the write-control layer.
+
+#### Same-Relation Rejection Breakdown
+
+Diagnostic question:
+
+```text
+When same-relation parents are rejected, which gate criterion rejects them?
+```
+
+Toy calibrated run:
+
+```text
+file = semantic-geometry-parent-trained-tolerance-sweep-a-slots5-10seed.json
+same_relation_attempts = 10
+accepted = 6
+rejected = 4
+
+rejection reason counts:
+  dependent_comp = 3
+  composition_drop = 2
+
+reason combinations:
+  dependent_comp = 2
+  composition_drop = 1
+  composition_drop + dependent_comp = 1
+```
+
+Rejected toy same-relation candidates:
+
+```text
+seed 2:
+  active = 1.0
+  composition = 1.0
+  offset = 0.8256
+  direct_delta = +0.0885
+  first_hop_delta = +0.0344
+  dep_comp_delta = +0.4877
+  dep_comp_acc = 1.0
+  rejection = dependent_comp threshold
+
+seed 3:
+  active = 1.0
+  composition = 0.5
+  offset = 0.8344
+  direct_delta = +0.0774
+  first_hop_delta = +0.0453
+  dep_comp_delta = +0.4471
+  dep_comp_acc = 0.0
+  rejection = real composition drop
+
+seed 7:
+  active = 1.0
+  composition = 1.0
+  offset = 0.8256
+  direct_delta = +0.0890
+  first_hop_delta = +0.0342
+  dep_comp_delta = +0.4911
+  dep_comp_acc = 1.0
+  rejection = dependent_comp threshold
+
+seed 8:
+  active = 1.0
+  composition = 0.5
+  offset = 0.8344
+  direct_delta = +0.0785
+  first_hop_delta = +0.0453
+  dep_comp_delta = +0.4540
+  dep_comp_acc = 0.0
+  rejection = real composition drop + dependent_comp threshold
+```
+
+Toy interpretation:
+
+```text
+Two misses are mostly threshold calibration:
+  decoded composition remains correct but dep_comp_delta is slightly too high.
+
+Two misses are real failures:
+  composition drops from 1.0 to 0.5.
+```
+
+Natural-language gold run:
+
+```text
+file = natural-language-semantic-cl-10seed.json
+same_relation_attempts = 10
+accepted = 3
+rejected = 7
+
+rejection reason counts:
+  offset = 5
+  direct_closure = 2
+  first_hop = 2
+  composition_drop = 2
+
+reason combinations:
+  offset = 2
+  offset + direct_closure = 2
+  first_hop = 1
+  composition_drop + first_hop = 1
+  composition_drop + offset = 1
+```
+
+Natural-language interpretation:
+
+```text
+Five of seven misses are geometry-quality misses:
+  offset too low and/or direct/first-hop closure too high.
+
+Two misses are real behavior failures:
+  composition drops from 1.0 to 0.5.
+```
+
+This split matters:
+
+```text
+If rejection is only closure tolerance while composition_acc remains 1.0:
+  calibrate gate thresholds.
+
+If rejection includes composition_drop:
+  improve parent training or parent expressivity.
+
+If rejection is mostly offset:
+  improve parent offset training or test a stronger parent map.
+```
+
+### Natural-Language Paraphrase Stream
+
+Extended the sentence-level benchmark with paraphrase templates.
+
+Dataset events now support:
+
+```text
+sentences: [
+  template_1,
+  template_2,
+  template_3,
+  ...
+]
+```
+
+The runner supports:
+
+```text
+--sentence-variant-mode first
+--sentence-variant-mode seed
+```
+
+`first` always uses the first template. `seed` chooses a deterministic template
+per event:
+
+```text
+template_index = (seed + timestamp) % number_of_templates
+```
+
+This means different seeds see different surface forms for the same semantic
+fact while keeping the same gold extraction target.
+
+Examples:
+
+```text
+Paris is located in France.
+Paris belongs to France.
+The city of Paris is in France.
+France contains the city Paris.
+
+Alice lives in Paris.
+Alice resides in Paris.
+Alice's home is in Paris.
+The current city for Alice is Paris.
+```
+
+Important limitation:
+
+```text
+With extraction_mode = gold, paraphrases do not yet test whether the memory
+model understands sentence context.
+
+They test whether the benchmark pipeline can carry natural sentence variation
+while the write-control layer still receives correct structured facts.
+```
+
+To make paraphrases affect model behavior, the next step must add either:
+
+```text
+1. a data-driven rule extractor,
+2. a learned sentence-to-event extractor,
+3. or sentence embeddings as part of the write-policy/context input.
+```
+
+A CPU smoke verified the paraphrase-selection path.
+
+## Fresh GFO Math Track
+
+Restarted the continual-learning work as a pure optimizer/math track under:
+
+```text
+experiments/gco_math/
+```
+
+The research object is now the **Geometric Forgetting Optimizer (GFO)**:
+
+```text
+(theta_t, M_t) -> (theta_{t+1}, M_{t+1})
+```
+
+where `theta_t` is the neural network and `M_t` is an activation-anchor bank.
+No external slot system, no symbolic memory writer, and no task-specific
+controller are part of this track.
+
+Core update:
+
+```text
+delta_t =
+argmin_delta g_t^T delta + (1 / 2 eta) ||delta||_H^2
+
+subject to:
+||Psi_l(h_l(q_i; theta_t + delta)) - z_i||^2 <= epsilon_i
+```
+
+with:
+
+```text
+z_i = Psi_l(h_l(q_i; theta_store))
+```
+
+### Stage 1: Representation Test
+
+Implemented:
+
+```text
+experiments/gco_math/gfo_linear_activation_constraints.py
+```
+
+The script uses a two-layer linear neural net:
+
+```text
+x -> W1 -> h -> W2 -> y
+```
+
+It tests whether predicted anchor drift correlates with actual forgetting, then
+compares SGD with projected GFO updates.
+
+The key correction was making the anchor representation explicit:
+
+```text
+--anchor-representation direction
+--anchor-representation norm
+--anchor-representation full
+--anchor-representation direction_norm
+```
+
+Five-seed results:
+
+```text
+direction:
+  hidden Pearson   0.4428 +/- 0.2246
+  hidden Spearman  0.5424 +/- 0.2321
+
+norm:
+  hidden Pearson   0.4459 +/- 0.1434
+  hidden Spearman  0.4641 +/- 0.0915
+
+direction_norm:
+  hidden Pearson   0.5218 +/- 0.1775
+  hidden Spearman  0.6025 +/- 0.1662
+
+full:
+  hidden Pearson   0.8849 +/- 0.1156
+  hidden Spearman  0.8756 +/- 0.0785
+  output Pearson   1.0000 +/- 0.0000
+  combined Pearson 0.9955 +/- 0.0051
+```
+
+Conclusion:
+
+```text
+Direction-only GFO is falsified in this setup.
+Norm-only GFO is also insufficient.
+Direction+norm improves but still does not pass strongly.
+Full activation state passes Stage 1.
+```
+
+The corrected hypothesis is:
+
+```text
+Forgetting is predicted by drift in functionally relevant activation state,
+not by activation direction alone.
+```
+
+So GFO should protect:
+
+```text
+Psi(h) = h
+```
+
+before testing more compressed representations.
+
+### Stage 2: Protection vs Plasticity
+
+With `--anchor-representation full`, projected protection works but reduces
+plasticity. A bug in the first version used `score >= tau_collision` with
+`tau_collision = 0`, which selected anchors with zero predicted violation. The
+selection rule was corrected to:
+
+```text
+protect if score > tau_collision
+```
+
+So the default now means:
+
+```text
+protect anchors with positive predicted violation.
+```
+
+Corrected five-seed result:
+
+```text
+sgd:
+  forgetting  0.9446 +/- 0.4181
+  task2_after 0.0066 +/- 0.0064
+
+gfo_hidden:
+  forgetting  0.6748 +/- 0.3154
+  task2_after 0.1305 +/- 0.0647
+  update_ratio 0.6837 +/- 0.1065
+  protected anchors 11.0700 +/- 2.3948
+
+gfo_output:
+  forgetting  0.0000 +/- 0.0000
+  task2_after 0.9870 +/- 0.4434
+  update_ratio 0.2996 +/- 0.0457
+  protected anchors 23.1320 +/- 1.2012
+
+gfo_both:
+  forgetting  0.0000 +/- 0.0000
+  task2_after 0.9906 +/- 0.4431
+  update_ratio 0.2948 +/- 0.0452
+  protected anchors 23.3500 +/- 0.9305
+```
+
+Interpretation:
+
+```text
+The projection can protect old behavior.
+Hidden-state protection alone is not sufficient when the output map can move.
+Output protection eliminates forgetting in this linear setup.
+The next problem is not whether protection exists.
+The next problem is usable-gradient collapse / stability-plasticity balance.
+```
+
+Next math question:
+
+```text
+Can we protect only the at-risk anchors or use a tolerance-aware projection
+so the update preserves old activations while keeping enough gradient to learn
+the new task?
+```
+
+### Tolerance-Aware Projection
+
+Implemented:
+
+```text
+--constraint-mode tolerance
+```
+
+This uses the active-boundary approximation to the intended inequality
+constraint:
+
+```text
+||r_i + J_i delta||^2 <= epsilon_i
+```
+
+For a raw update:
+
+```text
+delta_raw = -eta g
+p_i = r_i + J_i delta_raw
+```
+
+If `p_i` is safe, no constraint is added. If it violates tolerance, the
+predicted residual is projected to the nearest boundary point:
+
+```text
+target_i = sqrt(epsilon_i) p_i / (||p_i|| + tiny)
+J_i delta = target_i - r_i
+```
+
+The Euclidean projection is:
+
+```text
+delta_tol =
+delta_raw - A^T(AA^T + rho I)^(-1)(A delta_raw - b_tol)
+```
+
+Already-broken anchors use an explicit policy:
+
+```text
+--broken-anchor-policy allow_improving
+--broken-anchor-policy project_boundary
+```
+
+Current default is `allow_improving`: if the raw update reduces an already
+violated anchor's drift, do not block it.
+
+Five-seed tolerance sweep with full activation anchors:
+
+```text
+restore / near-zero tolerance:
+  output forgetting   0.0000
+  output task2_after  0.9870
+
+tolerance eps=1e-3:
+  output forgetting   0.0002 +/- 0.0001
+  output task2_after  0.9599 +/- 0.4334
+
+tolerance eps=1e-2:
+  output forgetting   0.0021 +/- 0.0010
+  output task2_after  0.9124 +/- 0.4144
+
+tolerance eps=1e-1:
+  output forgetting   0.0174 +/- 0.0074
+  output task2_after  0.7771 +/- 0.3623
+
+tolerance eps=1e-1 + topk2:
+  output forgetting   0.0385 +/- 0.0184
+  output task2_after  0.7058 +/- 0.3318
+  update_ratio        1.3282 +/- 0.1671
+```
+
+Interpretation:
+
+```text
+Tolerance-aware projection behaves in the expected direction.
+Larger epsilon increases plasticity and gradually increases forgetting.
+Combining tolerance with top-k gives the best new-task learning so far,
+while still cutting forgetting from SGD's 0.9446 to 0.0385.
+```
+
+This is the first concrete stability-plasticity frontier result in the GFO
+math track.
+
+### Evidence-Driven Stream GFO
+
+Implemented:
+
+```text
+experiments/gco_math/gfo_evidence_stream.py
+```
+
+This is the first integrated test of the larger GFO plan on a pure two-layer
+linear neural net. It adds:
+
+```text
+pending concept buffer
+pressure / evidence accumulation
+create / merge / fuse decisions
+tolerance-safe targeted writes
+lineage-aware destructive forgetting
+blind SGD comparison
+```
+
+The synthetic stream contains:
+
+```text
+one-shot noise            -> should be ignored
+repeated safe new concept -> should create
+familiar old concept      -> should merge
+repeated conflict         -> should fuse / transform lineage
+unrelated old concept     -> should remain protected without rehearsal
+```
+
+Ten-seed result:
+
+```text
+GFO:
+  destructive_forgetting  0.0045 +/- 0.0035
+  consolidation_error     0.9210 +/- 0.3823
+  created_concept_loss    0.5918 +/- 0.5853
+  transformed_count       1.0000 +/- 0.0000
+  created_count           1.0000 +/- 0.0000
+  writes                  9.8000 +/- 0.4000
+  skipped                 6.2000 +/- 0.4000
+
+Blind SGD:
+  destructive_forgetting  0.0132 +/- 0.0100
+  old_compatibility_loss  1.0841 +/- 0.4226
+```
+
+Action counts:
+
+```text
+create  1.0000 +/- 0.0000
+fuse    2.9000 +/- 0.3000
+ignore  6.2000 +/- 0.4000
+merge   5.9000 +/- 0.5385
+```
+
+Interpretation:
+
+```text
+The evidence gate works: one-shot events are skipped, repeated concepts write.
+Dynamic creation occurs exactly once.
+Conflict lineage transforms exactly once.
+Destructive forgetting is lower than blind SGD on unrelated old concepts.
+```
+
+But the integrated system is not yet strong:
+
+```text
+created_concept_loss is still high.
+consolidation_error is still high.
+fusion writes happen repeatedly and need better stabilization.
+```
+
+Next fix:
+
+```text
+make pending concepts stop repeatedly firing after commit unless new evidence
+changes their target, and train targeted writes for several small safe steps
+instead of one update per event.
+```
+
+Implemented the fix:
+
+```text
+--write-steps
+--target-loss-threshold
+--committed-target-change-threshold
+```
+
+After a pending concept commits to an anchor, repeated same-target evidence now
+uses:
+
+```text
+reinforce
+```
+
+instead of repeatedly doing:
+
+```text
+create / fuse
+```
+
+Each write now performs several small tolerance-projected steps and stops early
+when target loss is low.
+
+Ten-seed result with default `--write-steps 5`:
+
+```text
+GFO:
+  destructive_forgetting  0.0113 +/- 0.0069
+  consolidation_error     0.0320 +/- 0.0234
+  created_concept_loss    0.2166 +/- 0.2998
+  transformed_count       1.0000 +/- 0.0000
+  created_count           1.0000 +/- 0.0000
+  writes                  8.2000 +/- 1.1662
+  safe_steps              41.0000 +/- 5.8310
+
+Blind SGD:
+  destructive_forgetting  0.0132 +/- 0.0100
+  old_compatibility_loss  1.0841 +/- 0.4226
+```
+
+Actions:
+
+```text
+create     1.0000 +/- 0.0000
+fuse       1.0000 +/- 0.0000
+ignore     7.8000 +/- 1.1662
+reinforce  6.2000 +/- 1.1662
+```
+
+Compared to the previous integrated stream result:
+
+```text
+consolidation_error:  0.9210 -> 0.0320
+created_concept_loss: 0.5918 -> 0.2166
+repeated fuse count:  ~2.9   -> 1.0
+```
+
+So the repeated-fusion bug is fixed and lineage consolidation is now much
+cleaner.
+
+Remaining failure:
+
+```text
+created_concept_loss is still high variance.
+Most seeds learn the created concept well, but a few seeds fail badly.
+Example: seed 4 created_concept_loss ~= 1.05.
+```
+
+Increasing `--write-steps 10` improves consolidation slightly but does not fix
+created-concept variance:
+
+```text
+consolidation_error   0.0231 +/- 0.0172
+created_concept_loss  0.2061 +/- 0.2923
+```
+
+Next likely issue:
+
+```text
+new concept creation sometimes lacks enough unconstrained writable direction.
+We need per-write diagnostics: raw target loss, post-write target loss,
+protected anchor count, update norm, and whether projection removed the useful
+new-concept gradient.
+```
+
+Per-write diagnostics were added with:
+
+```text
+--record-write-diagnostics
+```
+
+The diagnostic JSON records per stream event:
+
+```text
+action
+pressure
+write_pressure
+target_loss_before / target_loss_after
+projection ratio
+protected-anchor counts
+created_concept_loss
+consolidation_error
+destructive_forgetting
+anchor output drift
+```
+
+The first diagnostic run confirmed seed 4 was not failing because later fusion
+damaged the created concept. It was failing because the new concept was
+under-written before fusion:
+
+```text
+seed 4, --write-steps 5:
+new_safe create/reinforce path:
+  3.2676 -> 2.1794 -> 1.4845 -> 1.0561
+final created_concept_loss:
+  1.0489
+```
+
+The policy was updated so admission and continued writing are separated:
+
+```text
+pressure decides admission
+committed same-target evidence continues to reinforce
+write_pressure = max(current_pressure, committed_write_pressure)
+```
+
+Result:
+
+```text
+--write-steps 5 committed reinforce:
+  created_concept_loss  0.1394 +/- 0.2065
+  consolidation_error   0.0133 +/- 0.0122
+  destructive_forgetting 0.0141 +/- 0.0079
+
+seed 4:
+  created_concept_loss  0.7391
+```
+
+So committed reinforcement improved the failure but did not solve the hard seed.
+
+Increasing write budget:
+
+```text
+--write-steps 10 committed reinforce:
+  created_concept_loss   0.0519 +/- 0.0955
+  consolidation_error    0.0021 +/- 0.0017
+  destructive_forgetting 0.0196 +/- 0.0087
+  old_compatibility_loss 0.6266 +/- 0.2213
+
+seed 4:
+  created_concept_loss   0.3348
+  consolidation_error    0.0009
+  destructive_forgetting 0.0238
+```
+
+Interpretation:
+
+```text
+The average integrated stream now works much better.
+The hard seed remains a true stability-plasticity conflict.
+For seed 4, new_safe is learned monotonically, but protection starts
+constraining the update:
+
+new_safe_1: 3.2676 -> 1.5648, projection ratio 1.000
+new_safe_2: 1.5648 -> 0.8167, projection ratio 0.948
+new_safe_3: 0.8167 -> 0.5001, projection ratio 0.768
+new_safe_4: 0.5001 -> 0.3016, projection ratio 0.734
+
+Then blue fusion succeeds cleanly:
+consolidation_error -> 0.0009
+but created_concept_loss rises slightly to 0.3348.
+```
+
+Next diagnostic refinement:
+
+```text
+record protected anchor ids in the write diagnostics
+```
+
+This will tell whether the hard seed is blocked by one specific old concept,
+which is the evidence needed before changing the constraint policy.
+
+Protected-ID diagnostic result for seed 4:
+
+```text
+file = gfo-evidence-stream-steps10-seed4-protected-ids.json
+
+new_safe_1:
+  protected ids = []
+  3.2676 -> 1.5648
+  projection_ratio = 1.000
+
+new_safe_2:
+  protected ids = [old_green]
+  1.5648 -> 0.8167
+  projection_ratio = 0.948
+
+new_safe_3:
+  protected ids = [old_green]
+  0.8167 -> 0.5001
+  projection_ratio = 0.768
+
+new_safe_4:
+  protected ids = [old_green]
+  0.5001 -> 0.3016
+  projection_ratio = 0.734
+```
+
+So the hard seed is specifically:
+
+```text
+new_safe write vs unrelated old_green preservation
+```
+
+This is now a real stability-plasticity conflict, not a repeated-fusion bug and
+not a missing-write bug.
+
+Tolerance sweep:
+
+```text
+baseline:
+  --write-steps 10
+  --anchor-tolerance 0.2
+
+result:
+  created_concept_loss   0.0519 +/- 0.0955
+  destructive_forgetting 0.0196 +/- 0.0087
+
+relaxed:
+  --write-steps 10
+  --anchor-tolerance 0.3
+
+result:
+  created_concept_loss   0.0493 +/- 0.0871
+  destructive_forgetting 0.0215 +/- 0.0107
+```
+
+Seed 4:
+
+```text
+eps 0.2:
+  created_concept_loss   0.3348
+  destructive_forgetting 0.0238
+
+eps 0.3:
+  created_concept_loss   0.3064
+  destructive_forgetting 0.0359
+```
+
+Interpretation:
+
+```text
+Relaxing tolerance is not the right fix.
+It gives only a small created-concept improvement and noticeably worsens
+destructive forgetting, especially on the hard seed.
+```
+
+Next experiment should keep tolerance fixed and test whether progress along the
+safe tangent is simply under-budgeted:
+
+```text
+increase --write-steps to 20 at anchor_tolerance 0.2
+```
+
+If seed 4 improves without increasing destructive forgetting much, the right
+implementation is adaptive write budget:
+
+```text
+continue committed writes until:
+  target loss is low
+  or projection ratio collapses
+  or destructive forgetting budget is exceeded
+```
+
+If seed 4 does not improve with more safe steps, the bottleneck is capacity or
+representation overlap, and the next test is a wider hidden dimension or an
+explicit separation objective.
+
+## Real-Book NLP GFO Pivot
+
+The synthetic GFO stream has done its job:
+
+```text
+it falsified direction-only anchors,
+validated full activation drift as the useful representation,
+and exposed stability-plasticity conflicts in a controlled setting.
+```
+
+But it cannot validate the real claim because the stream is still synthetic.
+The next benchmark must use raw text and a neural language model.
+
+Added:
+
+```text
+experiments/gco_math/gfo_real_book_activation_cl.py
+```
+
+This is the first GFO NLP benchmark. It uses the existing real-book assets:
+
+```text
+data/real_book/chunks.json
+data/real_book/fact_probes.json
+data/real_book/eval_prompts.json
+checkpoints/real_book/base_model.pt
+checkpoints/real_book/tokenizer.json
+```
+
+The model is the existing tiny decoder transformer:
+
+```text
+DecoderTransformer:
+  token embedding
+  position embedding
+  4 transformer blocks by default
+  final LayerNorm
+  tied LM head
+```
+
+The benchmark compares:
+
+```text
+adamw:
+  ordinary sequential fine-tuning on book chunks
+
+gfo_soft:
+  same sequential fine-tuning,
+  plus activation-anchor drift penalty on real text probes from earlier chunks
+```
+
+For each chunk:
+
+```text
+1. train on raw book chunk text
+2. optionally train on local QA prompt answers
+3. evaluate local / retention / composition QA prompts
+4. store activation anchors from:
+   - local QA prompt+answer strings
+   - fact probe sentences from fact_probes.json
+5. later chunks penalize drift from those stored hidden activations
+```
+
+The protected representation is:
+
+```text
+Psi(h) = full hidden state h
+```
+
+matching the Stage 1 GFO result.
+
+This is not gold subject/relation extraction:
+
+```text
+raw text -> transformer hidden states -> activation anchors -> drift penalty
+```
+
+It is still a soft GFO approximation rather than the hard Jacobian projection:
+
+```text
+L_total = L_lm + qa_weight L_qa + anchor_weight * mean ||h_current - h_anchor||^2
+```
+
+This is intentional for the first NLP test because exact Jacobian projection
+over a transformer and many text anchors is too expensive for the first pass.
+The purpose is to test whether activation-anchor protection helps retention on
+real text at all.
+
+Validation smoke tests:
+
+```text
+adamw:
+  --max-chunks 1
+  --epochs-per-chunk 1
+  completed and wrote JSON
+
+gfo_soft:
+  --max-chunks 2
+  --epochs-per-chunk 1
+  --max-anchors-per-chunk 1
+  completed and wrote JSON
+  final anchor_drift_mean = 0.0179
+```
+
+Next run should be a small real-book comparison:
+
+```text
+adamw vs gfo_soft
+max_chunks = 5
+epochs_per_chunk = 5 or 10
+include_local_prompts_in_training = true
+anchor_local_prompts = true
+```
+
+Metrics to read:
+
+```text
+retention_token_accuracy_mean/final
+retention_generation_match_mean/final
+anchor_drift_mean_final
+anchor_drift_max_final
+local_token_accuracy_mean/final
+```
+
+If GFO improves retention but hurts local learning too much, sweep:
+
+```text
+--anchor-drift-weight
+```
+
+If GFO does not improve retention at all, the next representation must be
+logits or answer-token hidden states rather than full sequence hidden state.
+
+First real-book result:
+
+```text
+command:
+  adamw,gfo_soft
+  max_chunks = 5
+  epochs_per_chunk = 5
+  include_local_prompts_in_training = true
+  anchor_local_prompts = true
+  anchor_drift_weight = 5.0
+
+adamw:
+  local_token_accuracy_mean        1.0000
+  retention_token_accuracy_mean    0.2754
+  composition_token_accuracy_mean  0.4000
+  local_generation_match_mean      1.0000
+  retention_generation_match_mean  0.2250
+  composition_generation_match     0.5000
+  anchor_drift_mean_final          0.2073
+  anchor_drift_max_final           0.2673
+
+gfo_soft:
+  local_token_accuracy_mean        1.0000
+  retention_token_accuracy_mean    0.3976
+  composition_token_accuracy_mean  0.4000
+  local_generation_match_mean      1.0000
+  retention_generation_match_mean  0.3722
+  composition_generation_match     0.6000
+  anchor_drift_mean_final          0.0714
+  anchor_drift_max_final           0.0950
+```
+
+Interpretation:
+
+```text
+This is the first positive real-NLP GFO result.
+The soft activation-anchor penalty improves retention while preserving local
+learning on raw book chunks.
+
+Retention token accuracy improves:
+  0.2754 -> 0.3976
+
+Retention generation match improves:
+  0.2250 -> 0.3722
+
+Anchor drift is reduced:
+  mean 0.2073 -> 0.0714
+  max  0.2673 -> 0.0950
+```
+
+Per-chunk detail:
+
+```text
+The largest retention improvement occurs around chunk_03:
+  adamw retention_token_accuracy = 0.1875
+  gfo retention_token_accuracy   = 0.6875
+
+Final retention remains weak:
+  adamw final retention_token_accuracy = 0.0556
+  gfo final retention_token_accuracy   = 0.1667
+```
+
+So GFO is helping, but the benchmark is still hard for this tiny model.
+
+Added QA anchor representation mode:
+
+```text
+--qa-anchor-mode full_sequence
+--qa-anchor-mode answer_tokens
+```
+
+`full_sequence` preserves the previous behavior:
+
+```text
+protect hidden states across the whole prompt+answer sequence
+```
+
+`answer_tokens` protects only hidden positions that predict the answer tokens in
+local QA anchors. Fact-probe anchors still use full-sequence hidden states.
+
+Reason:
+
+```text
+Full-sequence anchors may waste protection budget on prompt/context tokens.
+Answer-token anchors should focus GFO pressure on the actual retained answer.
+```
+
+A two-chunk smoke verified that the answer-token mask path runs.
+
+Answer-token anchor result:
+
+```text
+command:
+  adamw,gfo_soft
+  max_chunks = 5
+  epochs_per_chunk = 5
+  include_local_prompts_in_training = true
+  anchor_local_prompts = true
+  qa_anchor_mode = answer_tokens
+  anchor_drift_weight = 5.0
+
+adamw:
+  local_token_accuracy_mean        1.0000
+  retention_token_accuracy_mean    0.3298
+  composition_token_accuracy_mean  0.4000
+  local_generation_match_mean      1.0000
+  retention_generation_match_mean  0.3044
+  composition_generation_match     0.4000
+  anchor_drift_mean_final          0.4444
+  anchor_drift_max_final           0.7729
+
+gfo_soft:
+  local_token_accuracy_mean        1.0000
+  retention_token_accuracy_mean    1.0000
+  composition_token_accuracy_mean  0.4000
+  local_generation_match_mean      1.0000
+  retention_generation_match_mean  1.0000
+  composition_generation_match     0.4000
+  anchor_drift_mean_final          0.0756
+  anchor_drift_max_final           0.1797
+```
+
+Per-prompt final retention for GFO answered every retained QA exactly:
+
+```text
+Kansas, Toto, Munchkins, Scarecrow, tin, Emerald City, silver, courage, water
+```
+
+Interpretation:
+
+```text
+Answer-token anchors are much stronger than full-sequence anchors for QA
+retention. They protect the hidden states at the positions that matter for the
+answer instead of spending protection on the whole prompt context.
+```
+
+Important caveat:
+
+```text
+The benchmark was missing an explicit random seed.
+Added:
+  --seed
+
+The script now resets the same seed before each method, so AdamW and GFO use the
+same batch permutations. The answer-token result should be rerun with the seeded
+version before treating it as final.
+```
+
+Another caveat:
+
+```text
+QA anchors store prompt+answer input tokens and hidden targets. This is not full
+label replay, but it is still memory of old QA strings. Report memory honestly
+and compare against replay baselines later.
+```
+
+Implemented the equal-anchor replay baseline:
+
+```text
+--methods replay
+--replay-loss-weight
+```
+
+Replay uses the same anchor bank as GFO:
+
+```text
+same old QA/fact-probe strings
+same anchor selection schedule
+same answer-token mask when --qa-anchor-mode answer_tokens
+```
+
+But instead of preserving hidden activations:
+
+```text
+GFO:
+  L += anchor_drift_weight * ||h_current - h_anchor||^2
+```
+
+it directly replays old token targets:
+
+```text
+replay:
+  L += replay_loss_weight * CE(model(anchor_inputs), anchor_targets)
+```
+
+This is the fair baseline for the current answer-token anchor result because
+both methods store comparable old text/QA memory. A two-chunk smoke verified the
+`replay` path.
+
+Replay baseline result:
+
+```text
+command:
+  adamw,gfo_soft,replay
+  seed = 0
+  max_chunks = 5
+  epochs_per_chunk = 5
+  include_local_prompts_in_training = true
+  anchor_local_prompts = true
+  qa_anchor_mode = answer_tokens
+  anchor_drift_weight = 5.0
+  replay_loss_weight = 5.0
+
+adamw:
+  local_token_accuracy_mean        1.0000
+  retention_token_accuracy_mean    0.2754
+  composition_token_accuracy_mean  0.4000
+  local_generation_match_mean      1.0000
+  retention_generation_match_mean  0.2500
+  composition_generation_match     0.5000
+  anchor_drift_mean_final          0.5903
+  anchor_drift_max_final           1.0508
+
+gfo_soft:
+  local_token_accuracy_mean        1.0000
+  retention_token_accuracy_mean    0.8992
+  composition_token_accuracy_mean  0.6000
+  local_generation_match_mean      1.0000
+  retention_generation_match_mean  0.8992
+  composition_generation_match     0.6000
+  anchor_drift_mean_final          0.0784
+  anchor_drift_max_final           0.1812
+
+replay:
+  local_token_accuracy_mean        1.0000
+  retention_token_accuracy_mean    1.0000
+  composition_token_accuracy_mean  0.4000
+  local_generation_match_mean      1.0000
+  retention_generation_match_mean  1.0000
+  composition_generation_match     0.4000
+  anchor_drift_mean_final          0.5491
+  anchor_drift_max_final           1.1816
+```
+
+Interpretation:
+
+```text
+Replay wins direct retained QA exactness in this setting.
+GFO does not currently beat equal-anchor replay on memorized old prompt answers.
+
+GFO does strongly reduce activation drift:
+  adamw  mean drift 0.5903
+  replay mean drift 0.5491
+  gfo    mean drift 0.0784
+
+GFO also improves composition mean in this run:
+  adamw  0.4000 token / 0.5000 generation
+  replay 0.4000 token / 0.4000 generation
+  gfo    0.6000 token / 0.6000 generation
+```
+
+The honest current claim is:
+
+```text
+Soft activation-anchor GFO improves real-book retention over AdamW and preserves
+hidden-state geometry much better than replay, but direct QA retention is still
+easier to solve with explicit equal-memory replay.
+```
+
+This means the next decisive test is not exact retained prompts. It is heldout
+paraphrase prompts that were not stored as anchors and were not replayed as
+targets. Added:
+
+```text
+data/real_book/heldout_eval_prompts.json
+--heldout-prompts-path
+```
+
+Read:
+
+```text
+heldout_retention_token_accuracy_final
+heldout_retention_generation_match_final
+heldout_composition_token_accuracy_final
+heldout_composition_generation_match_final
+```
+
+Possible outcomes:
+
+```text
+If replay also wins heldout paraphrases, then replay dominates the current GFO
+variant for direct QA behavior.
+
+If GFO wins heldout paraphrases while replay wins exact retained prompts, then
+GFO's activation geometry is buying generalization that target replay is not.
+
+If all methods fail heldout paraphrases, the tiny model is memorizing local QA
+and does not yet have enough semantic generalization. Then the next step is a
+larger model/data setting or a stronger semantic objective, not more synthetic
+gating.
+```
+
+Heldout paraphrase result:
+
+```text
+command:
+  adamw,gfo_soft,replay
+  seed = 0
+  max_chunks = 5
+  epochs_per_chunk = 5
+  qa_anchor_mode = answer_tokens
+  heldout_prompts_path = data/real_book/heldout_eval_prompts.json
+
+adamw:
+  retained exact token mean          0.2754
+  retained exact generation mean     0.2472
+  heldout retention token final      0.0556
+  heldout retention generation final 0.0000
+  heldout composition final          0.0000
+  anchor drift mean final            0.7981
+
+gfo_soft:
+  retained exact token mean          0.8992
+  retained exact generation mean     0.8992
+  heldout retention token final      0.2778
+  heldout retention generation final 0.4444
+  heldout composition final          0.0000
+  anchor drift mean final            0.0665
+
+replay:
+  retained exact token mean          1.0000
+  retained exact generation mean     1.0000
+  heldout retention token final      0.1667
+  heldout retention generation final 0.1111
+  heldout composition final          0.0000
+  anchor drift mean final            0.3179
+```
+
+Interpretation:
+
+```text
+This is the trigger to move to the real living-map implementation.
+
+Replay still wins exact prompt retention, which means direct target replay is
+better at memorizing old QA strings.
+
+GFO wins heldout paraphrase retention:
+  token final      replay 0.1667 -> gfo 0.2778
+  generation final replay 0.1111 -> gfo 0.4444
+
+That means activation geometry is buying some generalization beyond exact
+target replay. It is now worth implementing the full GFO machinery around the
+real NLP benchmark rather than continuing synthetic tests.
+```
+
+Next implementation target:
+
+```text
+experiments/gco_math/gfo_real_book_living_map.py
+
+Start with:
+  living concept map
+  pending concept evidence
+  breadth/depth/frequency/novelty pressure
+  write gate
+  create / reinforce / replacement-fusion actions
+  lineage-aware destructive forgetting metrics
+  optional background maintenance
+
+Use the current gfo_soft drift penalty as the first write kernel.
+Do not add hard Jacobian projection until the living-map metrics work.
+```
+
+Implemented first living-map script:
+
+```text
+experiments/gco_math/gfo_real_book_living_map.py
+```
+
+It adds:
+
+```text
+PendingConcept:
+  similarity-clustered pending evidence with count, centroid, variance
+
+LivingConcept:
+  concept id, lineage id, active/transformed/retired status,
+  current activation anchor, pressure, stability, tolerance, count
+
+Evidence:
+  breadth
+  depth
+  frequency
+  consistency
+  novelty
+  prediction loss / normalized error
+  base pressure
+  creation pressure
+  reinforce pressure
+
+Actions:
+  ignore
+  create
+  reinforce
+  replacement_fuse
+  retire
+
+Metrics:
+  active_concept_count
+  pending_concept_count
+  lineage_count
+  created_count
+  reinforced_count
+  replacement_fused_count
+  ignored_count
+  deferred_count
+  retired_count
+  destructive_drift_mean/max
+  optional maintenance repairs
+```
+
+The script supports:
+
+```text
+adamw
+gfo_living
+replay_living
+```
+
+`gfo_living` protects active living-map anchors with the soft activation-drift
+penalty. `replay_living` uses the same active living-map anchors as target
+replay. `adamw` still builds the map for measurement, but does not use it for
+training.
+
+Validation:
+
+```text
+py_compile passed.
+
+One-chunk smoke passed with:
+  adamw,gfo_living,replay_living
+  heldout prompts enabled
+  answer-token anchors
+  max_candidate_anchors_per_chunk = 2
+```
+
+The first smoke produced one active lineage and one replacement-fusion action.
+This confirms the map is dynamic, but the first full run should inspect whether
+replacement-fusion is too aggressive. If it collapses too many QA anchors into
+one lineage, rerun with:
+
+```text
+--incompatible-merge-action create
+```
+
+First full living-map result:
+
+```text
+command:
+  adamw,gfo_living,replay_living
+  seed = 0
+  max_chunks = 5
+  epochs_per_chunk = 5
+  qa_anchor_mode = answer_tokens
+  heldout_prompts_path = data/real_book/heldout_eval_prompts.json
+  incompatible_merge_action = replacement_fuse
+  same_source_only = false
+
+adamw:
+  retention_token_accuracy_mean              0.2754
+  heldout_retention_generation_match_final   0.1111
+  active_concept_count_final                 8
+  lineage_count_final                        8
+  replacement_fused_count_final              5
+  destructive_drift_mean_final               0.4697
+
+gfo_living:
+  retention_token_accuracy_mean              0.8520
+  heldout_retention_generation_match_final   0.2222
+  active_concept_count_final                 8
+  lineage_count_final                        8
+  replacement_fused_count_final              5
+  destructive_drift_mean_final               0.0308
+
+replay_living:
+  retention_token_accuracy_mean              0.5750
+  heldout_retention_generation_match_final   0.1111
+  active_concept_count_final                 6
+  lineage_count_final                        6
+  replacement_fused_count_final              7
+  destructive_drift_mean_final               0.2048
+```
+
+Interpretation:
+
+```text
+The living map is not yet better than static gfo_soft.
+
+The good part:
+  gfo_living still beats AdamW and replay_living on retained QA.
+  gfo_living strongly reduces destructive drift.
+
+The bad part:
+  heldout retention dropped compared with static gfo_soft.
+  reinforced_count = 0.
+  replacement_fuse is doing most of the dynamic work.
+```
+
+JSON inspection showed two concrete gate problems:
+
+```text
+1. same_source_only=false allowed QA anchors and fact-probe anchors to compete
+   in one concept space. Fact probes can replacement-fuse QA concepts.
+
+2. incompatible QA/fact anchors with high cosine similarity were treated as
+   lineage replacements. This is too permissive and can hide forgetting by
+   declaring an old concept transformed before the transformation is justified.
+```
+
+Next clean test:
+
+```text
+rerun with:
+  --same-source-only
+  --incompatible-merge-action create
+  --fusion-similarity 0.95
+
+Goal:
+  make the first living-map version conservative.
+  It should create/retain enough concepts before attempting replacement.
+```
+
+If that improves heldout retention, the bug was over-fusion. If it does not,
+the next code change is multi-anchor concepts: one concept should hold several
+paraphrase/probe anchors instead of replacing the old anchor with the newest
+one.
+
+Conservative living-map result:
+
+```text
+command changes:
+  --same-source-only
+  --incompatible-merge-action create
+  --fusion-similarity 0.95
+
+adamw:
+  retention_token_accuracy_mean              0.2976
+  heldout_retention_generation_match_final   0.0000
+  active_concept_count_final                 13
+  replacement_fused_count_final              0
+  destructive_drift_mean_final               0.4427
+
+gfo_living:
+  retention_token_accuracy_mean              0.8992
+  composition_token_accuracy_mean            0.5000
+  heldout_retention_token_accuracy_final     0.2778
+  heldout_retention_generation_match_final   0.5556
+  active_concept_count_final                 13
+  replacement_fused_count_final              0
+  destructive_drift_mean_final               0.0646
+
+replay_living:
+  retention_token_accuracy_mean              1.0000
+  composition_token_accuracy_mean            0.4000
+  heldout_retention_token_accuracy_final     0.1667
+  heldout_retention_generation_match_final   0.1111
+  active_concept_count_final                 12
+  replacement_fused_count_final              1
+  destructive_drift_mean_final               0.2735
+```
+
+Interpretation:
+
+```text
+This is the best real-book GFO result so far.
+
+Conservative gfo_living now beats:
+  AdamW on exact retention, heldout retention, composition, and drift.
+  replay_living on heldout retention, composition, and drift.
+
+Replay still wins exact prompt retention, but it does not generalize to heldout
+paraphrases nearly as well.
+
+The previous living-map failure was over-fusion.
+```
+
+Remaining gap:
+
+```text
+reinforced_count = 0
+replacement_fused_count = 0
+```
+
+So the conservative map is currently closer to a gated dynamic anchor bank than
+a real evidence-fusing concept map. It creates the right anchors and protects
+them, but it does not yet accumulate multiple paraphrases/probes into one
+concept.
+
+Implemented multi-anchor concepts:
+
+```text
+LivingConcept now keeps:
+  anchor     = representative anchor
+  anchors    = all anchors attached to this concept
+
+active_anchors flattens all active concept anchors.
+destructive_drift is measured over all active anchors.
+replay_living replays all active concept anchors.
+gfo_living protects all active concept anchors.
+```
+
+New action/counter:
+
+```text
+attach
+attached_count
+active_anchor_count
+```
+
+`attach` is used when a new anchor is highly similar to an existing concept but
+is not tensor-compatible for EMA reinforcement. This stores the new evidence
+inside the same concept without replacing the old anchor and without declaring
+the old concept transformed.
+
+Validation:
+
+```text
+py_compile passed.
+one-chunk smoke passed with --incompatible-merge-action attach.
+```
+
+Next run should compare multi-anchor attachment against the conservative create
+baseline. Use a stricter merge threshold so attachment only groups near-duplicate
+semantic evidence:
+
+```text
+--merge-similarity 0.995
+--fusion-similarity 0.995
+--incompatible-merge-action attach
+```
+
+Multi-anchor strict-attach result:
+
+```text
+command changes:
+  --merge-similarity 0.995
+  --fusion-similarity 0.995
+  --incompatible-merge-action attach
+
+gfo_living:
+  retention_token_accuracy_mean              0.9464
+  composition_token_accuracy_mean            0.6000
+  heldout_retention_token_accuracy_final     0.1667
+  heldout_retention_generation_match_final   0.4444
+  active_concept_count_final                 11
+  active_anchor_count_final                  12
+  attached_count_final                       1
+  ignored_count_final                        1
+  destructive_drift_mean_final               0.0726
+```
+
+Interpretation:
+
+```text
+Multi-anchor attachment works mechanically:
+  active_anchor_count > active_concept_count
+  attached_count = 1
+
+But this strict threshold did not beat the conservative create baseline:
+  conservative heldout generation 0.5556
+  strict attach heldout generation 0.4444
+
+It did improve exact retained QA and mean composition:
+  conservative retention mean 0.8992
+  strict attach retention mean 0.9464
+
+  conservative composition mean 0.5000
+  strict attach composition mean 0.6000
+```
+
+JSON diagnosis:
+
+```text
+The last chunk fact_probe had nearest_active_similarity = 0.9892.
+With merge_similarity = 0.995 it could not attach.
+Its novelty was only 0.0108, so the creation gate rejected it.
+That produced ignored_count = 1.
+```
+
+So the strict attach test partly tested the wrong thing. It was too strict to
+attach near-duplicate fact-probe evidence. Next run should lower the attach
+threshold back to 0.98 while keeping:
+
+```text
+--same-source-only
+--incompatible-merge-action attach
+```
+
+Expected behavior:
+
+```text
+fewer ignored anchors
+active_anchor_count should stay near the conservative concept count
+active_concept_count should be lower than active_anchor_count
+heldout retention should recover if the ignored fact-probe was the issue
+```
+
+Attach-0.98 result:
+
+```text
+command changes:
+  --merge-similarity 0.98
+  --fusion-similarity 0.98
+  --same-source-only
+  --incompatible-merge-action attach
+
+gfo_living:
+  retention_token_accuracy_mean              0.9464
+  composition_token_accuracy_mean            0.5000
+  heldout_retention_token_accuracy_final     0.1667
+  heldout_retention_generation_match_final   0.1111
+  active_concept_count_final                 11
+  active_anchor_count_final                  13
+  attached_count_final                       2
+  destructive_drift_mean_final               0.0569
+
+replay_living:
+  retention_token_accuracy_mean              1.0000
+  heldout_retention_generation_match_final   0.1111
+  destructive_drift_mean_final               0.3178
+```
+
+Interpretation:
+
+```text
+Attach is mechanically working:
+  active_anchor_count > active_concept_count
+  attached_count = 2
+
+But on seed 0 it is worse for heldout retention than conservative create:
+  conservative heldout generation 0.5556
+  attach-0.98 heldout generation 0.1111
+
+It improves exact retention and lowers destructive drift:
+  conservative exact retention mean 0.8992
+  attach-0.98 exact retention mean 0.9464
+
+  conservative destructive drift 0.0646
+  attach-0.98 destructive drift 0.0569
+```
+
+JSON diagnosis:
+
+```text
+The attached anchors are fact_probe anchors:
+  chunk_02:fact_probe:1
+  chunk_05:fact_probe:1
+
+The heldout generations collapse toward repeated high-frequency answers like
+Glinda/Munchkins/silver. This looks like over-preserving narrow activation
+regions or changing anchor sampling pressure, not like a failure to retain exact
+answers.
+```
+
+Next conclusion:
+
+```text
+Do not tune this from a single seed.
+
+We now have two plausible living-map gates:
+  conservative create:
+    better seed-0 heldout retention
+
+  attach-0.98:
+    better seed-0 exact retention, lower drift, working multi-anchor concepts
+
+The next experiment should be a seed sweep comparing these two gates directly.
+If conservative wins multi-seed heldout, attach is over-grouping.
+If attach wins or ties multi-seed while improving exact retention/drift, it is
+worth keeping and tuning sampler pressure.
+
+Seed-1 conservative living-map result:
+
+```text
+gfo_living:
+  retention_token_accuracy_mean              0.8742
+  composition_token_accuracy_mean            0.4000
+  heldout_retention_token_accuracy_final     0.1667
+  heldout_retention_generation_match_final   0.2222
+  active_concept_count_final                 12
+  active_anchor_count_final                  12
+  replacement_fused_count_final              1
+  destructive_drift_mean_final               0.0552
+
+replay_living:
+  retention_token_accuracy_mean              1.0000
+  composition_token_accuracy_mean            0.5000
+  heldout_retention_token_accuracy_final     0.2778
+  heldout_retention_generation_match_final   0.3333
+  destructive_drift_mean_final               0.3712
+```
+
+A second seed-1 run reported:
+
+```text
+gfo_living:
+  retention_token_accuracy_mean              0.8992
+  heldout_retention_token_accuracy_final     0.2778
+  heldout_retention_generation_match_final   0.3333
+  destructive_drift_mean_final               0.0471
+```
+
+But it wrote to the same output path:
+
+```text
+model/analysis/gfo-real-book-living-map-conservative-seed1-5chunks-e5.json
+```
+
+and reported:
+
+```text
+attached_count_final = 0
+active_anchor_count_final = active_concept_count_final
+```
+
+So this does not appear to be an attach run. Treat the pasted seed-1 results as
+evidence that GFO still strongly reduces drift, but not as a clean
+conservative-vs-attach comparison.
+
+Current research status:
+
+```text
+Proven enough to continue implementation:
+  activation-anchor GFO beats AdamW on real-book retention
+  activation-anchor GFO preserves hidden geometry
+  GFO can beat replay on heldout paraphrases for seed 0
+  conservative living map can improve over static GFO for seed 0
+
+Not proven yet:
+  GFO beats replay on heldout paraphrases across seeds
+  attach/multi-anchor concepts improve heldout generalization
+  replacement/fusion is safe rather than hiding forgetting
+  layer-wise evidence is doing real work
+  background maintenance helps rather than over-regularizing
+```
+
+Implemented layer-wise living-map anchors:
+
+```text
+--anchor-layers final
+--anchor-layers final,block_3
+--anchor-layers final,block_3,block_2
+--anchor-layers embed,block_0,block_1,block_2,block_3,final
+```
+
+Each living-map anchor now stores:
+
+```text
+layer_id
+hidden_target at that layer
+answer-token/full-sequence mask
+```
+
+Layer hidden states are captured by explicitly running the existing
+DecoderTransformer block-by-block:
+
+```text
+embed   = token_embedding + position_embedding
+block_i = output after transformer block i
+final   = final LayerNorm output
+```
+
+No model architecture change was needed.
+
+The living-map gate now prevents cross-layer concept matching by default:
+
+```text
+final anchors compare with final anchors
+block_3 anchors compare with block_3 anchors
+```
+
+Cross-layer matching is only allowed with:
+
+```text
+--allow-cross-layer-match
+```
+
+Training now uses layer-aware protection:
+
+```text
+gfo_living:
+  drift penalty is measured at each anchor's stored layer
+
+replay_living:
+  target replay still uses final logits, but the same living-map anchors
+  determine replay sampling
+```
+
+New metrics:
+
+```text
+active_layer_count
+layer_drift per step in JSON
+```
+
+Validation:
+
+```text
+py_compile passed.
+
+Smoke with default final-only anchors passed:
+  active_layer_count_final = 1
+
+Smoke with final,block_3 passed:
+  active_layer_count_final = 2
+```
+
+Next experiment:
+
+```text
+Compare final-only conservative GFO against final+block_3 conservative GFO.
+
+If final+block_3 improves heldout retention or composition while keeping local
+learning and exact retention, then layer-wise evidence is doing real work.
+
+If it hurts heldout, the extra layer anchor is over-constraining plasticity.
+Then test final-only with layer diagnostics before adding more layers.
+```
+
+First final+block_3 layer-wise result:
+
+```text
+command:
+  --anchor-layers final,block_3
+  --drift-normalization none
+
+gfo_living:
+  retention_token_accuracy_mean              0.8103
+  composition_token_accuracy_mean            0.4000
+  heldout_retention_generation_match_final   0.2222
+  active_layer_count_final                   2
+  destructive_drift_mean_final               4.1078
+  destructive_drift_max_final                29.9496
+
+adamw:
+  destructive_drift_mean_final               106.0826
+  destructive_drift_max_final                414.2239
+
+replay_living:
+  destructive_drift_mean_final               83.3090
+  destructive_drift_max_final                849.8754
+```
+
+Layer drift breakdown showed the issue:
+
+```text
+gfo_living final layer drift mean    0.2808
+gfo_living block_3 drift mean        9.6357
+
+adamw final layer drift mean         0.5267
+adamw block_3 drift mean             232.7497
+
+replay final layer drift mean        0.4574
+replay block_3 drift mean            249.0123
+```
+
+Interpretation:
+
+```text
+The layer-wise implementation works, but raw drift scales are not comparable.
+`final` is LayerNormed. `block_3` is pre-final-LayerNorm residual state.
+Using the same raw MSE for both makes block_3 dominate the protection loss and
+over-constrains plasticity.
+```
+
+Implemented explicit drift normalization:
+
+```text
+--drift-normalization none
+--drift-normalization target_energy
+```
+
+With:
+
+```text
+target_energy:
+  drift = mean(||h_current - h_anchor||^2) / mean(||h_anchor||^2)
+```
+
+This turns layer-wise drift into relative displacement, so pre-LayerNorm and
+post-LayerNorm anchors can be compared without hardcoding layer-specific
+weights. If the target energy is zero, the script raises an error instead of
+silently falling back.
+
+Validation:
+
+```text
+py_compile passed.
+one-chunk final,block_3 smoke passed with --drift-normalization target_energy.
+```
+
+Next run should repeat final+block_3 with:
+
+```text
+--drift-normalization target_energy
+```
+
+If heldout retention recovers while active_layer_count remains 2, layer-wise
+protection is useful once normalized. If it still underperforms final-only,
+final-layer anchors are currently the right representation for this tiny model.
+
+Normalized final+block_3 result:
+
+```text
+command:
+  --anchor-layers final,block_3
+  --drift-normalization target_energy
+
+gfo_living:
+  retention_token_accuracy_mean              0.9214
+  retention_token_accuracy_final             1.0000
+  composition_token_accuracy_mean            0.4000
+  composition_token_accuracy_final           0.0000
+  heldout_retention_token_accuracy_final     0.1667
+  heldout_retention_generation_match_final   0.1111
+  active_layer_count_final                   2
+  destructive_drift_mean_final               0.1338
+  destructive_drift_max_final                0.4573
+
+replay_living:
+  retention_token_accuracy_mean              1.0000
+  heldout_retention_generation_match_final   0.3333
+  heldout_composition_generation_match_final 0.5000
+  destructive_drift_mean_final               1.1380
+```
+
+Layer drift is now scale-balanced:
+
+```text
+gfo_living final drift mean final    0.1666
+gfo_living block_3 drift mean final  0.0805
+```
+
+Interpretation:
+
+```text
+Normalization fixed the scale bug, but final+block_3 still underperforms
+final-only on heldout retention and composition.
+
+For this tiny model, final-layer answer-token anchors are currently the right
+active representation. Earlier-layer anchors are useful diagnostically, but
+protecting them during training over-constrains semantic flexibility.
+```
+
+Implemented maintenance layer selection:
+
+```text
+--maintenance-layers final
+--maintenance-layers final,block_3
+```
+
+If omitted, maintenance can repair all active anchor layers. With this option,
+background repair can be restricted to final-layer anchors, avoiding the same
+overconstraint that hurt final+block_3 training.
+
+Validation:
+
+```text
+py_compile passed.
+one-chunk maintenance smoke passed with --maintenance-layers final.
+```
+
+Next implementation test:
+
+```text
+Use final-only conservative GFO, then add low-rate background maintenance.
+
+Goal:
+  repair final-layer drift only
+  improve heldout/exact retention without hurting local learning
+  avoid earlier-layer overconstraint
+```
+
+Semantic-region pivot:
+
+```text
+Problem:
+  Exact activation-point preservation is too rigid.
+  It can preserve old prompt activations while blocking the representation from
+  reorganizing into a better semantic region.
+
+Correction:
+  Preserve answer/readout margin as the primary old-knowledge object.
+  Keep hidden-anchor drift as an optional loose auxiliary, not the definition of
+  forgetting.
+```
+
+Implemented semantic margin anchors in the living-map benchmark:
+
+```text
+SemanticMarginAnchor:
+  question
+  answer
+  prompt token prefix
+  correct answer token ids
+  negative answer first-token ids
+
+Preservation loss:
+  [semantic_margin - (logit(correct_answer_first_token)
+                      - max logit(negative_answer_first_token))]_+^2
+```
+
+Negative answer candidates are derived from the benchmark QA answer vocabulary
+from selected training chunks and heldout prompt groups. No answer strings are
+hardcoded. If no distinct negative first-token answer exists, the script raises
+an error.
+
+New options:
+
+```text
+--semantic-margin-weight
+--semantic-margin
+--semantic-margin-negatives
+--semantic-anchor-batch-size
+```
+
+Validation:
+
+```text
+py_compile passed.
+one-chunk semantic-margin smoke passed.
+
+Smoke command:
+  --methods gfo_living
+  --max-chunks 1
+  --epochs-per-chunk 1
+  --anchor-layers final
+  --semantic-margin-weight 1.0
+  --semantic-margin 1.0
+  --anchor-drift-weight 0.25
+
+Smoke result:
+  active_semantic_anchor_count_final             2
+  semantic_margin_mean_final                    -7.1822
+  semantic_margin_violation_rate_final           1.0000
+```
+
+Interpretation:
+
+```text
+The semantic-margin path is active. The smoke intentionally undertrains, so
+negative margins are expected. The important check is that semantic anchors are
+created, margin violations are visible, and no silent fallback occurs.
+```
+
+Next real run:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/gco_math/gfo_real_book_living_map.py \
+  --methods adamw,gfo_living,replay_living \
+  --seed 0 \
+  --max-chunks 5 \
+  --epochs-per-chunk 5 \
+  --batch-size 8 \
+  --include-local-prompts-in-training \
+  --anchor-local-prompts \
+  --qa-anchor-mode answer_tokens \
+  --heldout-prompts-path data/real_book/heldout_eval_prompts.json \
+  --anchor-layers final \
+  --drift-normalization none \
+  --semantic-margin-weight 1.0 \
+  --semantic-margin 1.0 \
+  --semantic-margin-negatives 16 \
+  --semantic-anchor-batch-size 4 \
+  --anchor-drift-weight 0.25 \
+  --replay-loss-weight 5.0 \
+  --anchor-batch-size 4 \
+  --max-candidate-anchors-per-chunk 8 \
+  --max-fact-probes-per-chunk 8 \
+  --evidence-exposures 1 \
+  --pressure-threshold 0.2 \
+  --pending-merge-similarity 0.8 \
+  --merge-similarity 0.98 \
+  --fusion-similarity 0.95 \
+  --same-source-only \
+  --incompatible-merge-action create \
+  --device mps \
+  --no-progress \
+  --output-json model/analysis/gfo-real-book-living-map-semantic-margin-seed0-5chunks-e5.json
+```
+
+What this tests:
+
+```text
+Can semantic-margin preservation improve heldout paraphrase retention and
+composition compared with exact activation-point preservation, while keeping
+exact retention competitive?
+```
+
+Semantic-margin seed-0 full command result with squared hinge / weight 1.0:
+
+```text
+adamw:
+  local_token_accuracy_mean                      1.0000
+  retention_token_accuracy_mean                  0.3548
+  heldout_retention_generation_match_final       0.1111
+  semantic_margin_violation_rate_final           0.8000
+
+gfo_living:
+  local_token_accuracy_mean                      0.6000
+  retention_token_accuracy_mean                  0.4000
+  destructive_drift_mean_final                   nan
+  semantic_margin_mean_final                     nan
+
+replay_living:
+  local_token_accuracy_mean                      0.2000
+  retention_token_accuracy_mean                  0.2000
+  destructive_drift_mean_final                   nan
+  semantic_margin_mean_final                     nan
+```
+
+Diagnosis:
+
+```text
+This run is invalid as a research result.
+
+The first non-finite point is gfo_living chunk 3:
+  train_loss = NaN
+
+The squared hinge objective on raw logit margins is too sharp:
+  margin violation roughly 8 -> squared penalty roughly 64 per anchor.
+
+By chunk 2, semantic margins overshot to large positive values:
+  semantic_margin_mean ~= 22.8
+  semantic_margin_min ~= 13.9
+
+Then chunk 3 went non-finite. The old summary hid part of this by reporting
+semantic_margin_violation_rate = 0 when the margin itself was NaN.
+```
+
+Implemented fail-fast numerical checks:
+
+```text
+training loss must be finite
+gradients must be finite
+model parameters must be finite after each step
+anchor drift must be finite
+semantic margins must be finite
+summary metrics must be finite
+JSON output uses allow_nan=False
+```
+
+Also removed NaN placeholders from the action ledger:
+
+```text
+nearest_active_present = 0/1
+nearest_active_similarity = -1.0 only when no nearest active concept exists
+```
+
+Added semantic margin loss modes:
+
+```text
+--semantic-margin-loss hinge
+--semantic-margin-loss squared_hinge
+```
+
+The default is now `hinge`, because it enforces the same margin condition with
+bounded gradient pressure:
+
+```text
+[m - margin]_+
+```
+
+instead of:
+
+```text
+[m - margin]_+^2
+```
+
+CPU stability check:
+
+```text
+command:
+  --methods gfo_living
+  --max-chunks 3
+  --epochs-per-chunk 5
+  --semantic-margin-weight 0.1
+  --semantic-margin-loss hinge
+  --anchor-drift-weight 0.25
+
+result:
+  local_token_accuracy_mean                      1.0000
+  retention_token_accuracy_mean                  1.0000
+  composition_token_accuracy_mean                0.6667
+  heldout_retention_generation_match_final       0.2222
+  destructive_drift_mean_final                   0.0556
+  semantic_margin_mean_final                     15.0492
+  semantic_margin_min_final                      6.1031
+  semantic_margin_violation_rate_final           0.0000
+```
+
+No NaN/Infinity appeared in the smoke JSON.
+
+Next MPS run:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/gco_math/gfo_real_book_living_map.py \
+  --methods adamw,gfo_living,replay_living \
+  --seed 0 \
+  --max-chunks 5 \
+  --epochs-per-chunk 5 \
+  --batch-size 8 \
+  --include-local-prompts-in-training \
+  --anchor-local-prompts \
+  --qa-anchor-mode answer_tokens \
+  --heldout-prompts-path data/real_book/heldout_eval_prompts.json \
+  --anchor-layers final \
+  --drift-normalization none \
+  --semantic-margin-weight 0.1 \
+  --semantic-margin 1.0 \
+  --semantic-margin-loss hinge \
+  --semantic-margin-negatives 16 \
+  --semantic-anchor-batch-size 4 \
+  --anchor-drift-weight 0.25 \
+  --replay-loss-weight 5.0 \
+  --anchor-batch-size 4 \
+  --max-candidate-anchors-per-chunk 8 \
+  --max-fact-probes-per-chunk 8 \
+  --evidence-exposures 1 \
+  --pressure-threshold 0.2 \
+  --pending-merge-similarity 0.8 \
+  --merge-similarity 0.98 \
+  --fusion-similarity 0.95 \
+  --same-source-only \
+  --incompatible-merge-action create \
+  --device mps \
+  --no-progress \
+  --output-json model/analysis/gfo-real-book-living-map-semantic-hinge-w01-seed0-5chunks-e5.json
+```
+
+If this still trips fail-fast on MPS, lower only:
+
+```text
+--semantic-margin-weight 0.05
+```
+
+Do not compare any run that produces NaN.
+
+Training instrumentation added:
+
+```text
+The living-map benchmark now reports whether the model actually moved and which
+loss terms drove the movement.
+```
+
+New per-step and summary metrics:
+
+```text
+total_parameter_count
+trainable_parameter_count
+frozen_parameter_count
+trainable_parameter_fraction
+
+chunk_weight_delta_norm
+chunk_weight_delta_relative
+chunk_weight_delta_max_abs
+cumulative_weight_delta_norm
+cumulative_weight_delta_relative
+cumulative_weight_delta_max_abs
+
+train_lm_loss
+train_qa_loss
+train_qa_objective
+train_semantic_margin_loss
+train_semantic_margin_objective
+train_anchor_drift_loss
+train_anchor_drift_objective
+train_replay_loss
+train_replay_objective
+train_total_loss
+```
+
+This directly answers the confusion:
+
+```text
+The model is trained by loss.backward() and optimizer.step().
+The report now shows trainable parameter count and weight delta so this is
+visible in the summary.
+```
+
+Smoke result:
+
+```text
+one chunk:
+  trainable_parameter_count_final              793344
+  trainable_parameter_fraction_final           0.7444
+  cumulative_weight_delta_norm_final           2.3468
+  cumulative_weight_delta_relative_final       0.0434
+  train_total_loss_final_epoch_final           106.8720
+  train_lm_loss_final_epoch_final              11.7669
+  train_qa_objective_final_epoch_final         95.1050
+  train_semantic_margin_objective_final_epoch  0.0000
+
+Interpretation:
+  chunk 1 has no old anchors yet, so semantic/anchor preservation is zero.
+  The model still trains: weight_delta_norm is nonzero.
+```
+
+Two-chunk smoke:
+
+```text
+chunk 2 final:
+  cumulative_weight_delta_norm_final           2.6321
+  train_total_loss_final_epoch_final           24.9124
+  train_lm_loss_final_epoch_final              14.5089
+  train_qa_objective_final_epoch_final          9.3020
+  train_semantic_margin_objective_final_epoch   1.1000
+  train_anchor_drift_objective_final_epoch      0.0015
+```
+
+Interpretation:
+
+```text
+From chunk 2 onward, GFO is training on:
+  new chunk language modeling
+  current local QA supervision
+  old semantic-margin preservation
+  old hidden-anchor drift preservation
+```
+
+Added opt-in semantic paraphrase clusters:
+
+```text
+--semantic-cluster-prompts-path path/to/prompts.json
+--semantic-cluster-max-prompts N
+```
+
+The cluster file uses the same prompt-group JSON schema as heldout prompts:
+
+```json
+{
+  "retention_prompts": [
+    {"question": "...", "answer": "..."}
+  ]
+}
+```
+
+When a source QA anchor is created, the script finds cluster prompts with the
+same normalized answer and adds them as additional semantic margin anchors. This
+is opt-in because using heldout prompts as clusters would contaminate heldout
+evaluation.
+
+Plumbing smoke used the heldout file only to verify the code path:
+
+```text
+--semantic-cluster-prompts-path data/real_book/heldout_eval_prompts.json
+--semantic-cluster-max-prompts 1
+
+active_semantic_anchor_count_final:
+  without cluster path: 2
+  with cluster path:    4
+```
+
+This smoke is not a scientific result because it uses heldout prompts as
+training-time semantic anchors.
+
+Next valid command without cluster leakage:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/gco_math/gfo_real_book_living_map.py \
+  --methods adamw,gfo_living,replay_living \
+  --seed 0 \
+  --max-chunks 5 \
+  --epochs-per-chunk 5 \
+  --batch-size 8 \
+  --include-local-prompts-in-training \
+  --anchor-local-prompts \
+  --qa-anchor-mode answer_tokens \
+  --heldout-prompts-path data/real_book/heldout_eval_prompts.json \
+  --anchor-layers final \
+  --drift-normalization none \
+  --semantic-margin-weight 0.1 \
+  --semantic-margin 1.0 \
+  --semantic-margin-loss hinge \
+  --semantic-margin-negatives 16 \
+  --semantic-anchor-batch-size 4 \
+  --anchor-drift-weight 0.25 \
+  --replay-loss-weight 5.0 \
+  --anchor-batch-size 4 \
+  --max-candidate-anchors-per-chunk 8 \
+  --max-fact-probes-per-chunk 8 \
+  --evidence-exposures 1 \
+  --pressure-threshold 0.2 \
+  --pending-merge-similarity 0.8 \
+  --merge-similarity 0.98 \
+  --fusion-similarity 0.95 \
+  --same-source-only \
+  --incompatible-merge-action create \
+  --device mps \
+  --no-progress \
+  --output-json model/analysis/gfo-real-book-living-map-instrumented-semantic-hinge-w01-seed0-5chunks-e5.json
+```
+
+Next valid cluster experiment requires a separate non-heldout paraphrase file.
+Do not use `data/real_book/heldout_eval_prompts.json` as
+`--semantic-cluster-prompts-path` for a scientific comparison.
+
+Added a separate non-heldout semantic cluster file:
+
+```text
+data/real_book/semantic_cluster_prompts.json
+```
+
+It contains 20 paraphrase prompts covering the local QA facts:
+
+```text
+Kansas
+Toto
+Munchkins
+Scarecrow
+tin
+Emerald City
+silver
+courage
+water
+Glinda
+```
+
+Validation:
+
+```text
+jq empty passed.
+No exact question overlap with data/real_book/heldout_eval_prompts.json.
+```
+
+The script now rejects leakage by raising if:
+
+```text
+--semantic-cluster-prompts-path == --heldout-prompts-path
+```
+
+Cluster plumbing smoke:
+
+```text
+command:
+  --semantic-cluster-prompts-path data/real_book/semantic_cluster_prompts.json
+  --semantic-cluster-max-prompts 1
+  --max-chunks 1
+
+active_semantic_anchor_count_final = 4
+```
+
+Without cluster prompts the same smoke had:
+
+```text
+active_semantic_anchor_count_final = 2
+```
+
+Two-chunk cluster smoke:
+
+```text
+active_semantic_anchor_count_final              6
+train_semantic_margin_objective_final_epoch     1.1308
+train_anchor_drift_objective_final_epoch        0.0015
+cumulative_weight_delta_norm_final              2.6247
+```
+
+So cluster anchors are created and become active preservation terms on the next
+chunk.
+
+First valid semantic-region run:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/gco_math/gfo_real_book_living_map.py \
+  --methods adamw,gfo_living,replay_living \
+  --seed 0 \
+  --max-chunks 5 \
+  --epochs-per-chunk 5 \
+  --batch-size 8 \
+  --include-local-prompts-in-training \
+  --anchor-local-prompts \
+  --qa-anchor-mode answer_tokens \
+  --heldout-prompts-path data/real_book/heldout_eval_prompts.json \
+  --semantic-cluster-prompts-path data/real_book/semantic_cluster_prompts.json \
+  --semantic-cluster-max-prompts 1 \
+  --anchor-layers final \
+  --drift-normalization none \
+  --semantic-margin-weight 0.1 \
+  --semantic-margin 1.0 \
+  --semantic-margin-loss hinge \
+  --semantic-margin-negatives 16 \
+  --semantic-anchor-batch-size 4 \
+  --anchor-drift-weight 0.25 \
+  --replay-loss-weight 5.0 \
+  --anchor-batch-size 4 \
+  --max-candidate-anchors-per-chunk 8 \
+  --max-fact-probes-per-chunk 8 \
+  --evidence-exposures 1 \
+  --pressure-threshold 0.2 \
+  --pending-merge-similarity 0.8 \
+  --merge-similarity 0.98 \
+  --fusion-similarity 0.95 \
+  --same-source-only \
+  --incompatible-merge-action create \
+  --device mps \
+  --no-progress \
+  --output-json model/analysis/gfo-real-book-living-map-semantic-cluster-w01-seed0-5chunks-e5.json
+```
+
+What to compare against the previous non-cluster run:
+
+```text
+heldout_retention_generation_match_final
+heldout_retention_token_accuracy_final
+composition_token_accuracy_mean/final
+semantic_margin_violation_rate_final
+train_semantic_margin_objective_mean
+cumulative_weight_delta_norm_final
+```
+
+If heldout retention improves without losing exact retention, this supports the
+semantic-region hypothesis. If exact retention stays high but heldout does not
+improve, then answer-margin clusters are still too shallow and we need
+composition/operator preservation rather than more paraphrases.
+
+Worst-margin semantic cluster result:
+
+```text
+command change:
+  --semantic-anchor-selection worst_margin
+
+gfo_living:
+  retention_token_accuracy_mean                  1.0000
+  heldout_retention_token_accuracy_final         0.2778
+  heldout_retention_generation_match_final       0.2222
+  destructive_drift_mean_final                   0.0887
+  semantic_margin_violation_rate_final           0.0500
+  semantic_margin_source_violation_rate_final    0.0000
+  semantic_margin_cluster_violation_rate_final   0.1000
+```
+
+Worst anchor:
+
+```text
+chunk_id:        chunk_05
+cluster_source:  cluster
+question:        Question: Who is known as the Good Witch of the South? Answer:
+answer:          Glinda
+margin:          -29.1218
+```
+
+Interpretation:
+
+```text
+The remaining violation is not old-memory forgetting.
+It is a new chunk-5 cluster paraphrase added after chunk-5 training.
+
+The source question for Glinda is learned, but the non-heldout cluster
+paraphrase is not trained because the living map creates semantic anchors after
+the chunk training loop.
+```
+
+Implemented current-cluster write loss:
+
+```text
+--current-semantic-cluster-weight
+```
+
+When this is positive, cluster paraphrases for the current chunk's local QA
+facts are trained during the same chunk where the source fact appears. This is
+different from `--semantic-margin-weight`, which preserves active semantic
+anchors from the living map after they have been created.
+
+Smoke:
+
+```text
+--current-semantic-cluster-weight 0.1
+
+train_current_semantic_cluster_objective_final_epoch_final = 0.1717
+```
+
+Next run:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/gco_math/gfo_real_book_living_map.py \
+  --methods adamw,gfo_living,replay_living \
+  --seed 0 \
+  --max-chunks 5 \
+  --epochs-per-chunk 5 \
+  --batch-size 8 \
+  --include-local-prompts-in-training \
+  --anchor-local-prompts \
+  --qa-anchor-mode answer_tokens \
+  --heldout-prompts-path data/real_book/heldout_eval_prompts.json \
+  --semantic-cluster-prompts-path data/real_book/semantic_cluster_prompts.json \
+  --semantic-cluster-max-prompts 1 \
+  --anchor-layers final \
+  --drift-normalization none \
+  --semantic-margin-weight 0.1 \
+  --current-semantic-cluster-weight 0.1 \
+  --semantic-margin 1.0 \
+  --semantic-margin-loss hinge \
+  --semantic-anchor-selection worst_margin \
+  --semantic-margin-negatives 16 \
+  --semantic-anchor-batch-size 4 \
+  --anchor-drift-weight 0.25 \
+  --replay-loss-weight 5.0 \
+  --anchor-batch-size 4 \
+  --max-candidate-anchors-per-chunk 8 \
+  --max-fact-probes-per-chunk 8 \
+  --evidence-exposures 1 \
+  --pressure-threshold 0.2 \
+  --pending-merge-similarity 0.8 \
+  --merge-similarity 0.98 \
+  --fusion-similarity 0.95 \
+  --same-source-only \
+  --incompatible-merge-action create \
+  --device mps \
+  --no-progress \
+  --output-json model/analysis/gfo-real-book-living-map-current-cluster-w01-seed0-5chunks-e5.json
+```
+
+Readout:
+
+```text
+If source_violation = 0 and cluster_violation = 0, current-cluster writing
+fixed the remaining semantic-region preservation bug.
+
+If heldout still does not improve after cluster_violation = 0, then this
+confirms the next missing piece is composition/operator preservation, not more
+answer-margin paraphrase training.
+```
+
+## Composition/operator supervision pass
+
+The current-cluster run reached zero source and cluster semantic-margin
+violations for GFO, while heldout generation improved but composition remained
+flat. That means answer-region preservation is no longer the main bottleneck.
+The next missing object is an operator/composition target.
+
+Implemented:
+
+```text
+--include-composition-prompts-in-training
+--composition-loss-weight
+--anchor-composition-prompts
+```
+
+Composition prompts are now supervised as QA objectives during the chunk and can
+also enter the living map as `composition_qa` anchors. The living-map candidate
+order is explicit:
+
+```text
+local QA -> composition QA -> fact probes
+```
+
+This prevents composition anchors from being silently truncated behind generic
+fact probes when candidate capacity is limited.
+
+Smoke:
+
+```text
+max_chunks = 3
+epochs_per_chunk = 1
+method = gfo_living
+
+train_composition_qa_objective_final_epoch_final = 32.8740
+composition_token_accuracy_mean = 0.9444
+composition_actions = 2
+source_counts = {'qa': 8, 'composition_qa': 2, 'fact_probe': 9}
+```
+
+The smoke only verifies wiring. It is not a method-quality result because one
+epoch is not enough for semantic margins to converge.
+
+The first full composition run failed fast on MPS:
+
+```text
+method=gfo_living
+chunk=chunk_05
+epoch=1
+batch=21
+error=Non-finite gradient
+```
+
+Diagnosis:
+
+```text
+Composition supervision was being applied as the full composition prompt set on
+every LM batch. With small LM batches, this repeats the same auxiliary objective
+many times inside a chunk while semantic-margin and anchor-drift preservation
+are also active.
+```
+
+Implemented:
+
+```text
+--composition-supervision-batch-size
+```
+
+`0` preserves the old behavior: all composition prompts on every LM batch.
+A positive value uses deterministic round-robin prompt rows per LM batch.
+
+Also improved non-finite gradient diagnostics. Future failures name:
+
+```text
+parameter name
+parameter shape
+NaN/+Inf/-Inf counts
+finite gradient max
+all active loss components
+```
+
+CPU stability smoke:
+
+```text
+method = gfo_living
+max_chunks = 5
+epochs_per_chunk = 1
+composition_supervision_batch_size = 2
+
+composition_token_accuracy_mean                1.0000
+semantic_margin_violation_rate_final           0.0000
+semantic_margin_source_violation_rate_final    0.0000
+semantic_margin_cluster_violation_rate_final   0.0000
+```
+
+MPS is unavailable in the sandbox, so the exact MPS failure path could not be
+locally reproduced.
+
+Second MPS failure:
+
+```text
+method=gfo_living
+chunk=chunk_05
+epoch=3
+batch=5
+parameter=blocks.0.ln1.bias
+loss_total=8.272
+anchor_drift_objective=0.0236509
+composition_qa_objective=0.000419877
+semantic_margin_objective=0
+current_cluster_objective=0
+failure=one -Inf gradient element
+```
+
+Interpretation:
+
+```text
+The loss components are finite and modest, so this is not an oversized
+semantic/composition objective. The failure occurs during backward through the
+first transformer block.
+```
+
+The shared decoder attention used `-inf` in the causal mask before softmax:
+
+```text
+scores.masked_fill(mask, -inf)
+```
+
+On MPS this can produce non-finite backward values even when the forward loss is
+finite. Changed the mask value to the finite minimum for the tensor dtype:
+
+```text
+torch.finfo(scores.dtype).min
+```
+
+This still makes masked probabilities zero after softmax, but avoids putting an
+infinity into the computation graph.
+
+Validation:
+
+```text
+py_compile passed
+CPU 5-chunk / 1-epoch GFO stability smoke passed
+```
+
+Third MPS failure:
+
+```text
+Individual gradients passed finite checks.
+PyTorch clip_grad_norm_ then reported a non-finite total norm.
+```
+
+This means the failure moved from non-finite gradient values to the backend's
+gradient-norm reduction/clipping path. Replaced PyTorch gradient clipping with
+strict local clipping:
+
+```text
+1. copy each gradient to CPU float64
+2. verify every gradient value is finite
+3. compute total norm in float64
+4. verify total norm is finite
+5. explicitly scale gradients if total_norm > --grad-clip
+```
+
+This is not a silent fallback: if any gradient or the true float64 norm is
+non-finite, the run raises with parameter and loss-component diagnostics.
+
+Validation:
+
+```text
+py_compile passed
+No torch.nn.utils.clip_grad_norm_ calls remain in gfo_real_book_living_map.py
+CPU 5-chunk / 1-epoch strict-clip smoke passed
+```
+
+## Full-Answer Semantic Preservation
+
+The composition-batched run solved exact seen composition prompts but did not
+solve heldout composition or heldout paraphrase retention:
+
+```text
+gfo_living:
+  retention_token_accuracy_mean                  1.0000
+  composition_token_accuracy_mean                1.0000
+  semantic_margin_violation_rate_final           0.0000
+
+but:
+  heldout_retention_token_accuracy_final         0.1111
+  heldout_composition_generation_match_final     0.0000
+```
+
+Diagnosis:
+
+```text
+The semantic margin anchor only protected the first answer token.
+This is too weak for multi-token answers:
+  Emerald City
+  brains and heart
+```
+
+Implemented full-answer semantic sequence preservation:
+
+```text
+SemanticMarginAnchor now stores:
+  prompt-only input for first-token answer margin
+  full QA teacher-forcing tensors for all answer tokens
+
+New loss term inside semantic anchor loss:
+  semantic_answer_sequence_weight * CE(answer tokens | prompt)
+```
+
+New option:
+
+```text
+--semantic-answer-sequence-weight
+```
+
+New semantic-anchor selection mode:
+
+```text
+--semantic-anchor-selection worst_answer_loss
+```
+
+New reported metrics:
+
+```text
+semantic_answer_loss_mean
+semantic_answer_loss_max
+semantic_answer_token_accuracy_mean
+semantic_answer_exact_match_rate
+```
+
+Smoke:
+
+```text
+method = gfo_living
+max_chunks = 3
+epochs_per_chunk = 1
+semantic_answer_sequence_weight = 1.0
+semantic_anchor_selection = worst_answer_loss
+
+semantic_answer_loss_mean_final           8.7879
+semantic_answer_token_accuracy_mean_final 0.1875
+semantic_answer_exact_match_rate_final    0.1875
+```
+
+The smoke is intentionally undertrained. The important check is that the
+full-answer semantic path is active, reports sequence metrics, and writes valid
+JSON.
+
+## Composition Semantic Clusters
+
+Five-seed cluster-2 result:
+
+```text
+heldout_retention_token_accuracy_final
+  adamw          0.0444
+  replay_living  0.1778
+  gfo_living     0.4111
+
+heldout_composition_token_accuracy_final
+  adamw          0.1667
+  replay_living  0.1667
+  gfo_living     0.4000
+
+semantic_answer_exact_match_rate_final
+  adamw          0.2354
+  replay_living  0.5848
+  gfo_living     1.0000
+```
+
+The remaining variance is composition generalization. Direct-fact semantic
+clusters exist, but composition prompts were only protected as exact source
+prompts.
+
+Implemented source-aware semantic clusters:
+
+```text
+retention_clusters   -> source_type qa
+composition_clusters -> source_type composition_qa
+```
+
+This avoids mixing cluster prompts only by answer. For example, `Scarecrow` as a
+direct fact and `Scarecrow` as the result of an ordering composition are now
+separate semantic-region sources.
+
+Added non-heldout composition cluster prompts to:
+
+```text
+data/real_book/semantic_cluster_prompts.json
+```
+
+Validation:
+
+```text
+JSON syntax valid
+heldout overlap = 0
+cluster_groups = {'retention_clusters': 20, 'composition_clusters': 4}
+```
+
+CPU smoke verified composition clusters enter the living map:
+
+```text
+source_type=composition_qa semantic anchors:
+  2 source composition prompts
+  4 composition cluster prompts
+```
+
+## 2026-05-31 Compressed Evidence Ledger
+
+This section is the short-form living log. Keep only results that changed the
+research belief or the architecture. Raw per-run summaries belong in
+`model/analysis/*.json`, not here.
+
+### Living Log Rule
+
+Each durable entry should answer five questions:
+
+```text
+Claim:       what belief did this test support or reject?
+Evidence:    the smallest numeric result that matters
+Decision:    what design choice changed because of it?
+Status:      proved / supported / failed / unresolved
+Next risk:   what could still invalidate this result?
+```
+
+Do not keep every seed or every near-duplicate run. Keep the run that establishes
+the effect, the strongest counterexample, and any result that reverses a prior
+belief.
+
+### What We Have Actually Shown
+
+**1. Forgetting can be mechanistically decomposed.**
+
+In the zero-transformer copy-position task, Task B moved the query route from
+position 0 to position 1 and Task A collapsed.
+
+```text
+after Task A:
+  Task A accuracy = 1.000
+  query attention mostly position 0
+
+after Task B:
+  Task A accuracy = 0.200
+  Task B accuracy = 1.000
+  query attention mostly position 1
+  C_QK drift = 2.067006
+```
+
+Freezing only `W_Q` and `W_K` did not preserve the route because embeddings and
+position vectors moved. The effective route is:
+
+```text
+x_query^T W_Q W_K^T x_source
+```
+
+Decision: preserve role geometry, not only operator weights.
+
+Status: proved in the minimal attention setting.
+
+**2. Neuron-level importance predicts conflict but is not a solution.**
+
+In the usage/allocation MLP tests, ablation-style effect scores correlated with
+loss attribution and drift.
+
+```text
+E vs loss_attribution Spearman rho = 0.7503 +/- 0.0540
+E vs total_drift      Spearman rho = 0.6528 +/- 0.0706
+```
+
+But protecting or selecting neurons did not solve continual learning. About 41%
+of new-task gradient mass wanted neurons already used by old tasks.
+
+Decision: scoring old-useful neurons is diagnostic, not sufficient. We need
+route allocation and transformation writes.
+
+Status: supported across the toy MLP allocation tests.
+
+**3. Capacity reclamation by random reset failed.**
+
+Resetting low-old-importance neurons preserved old behavior immediately after
+reset but made new-task learning worse than keeping their weak pretrained
+structure.
+
+```text
+AE_low_old_reset:
+  reset_old_acc = 0.958
+  old_acc       = 0.693
+  new_acc       = 0.520
+
+AE_low_old without reset:
+  old_acc = 0.700
+  new_acc = 0.782
+```
+
+Decision: do not treat low-use neurons as empty. Weak structure still carries
+plastic value.
+
+Status: failed intervention.
+
+**4. Readout-only reuse is insufficient for the ADD12 shift.**
+
+Changing only readout rows left ADD12 near chance.
+
+```text
+AE_readout_all:
+  old_acc = 0.634
+  new_acc = 0.258
+
+AE_safe_readout:
+  old_acc = 0.727
+  new_acc = 0.224
+```
+
+The hybrid feature+readout update learned better but forgot more.
+
+```text
+AE_hybrid:
+  old_acc = 0.662
+  new_acc = 0.852
+```
+
+Decision: new tasks sometimes require feature-level movement, not just readout
+realignment.
+
+Status: supported in the toy MLP.
+
+**5. Controlled geometric reasoning can distinguish reuse from split.**
+
+Experiment 0 showed that a route reasoner can reuse compatible transformations
+and split conflicting transformations in controlled synthetic route-space.
+
+```text
+compatible B ~= A + noise:
+  GCO reused route
+  Task A improved while learning Task B
+
+conflicting B = -A:
+  Adam/SGD learned B but forgot A
+  GCO split/protected and kept A stable
+```
+
+Decision: the route-state belief idea is viable in a controlled setting.
+
+Status: proved in synthetic route-space.
+
+**6. Real embedding geometry contains useful relation signal, but conflict is
+hard.**
+
+Experiment 1 moved to text embeddings.
+
+```text
+random baseline       18.75%
+cosine threshold      46.88%
+MLP classifier        68.75%
+GCO recurrent reasoner 68.75%
+
+GCO per-class:
+  compatible 60.00%
+  conflict   33.33%
+  bridge    100.00%
+  novel     100.00%
+```
+
+Decision: embeddings are usable, but contradiction/conflict cannot be solved by
+simple semantic proximity.
+
+Status: early signal, not proof of superiority over classifiers.
+
+**7. Dynamic multi-factor GCO reasoning beats static/current baselines.**
+
+Experiment 2 tested route action decisions over time using embeddings,
+activations, Fisher-like weight importance, topology stability, recurrence, and
+Jacobian damage sensors.
+
+```text
+GCO-full              action_acc = 68.00%, WWR = 4.80%, split_recall = 37.04%
+MLP-current-only      action_acc = 51.00%, WWR = 0.00%, split_recall = 29.63%
+GRU-sequence-baseline action_acc = 36.00%, WWR = 0.00%, split_recall = 25.93%
+cosine-rule-baseline  action_acc = 56.50%, WWR = 34.40%, split_recall = 0.00%
+```
+
+Decision: the next transformer GCO should replace scalar pressure with a
+route-evidence vector, recurrent route state, and belief/action head:
+
+```text
+xi_{l,r,t} -> s_{l,r,t} -> role belief -> structural action
+```
+
+Status: supported, with caveat that some ablations still match or beat full GCO
+and route purity did not change.
+
+**8. Living-map GFO showed strong protection but was not pure model-native CL.**
+
+Real-book living-map experiments consistently showed better semantic margins,
+lower destructive drift, and stronger composition than AdamW/replay.
+
+Representative five-seed cluster-2 result:
+
+```text
+heldout_retention_token_accuracy_final
+  adamw          0.0444
+  replay_living  0.1778
+  gfo_living     0.4111
+
+heldout_composition_token_accuracy_final
+  adamw          0.1667
+  replay_living  0.1667
+  gfo_living     0.4000
+
+semantic_answer_exact_match_rate_final
+  adamw          0.2354
+  replay_living  0.5848
+  gfo_living     1.0000
+```
+
+Decision: GFO-style protection works, but the external living-map machinery is
+not the final architecture.
+
+Status: supported as an external-system benchmark.
+
+**9. Native trace writes work mechanically, but routing collapses.**
+
+The native transformer gained source/residual reading, route reasoning, write
+gates, consolidation, compression/forget gates, fast keys, and fast value
+memory.
+
+Final native direct/write runs showed:
+
+```text
+fast_value_norm > 0
+fast_update_energy > 0
+write_rate > 0
+error_pressure > 0
+```
+
+But slot distribution remained poor:
+
+```text
+native_usage_imbalance = 1.0000
+slot_max_share often 0.70+
+slot_usage_ema_min near 0
+```
+
+Decision: fast write/read is alive; memory distribution is the bottleneck.
+
+Status: mechanism works, architecture unresolved.
+
+**10. Online GCO projection works, but it is still only GCO v0.**
+
+The online optimizer now protects MLP matrices only, using activation pathway
+matrices, pressure history, layer-wise pressure, novelty/interference correction,
+and row-wise projection.
+
+Final diagnostic run:
+
+```text
+projected MLP matrices              = 8
+gco_pressure_mean                   = 0.4405
+gco_projection_delta_ratio          = 0.0839
+gco_safe_update_ratio               = 0.9863
+seen_retention_forgetting_mean      = 0.0000
+heldout_retention_token_accuracy    = 0.0556
+```
+
+Decision: online projection is mechanically active, but it is not the evolved
+structural GCO yet.
+
+Status: implemented and verified as an online pressure/projection baseline.
+
+## Current Architecture Gap
+
+The evolved GCO spec changes the target from an AdamW-like optimizer to a
+structural geometric optimizer.
+
+Current code has:
+
+```text
+W_t                  yes
+fast trace slots     yes
+activation M_t       yes
+pressure H_t         yes
+row-wise projection  yes
+```
+
+Evolved GCO still needs:
+
+```text
+A_t topology / active wiring mask
+Q_t, R_t basis or neuron rearrangement
+O_t low-rank thought operators
+C_t protected/free capacity map
+S_t recurrent geometric reasoner state
+belief states over route roles
+direct geometric write solver Delta W K ~= E
+targeted edit set K_t
+operator creation / consolidation / decay
+```
+
+The next implementation target, if experiments resume, is a `GeometricMLP`:
+
+```text
+h_{l+1} =
+sigma(
+  [
+    Q_l (A_l * W_l) R_l^T
+    +
+    sum_r pi_{l,r}(h_l, S_t) O_{l,r}
+  ] h_l
+)
+```
+
+with `O_r = U_r C_r V_r^T` and route actions:
+
+```text
+IGNORE
+WRITE_REUSE
+WRITE_NEW
+PROTECT
+SPLIT_ROUTE
+BRIDGE_ROUTE
+REWRITE_WEAK
+DECAY_ROUTE
+```
+
+## What To Keep In The Living Paper
+
+Keep:
+
+- the zero-transformer route-drift result;
+- neuron-importance as diagnostic but not solution;
+- reset failure and readout-only failure;
+- synthetic route reasoner success;
+- embedding reasoner early signal and conflict weakness;
+- dynamic multi-factor reasoner table;
+- living-map real-book benchmark as an external-system upper signal;
+- native trace write evidence and slot-collapse failure;
+- online GCO pressure/projection evidence.
+
+Compress or remove:
+
+- repeated seed-by-seed real-book summaries;
+- runs that only confirm JSON writes or progress bars;
+- near-identical command blocks;
+- raw metric lists that do not change a design decision.
+
+Open problems to keep visible:
+
+```text
+slot collapse / route monopoly
+heldout retention weakness
+conflict detection in real semantics
+capacity recovery without destroying weak structure
+direct geometric write solver
+structural topology and operator creation
+offline anchor/Jacobian sleep phase
+```

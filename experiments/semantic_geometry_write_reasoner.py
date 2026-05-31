@@ -24,7 +24,7 @@ import argparse
 import copy
 import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,17 @@ ROLE_TO_INDEX = {role: index for index, role in enumerate(ROLE_NAMES)}
 SOURCE_NAMES = ("trusted", "untrusted")
 SOURCE_TO_INDEX = {source: index for index, source in enumerate(SOURCE_NAMES)}
 MAX_EVIDENCE_INDEX = 5
+FEATURE_ABLATIONS = (
+    "role",
+    "position",
+    "policy_identity",
+    "policy_position",
+    "policy_time",
+    "policy_source",
+    "policy_evidence",
+)
+CONSOLIDATION_ADMISSIONS = ("current", "same_relation", "composition_preserving")
+CONSOLIDATION_GROUP_ORDERS = ("current", "same_relation_first", "geometry")
 
 
 @dataclass(frozen=True)
@@ -103,6 +114,7 @@ class ConsolidationStats:
     rejected: int = 0
     no_capacity: int = 0
     freed_slots: int = 0
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -126,6 +138,8 @@ class SemanticMemoryModel(nn.Module):
         temperature: float,
         max_parents: int = 0,
         parent_confidence_weight: float = 0.5,
+        use_role_embeddings: bool = True,
+        use_position_encoding: bool = True,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -144,6 +158,8 @@ class SemanticMemoryModel(nn.Module):
         self.temperature = temperature
         self.max_parents = max_parents
         self.parent_confidence_weight = parent_confidence_weight
+        self.use_role_embeddings = use_role_embeddings
+        self.use_position_encoding = use_position_encoding
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.relation_embedding = nn.Embedding(relation_count, d_model)
         self.role_embedding = nn.Embedding(len(ROLE_NAMES), d_model)
@@ -194,8 +210,17 @@ class SemanticMemoryModel(nn.Module):
     def role_vector(self, role: str, batch: int, device: torch.device) -> torch.Tensor:
         if role not in ROLE_TO_INDEX:
             raise ValueError(f"Unknown role {role!r}.")
+        if not self.use_role_embeddings:
+            return torch.zeros(batch, self.d_model, device=device)
         role_ids = torch.full((batch,), ROLE_TO_INDEX[role], dtype=torch.long, device=device)
         return self.role_embedding(role_ids)
+
+    def position_vector(self, positions: torch.Tensor) -> torch.Tensor:
+        if positions.ndim != 1:
+            raise ValueError(f"positions must be rank-1 [batch], got {tuple(positions.shape)}.")
+        if not self.use_position_encoding:
+            return torch.zeros(positions.shape[0], self.d_model, device=positions.device)
+        return self.scalar_sincos(positions)
 
     def positioned_token(self, token_ids: torch.Tensor, role: str, pos: int) -> torch.Tensor:
         position = torch.full((token_ids.shape[0],), pos, dtype=torch.float32, device=token_ids.device)
@@ -211,7 +236,7 @@ class SemanticMemoryModel(nn.Module):
         return (
             self.token_embedding(token_ids)
             + self.role_vector(role, token_ids.shape[0], token_ids.device)
-            + self.scalar_sincos(positions)
+            + self.position_vector(positions)
         )
 
     def relation_query(self, state: torch.Tensor, relation_ids: torch.Tensor) -> torch.Tensor:
@@ -219,7 +244,7 @@ class SemanticMemoryModel(nn.Module):
         relation = (
             self.relation_embedding(relation_ids)
             + self.role_vector("relation", relation_ids.shape[0], relation_ids.device)
-            + self.scalar_sincos(relation_pos)
+            + self.position_vector(relation_pos)
         )
         query = self.query_norm(state + relation)
         return F.normalize(query, dim=-1)
@@ -258,7 +283,7 @@ class SemanticMemoryModel(nn.Module):
             relation = (
                 self.relation_embedding(relation_ids[:, step])
                 + self.role_vector("relation", relation_ids.shape[0], relation_ids.device)
-                + self.scalar_sincos(relation_pos)
+                + self.position_vector(relation_pos)
             )
             query = F.normalize(self.query_norm(state + relation), dim=-1)
             slot_scores = query @ keys.T / self.temperature
@@ -321,10 +346,8 @@ class SemanticMemoryModel(nn.Module):
         )
         relation_vectors = (
             self.relation_embedding(relation_ids)
-            + self.role_embedding(
-                torch.full((len(event.relations),), ROLE_TO_INDEX["relation"], dtype=torch.long, device=device)
-            )
-            + self.scalar_sincos(relation_positions)
+            + self.role_vector("relation", len(event.relations), device)
+            + self.position_vector(relation_positions)
         )
         source_id = torch.tensor([SOURCE_TO_INDEX[event.source]], dtype=torch.long, device=device)
         evidence_id = torch.tensor([min(MAX_EVIDENCE_INDEX, event.evidence)], dtype=torch.long, device=device)
@@ -334,7 +357,7 @@ class SemanticMemoryModel(nn.Module):
                 self.positioned_token(subject, "subject", event.subject_pos)[0],
                 relation_vectors.mean(dim=0),
                 self.positioned_token(target, "object", event.object_pos)[0],
-                self.scalar_sincos(time_value)[0] + self.role_vector("time", 1, device)[0],
+                self.position_vector(time_value)[0] + self.role_vector("time", 1, device)[0],
                 self.source_embedding(source_id)[0] + self.role_vector("source", 1, device)[0],
                 self.evidence_embedding(evidence_id)[0] + self.role_vector("evidence", 1, device)[0],
             ],
@@ -430,6 +453,8 @@ def make_model(
         temperature=args.temperature,
         max_parents=args.max_parents,
         parent_confidence_weight=args.parent_confidence_weight,
+        use_role_embeddings=not args.disable_role_embeddings,
+        use_position_encoding=not args.disable_position_encoding,
     ).to(device)
     if base_state is not None:
         model.load_state_dict({key: value.to(device) for key, value in base_state.items()}, strict=True)
@@ -741,7 +766,7 @@ def one_hop_query(
     relation = (
         model.relation_embedding(relation_id)
         + model.role_vector("relation", 1, device)
-        + model.scalar_sincos(relation_pos)
+        + model.position_vector(relation_pos)
     )
     return F.normalize(model.query_norm(state + relation), dim=-1)
 
@@ -788,7 +813,7 @@ def warmup_query_batch(
     relation = (
         model.relation_embedding(relation_ids)
         + model.role_vector("relation", len(events), device)
-        + model.scalar_sincos(relation_positions)
+        + model.position_vector(relation_positions)
     )
     queries = F.normalize(model.query_norm(state + relation), dim=-1)
     target_ids = torch.tensor([world.token_to_id[event.target] for event in events], dtype=torch.long, device=device)
@@ -1066,11 +1091,426 @@ def parent_training_batch(
     return queries.detach(), targets.detach()
 
 
+def event_target_code(
+    model: SemanticMemoryModel,
+    world: World,
+    event: SemanticEvent,
+    device: torch.device,
+) -> torch.Tensor:
+    target_id = torch.tensor([world.token_to_id[event.target]], dtype=torch.long, device=device)
+    return model.token_embedding(target_id)
+
+
+def memory_step(
+    model: SemanticMemoryModel,
+    state: torch.Tensor,
+    relation_ids: torch.Tensor,
+    relation_position: int,
+    disabled_slots: set[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if state.ndim != 2:
+        raise ValueError(f"state must be rank-2 [batch, d_model], got {tuple(state.shape)}.")
+    if relation_ids.ndim != 1:
+        raise ValueError(f"relation_ids must be rank-1 [batch], got {tuple(relation_ids.shape)}.")
+    if state.shape[0] != relation_ids.shape[0]:
+        raise ValueError("state and relation_ids batch size mismatch.")
+    if any(slot < 0 or slot >= model.num_slots for slot in disabled_slots):
+        raise ValueError(f"disabled_slots outside valid slot range: {sorted(disabled_slots)}.")
+
+    relation_pos = torch.full(
+        (relation_ids.shape[0],),
+        relation_position,
+        dtype=torch.float32,
+        device=relation_ids.device,
+    )
+    relation = (
+        model.relation_embedding(relation_ids)
+        + model.role_vector("relation", relation_ids.shape[0], relation_ids.device)
+        + model.position_vector(relation_pos)
+    )
+    query = F.normalize(model.query_norm(state + relation), dim=-1)
+    slot_scores = query @ model.normalized_keys().T / model.temperature
+    if disabled_slots:
+        mask = torch.zeros(model.num_slots, dtype=torch.bool, device=slot_scores.device)
+        mask[list(sorted(disabled_slots))] = True
+        slot_scores = slot_scores.masked_fill(mask.unsqueeze(0), torch.finfo(slot_scores.dtype).min)
+    slot_values = model.memory_values.unsqueeze(0).expand(query.shape[0], -1, -1)
+
+    if model.max_parents > 0 and bool(model.parent_active.any().item()):
+        active_parent_mask = model.active_parent_mask()
+        parent_keys = F.normalize(model.parent_keys[active_parent_mask], dim=-1)
+        parent_key_scores = query @ parent_keys.T
+        parent_values = (
+            query.unsqueeze(1) * model.parent_scale[active_parent_mask].unsqueeze(0)
+            + model.parent_bias[active_parent_mask].unsqueeze(0)
+        )
+        token_basis = F.normalize(model.token_embedding.weight, dim=-1)
+        parent_value_confidence = torch.einsum(
+            "bpd,vd->bpv",
+            F.normalize(parent_values, dim=-1),
+            token_basis,
+        ).max(dim=-1).values
+        parent_scores = (
+            parent_key_scores + model.parent_confidence_weight * parent_value_confidence
+        ) / model.temperature
+        scores = torch.cat([slot_scores, parent_scores], dim=1)
+        values = torch.cat([slot_values, parent_values], dim=1)
+    else:
+        scores = slot_scores
+        values = slot_values
+
+    attention = F.softmax(scores, dim=-1)
+    next_state = model.state_norm(torch.bmm(attention.unsqueeze(1), values).squeeze(1))
+    logits = next_state @ model.token_embedding.weight.T
+    return logits, next_state, query
+
+
+def parent_offset_loss(
+    model: SemanticMemoryModel,
+    parent_index: int,
+    queries: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    outputs = parent_output(model, parent_index, queries)
+    parent_offsets = outputs - queries
+    target_offsets = targets - queries
+    return (1.0 - F.cosine_similarity(parent_offsets, target_offsets, dim=-1)).mean()
+
+
+def parent_first_hop_loss(
+    model: SemanticMemoryModel,
+    parent_index: int,
+    queries: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    outputs = model.state_norm(parent_output(model, parent_index, queries))
+    return F.mse_loss(outputs, targets)
+
+
+def parent_anti_interference_loss(
+    model: SemanticMemoryModel,
+    world: World,
+    group: list[SemanticEvent],
+    active_facts: dict[tuple[str, tuple[str, ...]], SemanticEvent],
+    fact_slots: dict[tuple[str, tuple[str, ...]], int],
+    parent_index: int,
+    device: torch.device,
+    margin: float,
+) -> torch.Tensor:
+    if margin <= 0.0:
+        raise ValueError(f"margin must be positive, got {margin}.")
+    group_keys = {event.key for event in group}
+    losses: list[torch.Tensor] = []
+    parent_key = F.normalize(model.parent_keys[parent_index], dim=0)
+    token_basis = F.normalize(model.token_embedding.weight, dim=-1)
+    keys = model.normalized_keys()
+    for key, event in active_facts.items():
+        if key in group_keys or key not in fact_slots or not event.is_one_hop:
+            continue
+        slot_index = fact_slots[key]
+        if slot_index < 0 or slot_index >= model.num_slots:
+            raise ValueError(f"slot_index={slot_index} outside [0, {model.num_slots}).")
+        query = one_hop_query(model, world, event, device)
+        parent_value = parent_output(model, parent_index, query)
+        parent_confidence = (F.normalize(parent_value, dim=-1) @ token_basis.T).max(dim=1).values
+        parent_score = query @ parent_key + model.parent_confidence_weight * parent_confidence
+        correct_score = query @ keys[slot_index : slot_index + 1].T
+        losses.append(F.relu(margin + parent_score.squeeze(0) - correct_score.squeeze(0)).mean())
+    if not losses:
+        return torch.zeros((), dtype=model.memory_keys.dtype, device=device)
+    return torch.stack(losses).mean()
+
+
+def parent_dependent_composition_loss(
+    model: SemanticMemoryModel,
+    world: World,
+    group: list[SemanticEvent],
+    slots_to_free: list[int],
+    active_facts: dict[tuple[str, tuple[str, ...]], SemanticEvent],
+    parent_index: int,
+    device: torch.device,
+    lambda_closure: float,
+) -> torch.Tensor:
+    if lambda_closure < 0.0:
+        raise ValueError(f"lambda_closure must be non-negative, got {lambda_closure}.")
+    group_keys = {event.key for event in group}
+    disabled_slots = set(slots_to_free)
+    losses: list[torch.Tensor] = []
+    for composition_event, first, _second in dependent_composition_events(active_facts, group):
+        second_relation = composition_event.relations[1]
+        second_relation_id = torch.tensor(
+            [world.relation_to_id[second_relation]],
+            dtype=torch.long,
+            device=device,
+        )
+        target_id = torch.tensor([world.token_to_id[composition_event.target]], dtype=torch.long, device=device)
+        if first.key in group_keys:
+            first_query = one_hop_query(model, world, first, device)
+            first_state = model.state_norm(parent_output(model, parent_index, first_query))
+        else:
+            first_subject_id = torch.tensor([world.token_to_id[first.subject]], dtype=torch.long, device=device)
+            first_relation_id = torch.tensor(
+                [[world.relation_to_id[first.relations[0]]]],
+                dtype=torch.long,
+                device=device,
+            )
+            _, first_diagnostics = model(first_subject_id, first_relation_id)
+            first_state = first_diagnostics["state"]
+
+        logits, second_state, _ = memory_step(
+            model,
+            first_state,
+            second_relation_id,
+            relation_position=2,
+            disabled_slots=disabled_slots,
+        )
+        target_code = model.token_embedding(target_id)
+        losses.append(F.cross_entropy(logits, target_id) + lambda_closure * F.mse_loss(second_state, target_code))
+    if not losses:
+        return torch.zeros((), dtype=model.memory_keys.dtype, device=device)
+    return torch.stack(losses).mean()
+
+
+@torch.no_grad()
+def safe_mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(np.mean(np.asarray(values, dtype=np.float64)))
+
+
+def composition_event_dependencies(
+    active_facts: dict[tuple[str, tuple[str, ...]], SemanticEvent],
+    composition_event: SemanticEvent,
+) -> tuple[SemanticEvent, SemanticEvent] | None:
+    if len(composition_event.relations) != 2:
+        return None
+    first_key = (composition_event.subject, (composition_event.relations[0],))
+    first = active_facts.get(first_key)
+    if first is None:
+        return None
+    second_key = (first.target, (composition_event.relations[1],))
+    second = active_facts.get(second_key)
+    if second is None:
+        return None
+    return first, second
+
+
+def dependent_composition_events(
+    active_facts: dict[tuple[str, tuple[str, ...]], SemanticEvent],
+    group: list[SemanticEvent],
+) -> list[tuple[SemanticEvent, SemanticEvent, SemanticEvent]]:
+    group_keys = {event.key for event in group}
+    dependent: list[tuple[SemanticEvent, SemanticEvent, SemanticEvent]] = []
+    for composition_event in active_composition_events(active_facts):
+        dependencies = composition_event_dependencies(active_facts, composition_event)
+        if dependencies is None:
+            continue
+        first, second = dependencies
+        if first.key in group_keys or second.key in group_keys:
+            dependent.append((composition_event, first, second))
+    return dependent
+
+
+@torch.no_grad()
+def consolidation_attempt_diagnostics(
+    before_model: SemanticMemoryModel,
+    after_model: SemanticMemoryModel,
+    world: World,
+    group: list[SemanticEvent],
+    slots_to_free: list[int],
+    parent_index: int,
+    active_facts: dict[tuple[str, tuple[str, ...]], SemanticEvent],
+    device: torch.device,
+    accepted: bool,
+    candidate_active_acc: float,
+    candidate_composition_acc: float,
+    candidate_group_acc: float,
+    before_active_acc: float,
+    before_composition_acc: float,
+) -> dict[str, Any]:
+    if len(group) < 2:
+        raise ValueError("Consolidation diagnostics require at least two grouped events.")
+    queries, targets = parent_training_batch(after_model, world, group, device)
+    outputs = parent_output(after_model, parent_index, queries)
+    parent_key = F.normalize(after_model.parent_keys[parent_index], dim=0)
+    target_offsets = targets - queries
+    parent_offsets = outputs - queries
+
+    own_target_cosines = F.cosine_similarity(outputs, targets, dim=-1).detach().cpu().tolist()
+    offset_cosines = F.cosine_similarity(parent_offsets, target_offsets, dim=-1).detach().cpu().tolist()
+    offset_norm_ratios = (
+        parent_offsets.norm(dim=-1) / (target_offsets.norm(dim=-1) + 1e-8)
+    ).detach().cpu().tolist()
+    key_cosines = (queries @ parent_key).detach().cpu().tolist()
+    query_pair_cosine = None
+    if len(group) == 2:
+        query_pair_cosine = float(F.cosine_similarity(queries[0:1], queries[1:2], dim=-1).item())
+
+    target_basis = F.normalize(targets, dim=-1)
+    output_basis = F.normalize(outputs, dim=-1)
+    output_to_target = output_basis @ target_basis.T
+    own_vs_other_margins: list[float] = []
+    own_slot_cosines: list[float] = []
+    other_slot_cosines: list[float] = []
+    for index, slot_index in enumerate(slots_to_free):
+        own = float(output_to_target[index, index].item())
+        others = [
+            float(output_to_target[index, other_index].item())
+            for other_index in range(len(group))
+            if other_index != index
+        ]
+        if others:
+            own_vs_other_margins.append(own - max(others))
+        before_slot_value = before_model.memory_values[slot_index].unsqueeze(0)
+        own_slot_cosines.append(
+            float(F.cosine_similarity(outputs[index : index + 1], before_slot_value, dim=-1).item())
+        )
+        other_slot_values = [
+            before_model.memory_values[other_slot].unsqueeze(0)
+            for other_slot_index, other_slot in enumerate(slots_to_free)
+            if other_slot_index != index
+        ]
+        if other_slot_values:
+            other_cosines = [
+                float(F.cosine_similarity(outputs[index : index + 1], other_slot_value, dim=-1).item())
+                for other_slot_value in other_slot_values
+            ]
+            other_slot_cosines.append(max(other_cosines))
+
+    before_direct_closures = [evaluate_closure(before_model, world, event, device) for event in group]
+    after_direct_closures = [evaluate_closure(after_model, world, event, device) for event in group]
+    dependent = dependent_composition_events(active_facts, group)
+    before_comp_accs: list[float] = []
+    after_comp_accs: list[float] = []
+    before_comp_closures: list[float] = []
+    after_comp_closures: list[float] = []
+    before_first_hop_closures: list[float] = []
+    after_first_hop_closures: list[float] = []
+    for composition_event, first, _second in dependent:
+        before_comp_accs.append(evaluate_events(before_model, world, [composition_event], device))
+        after_comp_accs.append(evaluate_events(after_model, world, [composition_event], device))
+        before_comp_closures.append(evaluate_closure(before_model, world, composition_event, device))
+        after_comp_closures.append(evaluate_closure(after_model, world, composition_event, device))
+        before_first_hop_closures.append(evaluate_closure(before_model, world, first, device))
+        after_first_hop_closures.append(evaluate_closure(after_model, world, first, device))
+
+    relation_types = [event.relations[0] for event in group]
+    return {
+        "accepted": accepted,
+        "group_events": [event.name for event in group],
+        "group_keys": [str(event.key) for event in group],
+        "relation_types": relation_types,
+        "same_relation": len(set(relation_types)) == 1,
+        "slots_to_free": [int(slot) for slot in slots_to_free],
+        "parent_index": int(parent_index),
+        "candidate_active_acc": candidate_active_acc,
+        "candidate_composition_acc": candidate_composition_acc,
+        "candidate_group_acc": candidate_group_acc,
+        "before_active_acc": before_active_acc,
+        "before_composition_acc": before_composition_acc,
+        "query_pair_cosine": query_pair_cosine,
+        "parent_key_cosine_mean": safe_mean([float(value) for value in key_cosines]),
+        "parent_key_cosine_min": None if not key_cosines else float(min(key_cosines)),
+        "parent_key_cosine_max": None if not key_cosines else float(max(key_cosines)),
+        "parent_output_target_cosine_mean": safe_mean([float(value) for value in own_target_cosines]),
+        "parent_output_target_cosine_min": None if not own_target_cosines else float(min(own_target_cosines)),
+        "parent_output_own_vs_other_target_margin_mean": safe_mean(own_vs_other_margins),
+        "parent_output_own_slot_cosine_mean": safe_mean(own_slot_cosines),
+        "parent_output_other_slot_cosine_mean": safe_mean(other_slot_cosines),
+        "offset_cosine_mean": safe_mean([float(value) for value in offset_cosines]),
+        "offset_cosine_min": None if not offset_cosines else float(min(offset_cosines)),
+        "offset_norm_ratio_mean": safe_mean([float(value) for value in offset_norm_ratios]),
+        "before_direct_closure_mean": safe_mean(before_direct_closures),
+        "after_direct_closure_mean": safe_mean(after_direct_closures),
+        "direct_closure_delta_mean": safe_mean(
+            [
+                after_value - before_value
+                for before_value, after_value in zip(before_direct_closures, after_direct_closures)
+            ]
+        ),
+        "dependent_composition_count": len(dependent),
+        "before_dependent_composition_acc_mean": safe_mean(before_comp_accs),
+        "after_dependent_composition_acc_mean": safe_mean(after_comp_accs),
+        "before_dependent_composition_closure_mean": safe_mean(before_comp_closures),
+        "after_dependent_composition_closure_mean": safe_mean(after_comp_closures),
+        "dependent_composition_closure_delta_mean": safe_mean(
+            [
+                after_value - before_value
+                for before_value, after_value in zip(before_comp_closures, after_comp_closures)
+            ]
+        ),
+        "before_first_hop_closure_mean": safe_mean(before_first_hop_closures),
+        "after_first_hop_closure_mean": safe_mean(after_first_hop_closures),
+        "first_hop_closure_delta_mean": safe_mean(
+            [
+                after_value - before_value
+                for before_value, after_value in zip(before_first_hop_closures, after_first_hop_closures)
+            ]
+        ),
+    }
+
+
+def none_or_leq(value: float | None, limit: float) -> bool:
+    return value is None or value <= limit
+
+
+def none_or_geq(value: float | None, limit: float) -> bool:
+    return value is None or value >= limit
+
+
+def consolidation_admission_safe(
+    args: argparse.Namespace,
+    group: list[SemanticEvent],
+    active_acc: float,
+    composition_acc: float,
+    group_acc: float,
+    before_active: float,
+    before_composition: float,
+    diagnostic: dict[str, Any] | None,
+) -> bool:
+    current_safe = (
+        active_acc + 1e-9 >= before_active
+        and composition_acc + 1e-9 >= before_composition
+        and group_acc >= args.commit_acc_threshold
+    )
+    if args.consolidation_admission == "current":
+        return current_safe
+
+    relation_types = [event.relations[0] for event in group]
+    same_relation = len(set(relation_types)) == 1
+    if args.consolidation_admission == "same_relation":
+        return current_safe and same_relation
+
+    if args.consolidation_admission != "composition_preserving":
+        raise ValueError(f"Unknown consolidation admission mode {args.consolidation_admission!r}.")
+    if diagnostic is None:
+        raise RuntimeError("composition_preserving admission requires consolidation diagnostics.")
+
+    return (
+        current_safe
+        and none_or_geq(diagnostic["offset_cosine_mean"], args.consolidation_min_offset_cosine)
+        and none_or_leq(
+            diagnostic["direct_closure_delta_mean"],
+            args.consolidation_max_direct_closure_delta,
+        )
+        and none_or_leq(
+            diagnostic["first_hop_closure_delta_mean"],
+            args.consolidation_max_first_hop_closure_delta,
+        )
+        and none_or_leq(
+            diagnostic["dependent_composition_closure_delta_mean"],
+            args.consolidation_max_dependent_composition_closure_delta,
+        )
+    )
+
+
 def train_parent_candidate(
     model: SemanticMemoryModel,
     world: World,
     group: list[SemanticEvent],
     slots_to_free: list[int],
+    active_facts: dict[tuple[str, tuple[str, ...]], SemanticEvent],
+    fact_slots: dict[tuple[str, tuple[str, ...]], int],
     parent_index: int,
     device: torch.device,
     args: argparse.Namespace,
@@ -1115,6 +1555,42 @@ def train_parent_candidate(
         max_wrong = torch.cat(wrong_scores, dim=1).max(dim=1).values
         margin_loss = F.relu(args.consolidation_margin + max_wrong - parent_scores).mean()
         loss = reconstruction_loss + cosine_loss + margin_loss
+        if args.parent_offset_weight > 0.0:
+            loss = loss + args.parent_offset_weight * parent_offset_loss(
+                shadow,
+                parent_index,
+                queries,
+                targets,
+            )
+        if args.parent_first_hop_weight > 0.0:
+            loss = loss + args.parent_first_hop_weight * parent_first_hop_loss(
+                shadow,
+                parent_index,
+                queries,
+                targets,
+            )
+        if args.parent_composition_weight > 0.0:
+            loss = loss + args.parent_composition_weight * parent_dependent_composition_loss(
+                shadow,
+                world,
+                group,
+                slots_to_free,
+                active_facts,
+                parent_index,
+                device,
+                args.lambda_closure,
+            )
+        if args.parent_anti_interference_weight > 0.0:
+            loss = loss + args.parent_anti_interference_weight * parent_anti_interference_loss(
+                shadow,
+                world,
+                group,
+                active_facts,
+                fact_slots,
+                parent_index,
+                device,
+                args.consolidation_margin,
+            )
         if not torch.isfinite(loss).item():
             raise FloatingPointError("Non-finite consolidation loss.")
         loss.backward()
@@ -1145,6 +1621,103 @@ def candidate_group_pairs(
     return groups
 
 
+def same_relation_group(group: list[SemanticEvent]) -> bool:
+    if not group:
+        raise ValueError("Cannot check relation homogeneity for an empty group.")
+    relation_types = [event.relations[0] for event in group]
+    return len(set(relation_types)) == 1
+
+
+@torch.no_grad()
+def group_geometry_score(
+    model: SemanticMemoryModel,
+    world: World,
+    group: list[SemanticEvent],
+    device: torch.device,
+) -> tuple[float, float]:
+    queries, targets = parent_training_batch(model, world, group, device)
+    if queries.shape[0] < 2:
+        raise ValueError("Group geometry score requires at least two events.")
+    normalized_queries = F.normalize(queries, dim=-1)
+    normalized_offsets = F.normalize(targets - queries, dim=-1)
+    query_similarities: list[float] = []
+    offset_similarities: list[float] = []
+    for left_index in range(queries.shape[0]):
+        for right_index in range(left_index + 1, queries.shape[0]):
+            query_similarities.append(
+                float(
+                    F.cosine_similarity(
+                        normalized_queries[left_index : left_index + 1],
+                        normalized_queries[right_index : right_index + 1],
+                        dim=-1,
+                    ).item()
+                )
+            )
+            offset_similarities.append(
+                float(
+                    F.cosine_similarity(
+                        normalized_offsets[left_index : left_index + 1],
+                        normalized_offsets[right_index : right_index + 1],
+                        dim=-1,
+                    ).item()
+                )
+            )
+    if not query_similarities or not offset_similarities:
+        raise RuntimeError("Group geometry scoring produced no pairwise similarities.")
+    return (
+        float(np.mean(np.asarray(offset_similarities, dtype=np.float64))),
+        float(np.mean(np.asarray(query_similarities, dtype=np.float64))),
+    )
+
+
+def order_consolidation_groups(
+    groups: list[tuple[list[SemanticEvent], list[int]]],
+    model: SemanticMemoryModel,
+    world: World,
+    device: torch.device,
+    order: str,
+) -> list[tuple[list[SemanticEvent], list[int]]]:
+    if order not in CONSOLIDATION_GROUP_ORDERS:
+        raise ValueError(f"Unknown consolidation group order {order!r}.")
+    if order == "current":
+        return groups
+    indexed_groups = list(enumerate(groups))
+    if order == "same_relation_first":
+        return [
+            group
+            for _index, group in sorted(
+                indexed_groups,
+                key=lambda item: (0 if same_relation_group(item[1][0]) else 1, item[0]),
+            )
+        ]
+    if order == "geometry":
+        scored: list[tuple[int, tuple[list[SemanticEvent], list[int]], bool, float, float]] = []
+        for index, group_pair in indexed_groups:
+            offset_similarity, query_similarity = group_geometry_score(model, world, group_pair[0], device)
+            scored.append(
+                (
+                    index,
+                    group_pair,
+                    same_relation_group(group_pair[0]),
+                    offset_similarity,
+                    query_similarity,
+                )
+            )
+        return [
+            group_pair
+            for index, group_pair, is_same_relation, offset_similarity, query_similarity in sorted(
+                scored,
+                key=lambda item: (
+                    0 if item[2] else 1,
+                    -item[3],
+                    -item[4],
+                    item[0],
+                ),
+            )
+        ]
+    raise ValueError(f"Unhandled consolidation group order {order!r}.")
+
+
 def try_dynamic_consolidation(
     model: SemanticMemoryModel,
     world: World,
@@ -1155,6 +1728,7 @@ def try_dynamic_consolidation(
     device: torch.device,
     args: argparse.Namespace,
     stats: ConsolidationStats,
+    record_diagnostics: bool,
 ) -> SemanticMemoryModel:
     if not args.enable_consolidation:
         return model
@@ -1167,35 +1741,83 @@ def try_dynamic_consolidation(
     if not groups:
         stats.rejected += 1
         return model
+    groups = order_consolidation_groups(groups, model, world, device, args.consolidation_group_order)
     groups = groups[: args.consolidation_max_candidates]
 
     before_active = evaluate_events(model, world, list(active_facts.values()), device)
     before_composition = evaluate_events(model, world, active_composition_events(active_facts), device)
     best_model: SemanticMemoryModel | None = None
     best_slots: list[int] = []
+    best_diagnostic_index: int | None = None
     best_score = -float("inf")
 
     for group, slots_to_free in groups:
         stats.attempts += 1
-        candidate = train_parent_candidate(model, world, group, slots_to_free, parent_index, device, args)
+        candidate = train_parent_candidate(
+            model,
+            world,
+            group,
+            slots_to_free,
+            active_facts,
+            fact_slots,
+            parent_index,
+            device,
+            args,
+        )
         active_acc = evaluate_events(candidate, world, list(active_facts.values()), device)
         composition_acc = evaluate_events(candidate, world, active_composition_events(active_facts), device)
         group_acc = evaluate_events(candidate, world, group, device)
         score = active_acc + composition_acc + group_acc + 0.01 * len(set(slots_to_free))
-        safe = (
-            active_acc + 1e-9 >= before_active
-            and composition_acc + 1e-9 >= before_composition
-            and group_acc >= args.commit_acc_threshold
+        needs_diagnostic = record_diagnostics or args.consolidation_admission == "composition_preserving"
+        diagnostic: dict[str, Any] | None = None
+        diagnostic_index: int | None = None
+        if needs_diagnostic:
+            diagnostic = consolidation_attempt_diagnostics(
+                before_model=model,
+                after_model=candidate,
+                world=world,
+                group=group,
+                slots_to_free=slots_to_free,
+                parent_index=parent_index,
+                active_facts=active_facts,
+                device=device,
+                accepted=False,
+                candidate_active_acc=active_acc,
+                candidate_composition_acc=composition_acc,
+                candidate_group_acc=group_acc,
+                before_active_acc=before_active,
+                before_composition_acc=before_composition,
+            )
+        safe = consolidation_admission_safe(
+            args=args,
+            group=group,
+            active_acc=active_acc,
+            composition_acc=composition_acc,
+            group_acc=group_acc,
+            before_active=before_active,
+            before_composition=before_composition,
+            diagnostic=diagnostic,
         )
+        if record_diagnostics:
+            if diagnostic is None:
+                raise RuntimeError("Expected consolidation diagnostic when record_diagnostics is enabled.")
+            diagnostic["safe"] = safe
+            diagnostic["score"] = score
+            diagnostic["admission"] = args.consolidation_admission
+            diagnostic_index = len(stats.diagnostics)
+            stats.diagnostics.append(diagnostic)
         if safe and score > best_score:
             best_score = score
             best_model = candidate
             best_slots = sorted(set(slots_to_free))
+            best_diagnostic_index = diagnostic_index
 
     if best_model is None:
         stats.rejected += 1
         return model
 
+    if best_diagnostic_index is not None:
+        stats.diagnostics[best_diagnostic_index]["accepted"] = True
     for slot_index in best_slots:
         owner = slot_owners[slot_index]
         if owner is not None:
@@ -1451,27 +2073,66 @@ def scalar_sincos_list(value: float, dim: int = 8) -> list[float]:
     return [float(x) for x in encoded[:dim]]
 
 
-def event_numeric_context(world: World, event: SemanticEvent) -> list[float]:
+def append_scalar_feature(context: list[float], value: float, enabled: bool, dim: int = 8) -> None:
+    if enabled:
+        context.extend(scalar_sincos_list(value, dim=dim))
+    else:
+        context.extend([0.0] * dim)
+
+
+def event_numeric_context(world: World, event: SemanticEvent, args: argparse.Namespace) -> list[float]:
     if event.source not in SOURCE_TO_INDEX:
         raise ValueError(f"Unknown event source {event.source!r}.")
     relation_ids = [world.relation_to_id[relation] for relation in event.relations]
     if not relation_ids:
         raise ValueError(f"Event {event.name} has no relation ids.")
-    scalars = (
-        float(world.token_to_id[event.subject]),
-        float(world.token_to_id[event.target]),
-        float(np.mean(relation_ids)),
-        float(len(relation_ids)),
-        float(event.subject_pos),
-        float(event.relation_pos),
-        float(event.object_pos),
-        float(event.timestamp),
-        float(SOURCE_TO_INDEX[event.source]),
-        float(min(MAX_EVIDENCE_INDEX, event.evidence)),
-    )
     context: list[float] = []
-    for scalar in scalars:
-        context.extend(scalar_sincos_list(scalar, dim=8))
+    append_scalar_feature(
+        context,
+        float(world.token_to_id[event.subject]),
+        enabled=not args.disable_policy_identity_features,
+    )
+    append_scalar_feature(
+        context,
+        float(world.token_to_id[event.target]),
+        enabled=not args.disable_policy_identity_features,
+    )
+    append_scalar_feature(
+        context,
+        float(np.mean(relation_ids)),
+        enabled=not args.disable_policy_identity_features,
+    )
+    append_scalar_feature(
+        context,
+        float(len(relation_ids)),
+        enabled=not args.disable_policy_identity_features,
+    )
+    append_scalar_feature(
+        context,
+        float(event.subject_pos),
+        enabled=not args.disable_policy_position_features,
+    )
+    append_scalar_feature(
+        context,
+        float(event.relation_pos),
+        enabled=not args.disable_policy_position_features,
+    )
+    append_scalar_feature(
+        context,
+        float(event.object_pos),
+        enabled=not args.disable_policy_position_features,
+    )
+    append_scalar_feature(context, float(event.timestamp), enabled=not args.disable_policy_time_features)
+    append_scalar_feature(
+        context,
+        float(SOURCE_TO_INDEX[event.source]),
+        enabled=not args.disable_policy_source_features,
+    )
+    append_scalar_feature(
+        context,
+        float(min(MAX_EVIDENCE_INDEX, event.evidence)),
+        enabled=not args.disable_policy_evidence_features,
+    )
     return context
 
 
@@ -1480,6 +2141,7 @@ def candidate_feature_vector(
     event: SemanticEvent,
     world: World,
     num_slots: int,
+    args: argparse.Namespace,
 ) -> list[float]:
     if candidate.action not in ACTION_TO_INDEX:
         raise ValueError(f"Unknown candidate action {candidate.action!r}.")
@@ -1489,7 +2151,7 @@ def candidate_feature_vector(
     value_cosine = -1.0 if candidate.value_cosine is None else candidate.value_cosine
     target_attention = -1.0 if candidate.target_attention is None else candidate.target_attention
     attention_margin = -1.0 if candidate.attention_margin is None else candidate.attention_margin
-    event_context = event_numeric_context(world, event)
+    event_context = event_numeric_context(world, event, args)
     action_features = [0.0] * len(ACTIONS)
     action_features[ACTION_TO_INDEX[candidate.action]] = 1.0
     return action_features + [
@@ -1513,10 +2175,11 @@ def candidate_feature_tensor(
     world: World,
     num_slots: int,
     device: torch.device,
+    args: argparse.Namespace,
 ) -> torch.Tensor:
     if not candidates:
         raise ValueError("Cannot featurize an empty candidate list.")
-    rows = [candidate_feature_vector(candidate, event, world, num_slots) for candidate in candidates]
+    rows = [candidate_feature_vector(candidate, event, world, num_slots, args) for candidate in candidates]
     return torch.tensor(rows, dtype=torch.float32, device=device)
 
 
@@ -1624,9 +2287,10 @@ def collect_policy_examples(
                     device,
                     args,
                     consolidation_stats,
+                    record_diagnostics=False,
                 )
             candidates = build_candidates(model, world, event, belief_facts, slot_use, device, args)
-            features = candidate_feature_tensor(candidates, event, world, args.num_slots, device)
+            features = candidate_feature_tensor(candidates, event, world, args.num_slots, device, args)
             target_index = teacher_candidate_index(event, candidates)
             examples.append((features.detach().cpu(), target_index))
             teacher = candidates[target_index]
@@ -1677,8 +2341,9 @@ def choose_with_policy(
     world: World,
     num_slots: int,
     device: torch.device,
+    args: argparse.Namespace,
 ) -> CandidateResult:
-    features = candidate_feature_tensor(candidates, event, world, num_slots, device)
+    features = candidate_feature_tensor(candidates, event, world, num_slots, device, args)
     logits = policy(features)
     chosen_index = int(logits.argmax().item())
     return candidates[chosen_index]
@@ -1712,6 +2377,7 @@ def run_geometry_reasoner(
                 device,
                 args,
                 consolidation_stats,
+                record_diagnostics=args.record_consolidation_diagnostics,
             )
         candidates = build_candidates(model, world, event, active_facts, slot_use, device, args)
         chosen = choose_candidate(event, active_facts, candidates, args.commit_acc_threshold)
@@ -1756,6 +2422,7 @@ def run_geometry_reasoner(
         "final_slot_use": [float(value) for value in slot_use.detach().cpu().tolist()],
         "final_parent_count": model.active_parent_count(),
         "consolidation": consolidation_stats.to_dict(),
+        "consolidation_diagnostics": consolidation_stats.diagnostics,
         "rows": rows,
     }
 
@@ -1790,9 +2457,10 @@ def run_learned_policy_reasoner(
                 device,
                 args,
                 consolidation_stats,
+                record_diagnostics=args.record_consolidation_diagnostics,
             )
         candidates = build_candidates(model, world, event, belief_facts, slot_use, device, args)
-        chosen = choose_with_policy(policy, candidates, event, model, world, args.num_slots, device)
+        chosen = choose_with_policy(policy, candidates, event, model, world, args.num_slots, device, args)
         action_ok = chosen.action == event.expected_action
 
         model = chosen.model
@@ -1836,6 +2504,7 @@ def run_learned_policy_reasoner(
         "final_slot_use": [float(value) for value in slot_use.detach().cpu().tolist()],
         "final_parent_count": model.active_parent_count(),
         "consolidation": consolidation_stats.to_dict(),
+        "consolidation_diagnostics": consolidation_stats.diagnostics,
         "rows": rows,
     }
 
@@ -1906,6 +2575,48 @@ def mean_std(values: list[float]) -> str:
     return f"{array.mean():.4f} +/- {array.std():.4f}"
 
 
+def optional_float_mean(rows: list[dict[str, Any]], key: str) -> float | None:
+    values = [float(row[key]) for row in rows if row.get(key) is not None]
+    if not values:
+        return None
+    return float(np.mean(np.asarray(values, dtype=np.float64)))
+
+
+def consolidation_diagnostic_summary(reports: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    by_method: dict[str, list[dict[str, Any]]] = {}
+    for report in reports:
+        diagnostics = report.get("consolidation_diagnostics", [])
+        if diagnostics:
+            by_method.setdefault(str(report["method"]), []).extend(diagnostics)
+
+    summary: dict[str, dict[str, Any]] = {}
+    for method, diagnostics in by_method.items():
+        same_relation = [row for row in diagnostics if row["same_relation"]]
+        mixed_relation = [row for row in diagnostics if not row["same_relation"]]
+        accepted = [row for row in diagnostics if row["accepted"]]
+        summary[method] = {
+            "attempts": len(diagnostics),
+            "accepted": len(accepted),
+            "same_relation_attempts": len(same_relation),
+            "same_relation_accepted": sum(1 for row in same_relation if row["accepted"]),
+            "mixed_relation_attempts": len(mixed_relation),
+            "mixed_relation_accepted": sum(1 for row in mixed_relation if row["accepted"]),
+            "offset_cosine_mean": optional_float_mean(diagnostics, "offset_cosine_mean"),
+            "accepted_offset_cosine_mean": optional_float_mean(accepted, "offset_cosine_mean"),
+            "direct_closure_delta_mean": optional_float_mean(diagnostics, "direct_closure_delta_mean"),
+            "dependent_composition_closure_delta_mean": optional_float_mean(
+                diagnostics,
+                "dependent_composition_closure_delta_mean",
+            ),
+            "first_hop_closure_delta_mean": optional_float_mean(diagnostics, "first_hop_closure_delta_mean"),
+            "after_dependent_composition_acc_mean": optional_float_mean(
+                diagnostics,
+                "after_dependent_composition_acc_mean",
+            ),
+        }
+    return summary
+
+
 def summarize(reports: list[dict[str, Any]]) -> dict[str, Any]:
     if not reports:
         raise ValueError("No reports to summarize.")
@@ -1968,7 +2679,11 @@ def summarize(reports: list[dict[str, Any]]) -> dict[str, Any]:
             "attention_margin": None if not attention_margins else float(np.mean(attention_margins)),
         }
 
-    return {"methods": summary, "geometry_events": event_summary}
+    return {
+        "methods": summary,
+        "geometry_events": event_summary,
+        "consolidation_diagnostics": consolidation_diagnostic_summary(reports),
+    }
 
 
 def print_summary(report: dict[str, Any]) -> None:
@@ -2007,6 +2722,35 @@ def print_summary(report: dict[str, Any]) -> None:
             f"{metrics['active_acc']:<8.3f} "
             f"{metrics['closure']:<8.4f}"
         )
+    if summary["consolidation_diagnostics"]:
+        print("-" * 124)
+        print("CONSOLIDATION DIAGNOSTICS")
+        print("-" * 124)
+        print(
+            f"{'method':<28} {'attempts':<9} {'accepted':<9} "
+            f"{'same_acc':<10} {'mixed_acc':<10} {'offset_cos':<12} "
+            f"{'dep_comp_acc':<13}"
+        )
+        for method, metrics in summary["consolidation_diagnostics"].items():
+            same_attempts = int(metrics["same_relation_attempts"])
+            mixed_attempts = int(metrics["mixed_relation_attempts"])
+            same_accept_rate = (
+                "n/a" if same_attempts == 0 else f"{metrics['same_relation_accepted'] / same_attempts:.3f}"
+            )
+            mixed_accept_rate = (
+                "n/a" if mixed_attempts == 0 else f"{metrics['mixed_relation_accepted'] / mixed_attempts:.3f}"
+            )
+            offset = metrics["accepted_offset_cosine_mean"]
+            dep_acc = metrics["after_dependent_composition_acc_mean"]
+            print(
+                f"{method:<28} "
+                f"{metrics['attempts']:<9} "
+                f"{metrics['accepted']:<9} "
+                f"{same_accept_rate:<10} "
+                f"{mixed_accept_rate:<10} "
+                f"{'n/a' if offset is None else f'{offset:.3f}':<12} "
+                f"{'n/a' if dep_acc is None else f'{dep_acc:.3f}':<13}"
+            )
     print("=" * 124)
 
 
@@ -2039,6 +2783,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--consolidation-lr", type=float, default=1e-2)
     parser.add_argument("--consolidation-margin", type=float, default=0.25)
     parser.add_argument("--consolidation-max-candidates", type=int, default=6)
+    parser.add_argument("--consolidation-group-order", choices=CONSOLIDATION_GROUP_ORDERS, default="current")
+    parser.add_argument("--consolidation-admission", choices=CONSOLIDATION_ADMISSIONS, default="current")
+    parser.add_argument("--consolidation-min-offset-cosine", type=float, default=0.85)
+    parser.add_argument("--consolidation-max-direct-closure-delta", type=float, default=0.0)
+    parser.add_argument("--consolidation-max-first-hop-closure-delta", type=float, default=0.0)
+    parser.add_argument("--consolidation-max-dependent-composition-closure-delta", type=float, default=0.0)
+    parser.add_argument("--parent-offset-weight", type=float, default=0.0)
+    parser.add_argument("--parent-first-hop-weight", type=float, default=0.0)
+    parser.add_argument("--parent-composition-weight", type=float, default=0.0)
+    parser.add_argument("--parent-anti-interference-weight", type=float, default=0.0)
+    parser.add_argument("--record-consolidation-diagnostics", action="store_true")
     parser.add_argument("--closure-penalty", type=float, default=0.1)
     parser.add_argument("--full-update-penalty", type=float, default=0.15)
     parser.add_argument("--commit-acc-threshold", type=float, default=0.999)
@@ -2048,10 +2803,78 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-lr", type=float, default=1e-3)
     parser.add_argument("--policy-hidden-dim", type=int, default=64)
     parser.add_argument("--include-rule-oracle", action="store_true")
+    parser.add_argument("--disable-role-embeddings", action="store_true")
+    parser.add_argument("--disable-position-encoding", action="store_true")
+    parser.add_argument("--disable-policy-identity-features", action="store_true")
+    parser.add_argument("--disable-policy-position-features", action="store_true")
+    parser.add_argument("--disable-policy-time-features", action="store_true")
+    parser.add_argument("--disable-policy-source-features", action="store_true")
+    parser.add_argument("--disable-policy-evidence-features", action="store_true")
+    parser.add_argument("--feature-ablation", action="store_true")
+    parser.add_argument("--feature-ablation-list", type=str, default=",".join(FEATURE_ABLATIONS))
+    parser.add_argument("--feature-ablation-include-blind", action="store_true")
+    parser.add_argument("--feature-ablation-include-diagnostics", action="store_true")
+    parser.add_argument("--skip-blind-adamw", action="store_true")
     parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cpu")
     parser.add_argument("--output-json", type=Path, default=Path("model/analysis/semantic-geometry-write-control.json"))
     parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args()
+
+
+def disabled_feature_names(args: argparse.Namespace) -> list[str]:
+    features: list[str] = []
+    if args.disable_role_embeddings:
+        features.append("role")
+    if args.disable_position_encoding:
+        features.append("position")
+    if args.disable_policy_identity_features:
+        features.append("policy_identity")
+    if args.disable_policy_position_features:
+        features.append("policy_position")
+    if args.disable_policy_time_features:
+        features.append("policy_time")
+    if args.disable_policy_source_features:
+        features.append("policy_source")
+    if args.disable_policy_evidence_features:
+        features.append("policy_evidence")
+    return features
+
+
+def parse_feature_ablation_list(raw: str) -> list[str]:
+    features = [feature.strip() for feature in raw.split(",") if feature.strip()]
+    if not features:
+        raise ValueError("--feature-ablation-list must contain at least one feature name.")
+    unknown = [feature for feature in features if feature not in FEATURE_ABLATIONS]
+    if unknown:
+        raise ValueError(
+            f"Unknown feature ablation(s): {unknown}. Available: {list(FEATURE_ABLATIONS)}."
+        )
+    if len(set(features)) != len(features):
+        raise ValueError(f"--feature-ablation-list contains duplicates: {features}.")
+    return features
+
+
+def args_with_feature_disabled(args: argparse.Namespace, feature: str) -> argparse.Namespace:
+    if feature not in FEATURE_ABLATIONS:
+        raise ValueError(f"Unknown feature ablation {feature!r}.")
+    variant = copy.copy(args)
+    if feature == "role":
+        variant.disable_role_embeddings = True
+    elif feature == "position":
+        variant.disable_position_encoding = True
+    elif feature == "policy_identity":
+        variant.disable_policy_identity_features = True
+    elif feature == "policy_position":
+        variant.disable_policy_position_features = True
+    elif feature == "policy_time":
+        variant.disable_policy_time_features = True
+    elif feature == "policy_source":
+        variant.disable_policy_source_features = True
+    elif feature == "policy_evidence":
+        variant.disable_policy_evidence_features = True
+    else:
+        raise ValueError(f"Unhandled feature ablation {feature!r}.")
+    return variant
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -2121,6 +2944,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--consolidation-max-candidates must be positive, got {args.consolidation_max_candidates}."
         )
+    if args.consolidation_min_offset_cosine < -1.0 or args.consolidation_min_offset_cosine > 1.0:
+        raise ValueError(
+            f"--consolidation-min-offset-cosine must be in [-1, 1], got {args.consolidation_min_offset_cosine}."
+        )
+    if args.parent_offset_weight < 0.0:
+        raise ValueError(f"--parent-offset-weight must be non-negative, got {args.parent_offset_weight}.")
+    if args.parent_first_hop_weight < 0.0:
+        raise ValueError(f"--parent-first-hop-weight must be non-negative, got {args.parent_first_hop_weight}.")
+    if args.parent_composition_weight < 0.0:
+        raise ValueError(f"--parent-composition-weight must be non-negative, got {args.parent_composition_weight}.")
+    if args.parent_anti_interference_weight < 0.0:
+        raise ValueError(
+            f"--parent-anti-interference-weight must be non-negative, got {args.parent_anti_interference_weight}."
+        )
     if args.policy_train_seed_count <= 0:
         raise ValueError(f"--policy-train-seed-count must be positive, got {args.policy_train_seed_count}.")
     if args.policy_train_seed_offset < 0:
@@ -2131,11 +2968,80 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--policy-lr must be positive, got {args.policy_lr}.")
     if args.policy_hidden_dim <= 0:
         raise ValueError(f"--policy-hidden-dim must be positive, got {args.policy_hidden_dim}.")
+    parse_feature_ablation_list(args.feature_ablation_list)
+    if args.feature_ablation and disabled_feature_names(args):
+        raise ValueError("--feature-ablation must be run without explicit --disable-* feature flags.")
 
 
-def main() -> None:
-    args = parse_args()
-    validate_args(args)
+def experiment_config(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "seed_count": args.seed_count,
+        "d_model": args.d_model,
+        "num_slots": args.num_slots,
+        "temperature": args.temperature,
+        "update_epochs": args.update_epochs,
+        "lr": args.lr,
+        "lambda_closure": args.lambda_closure,
+        "geometry_warmup": args.geometry_warmup,
+        "geometry_seed": args.geometry_seed,
+        "geometry_train_seed_count": args.geometry_train_seed_count,
+        "geometry_train_seed_offset": args.geometry_train_seed_offset,
+        "geometry_warmup_epochs": args.geometry_warmup_epochs,
+        "geometry_warmup_lr": args.geometry_warmup_lr,
+        "geometry_token_ce_weight": args.geometry_token_ce_weight,
+        "geometry_separation_weight": args.geometry_separation_weight,
+        "geometry_code_norm_weight": args.geometry_code_norm_weight,
+        "geometry_max_code_cosine": args.geometry_max_code_cosine,
+        "direct_write_weight": args.direct_write_weight,
+        "composition_write_weight": args.composition_write_weight,
+        "attention_margin": args.attention_margin,
+        "enable_consolidation": args.enable_consolidation,
+        "max_parents": args.max_parents,
+        "parent_confidence_weight": args.parent_confidence_weight,
+        "consolidation_epochs": args.consolidation_epochs,
+        "consolidation_lr": args.consolidation_lr,
+        "consolidation_margin": args.consolidation_margin,
+        "consolidation_max_candidates": args.consolidation_max_candidates,
+        "consolidation_group_order": args.consolidation_group_order,
+        "consolidation_admission": args.consolidation_admission,
+        "consolidation_min_offset_cosine": args.consolidation_min_offset_cosine,
+        "consolidation_max_direct_closure_delta": args.consolidation_max_direct_closure_delta,
+        "consolidation_max_first_hop_closure_delta": args.consolidation_max_first_hop_closure_delta,
+        "consolidation_max_dependent_composition_closure_delta": (
+            args.consolidation_max_dependent_composition_closure_delta
+        ),
+        "parent_offset_weight": args.parent_offset_weight,
+        "parent_first_hop_weight": args.parent_first_hop_weight,
+        "parent_composition_weight": args.parent_composition_weight,
+        "parent_anti_interference_weight": args.parent_anti_interference_weight,
+        "record_consolidation_diagnostics": args.record_consolidation_diagnostics,
+        "closure_penalty": args.closure_penalty,
+        "full_update_penalty": args.full_update_penalty,
+        "commit_acc_threshold": args.commit_acc_threshold,
+        "policy_train_seed_count": args.policy_train_seed_count,
+        "policy_train_seed_offset": args.policy_train_seed_offset,
+        "policy_epochs": args.policy_epochs,
+        "policy_lr": args.policy_lr,
+        "policy_hidden_dim": args.policy_hidden_dim,
+        "include_rule_oracle": args.include_rule_oracle,
+        "disable_role_embeddings": args.disable_role_embeddings,
+        "disable_position_encoding": args.disable_position_encoding,
+        "disable_policy_identity_features": args.disable_policy_identity_features,
+        "disable_policy_position_features": args.disable_policy_position_features,
+        "disable_policy_time_features": args.disable_policy_time_features,
+        "disable_policy_source_features": args.disable_policy_source_features,
+        "disable_policy_evidence_features": args.disable_policy_evidence_features,
+        "disabled_features": disabled_feature_names(args),
+        "feature_ablation": args.feature_ablation,
+        "feature_ablation_list": parse_feature_ablation_list(args.feature_ablation_list),
+        "feature_ablation_include_blind": args.feature_ablation_include_blind,
+        "feature_ablation_include_diagnostics": args.feature_ablation_include_diagnostics,
+        "skip_blind_adamw": args.skip_blind_adamw,
+        "device": args.device,
+    }
+
+
+def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     device = resolve_device(args.device)
     base_state, geometry_warmup_metrics = train_latent_geometry_base(args, device)
     policy = train_write_policy(args, device, base_state)
@@ -2146,56 +3052,86 @@ def main() -> None:
         reports.append(run_learned_policy_reasoner(seed, args, policy, base_state))
         if args.include_rule_oracle:
             reports.append(run_geometry_reasoner(seed, args, base_state))
-        reports.append(run_blind_adamw(seed, args, base_state))
+        if not args.skip_blind_adamw:
+            reports.append(run_blind_adamw(seed, args, base_state))
 
-    output = {
-        "config": {
-            "seed_count": args.seed_count,
-            "d_model": args.d_model,
-            "num_slots": args.num_slots,
-            "temperature": args.temperature,
-            "update_epochs": args.update_epochs,
-            "lr": args.lr,
-            "lambda_closure": args.lambda_closure,
-            "geometry_warmup": args.geometry_warmup,
-            "geometry_seed": args.geometry_seed,
-            "geometry_train_seed_count": args.geometry_train_seed_count,
-            "geometry_train_seed_offset": args.geometry_train_seed_offset,
-            "geometry_warmup_epochs": args.geometry_warmup_epochs,
-            "geometry_warmup_lr": args.geometry_warmup_lr,
-            "geometry_token_ce_weight": args.geometry_token_ce_weight,
-            "geometry_separation_weight": args.geometry_separation_weight,
-            "geometry_code_norm_weight": args.geometry_code_norm_weight,
-            "geometry_max_code_cosine": args.geometry_max_code_cosine,
-            "direct_write_weight": args.direct_write_weight,
-            "composition_write_weight": args.composition_write_weight,
-            "attention_margin": args.attention_margin,
-            "enable_consolidation": args.enable_consolidation,
-            "max_parents": args.max_parents,
-            "parent_confidence_weight": args.parent_confidence_weight,
-            "consolidation_epochs": args.consolidation_epochs,
-            "consolidation_lr": args.consolidation_lr,
-            "consolidation_margin": args.consolidation_margin,
-            "consolidation_max_candidates": args.consolidation_max_candidates,
-            "closure_penalty": args.closure_penalty,
-            "full_update_penalty": args.full_update_penalty,
-            "commit_acc_threshold": args.commit_acc_threshold,
-            "policy_train_seed_count": args.policy_train_seed_count,
-            "policy_train_seed_offset": args.policy_train_seed_offset,
-            "policy_epochs": args.policy_epochs,
-            "policy_lr": args.policy_lr,
-            "policy_hidden_dim": args.policy_hidden_dim,
-            "include_rule_oracle": args.include_rule_oracle,
-            "device": args.device,
-        },
+    return {
+        "config": experiment_config(args),
         "geometry_warmup": geometry_warmup_metrics,
         "seed_count": args.seed_count,
         "reports": reports,
         "summary": summarize(reports),
     }
+
+
+def print_feature_ablation_summary(output: dict[str, Any]) -> None:
+    print("\nSEMANTIC GEOMETRY FEATURE ABLATION SUMMARY")
+    print("=" * 124)
+    print(
+        f"{'variant':<24} {'disabled':<26} {'active_acc':<24} "
+        f"{'composition_acc':<24} {'action_acc':<24}"
+    )
+    print("-" * 124)
+    for variant in output["variants"]:
+        methods = variant["summary"]["methods"]
+        if "learned_policy" not in methods:
+            raise RuntimeError(f"Variant {variant['name']} has no learned_policy summary.")
+        metrics = methods["learned_policy"]
+        print(
+            f"{variant['name']:<24} "
+            f"{','.join(variant['disabled_features']) or 'none':<26} "
+            f"{metrics['final_active_acc']:<24} "
+            f"{metrics['final_composition_acc']:<24} "
+            f"{metrics['action_acc']:<24}"
+        )
+    print("=" * 124)
+
+
+def run_feature_ablation(args: argparse.Namespace) -> dict[str, Any]:
+    features = parse_feature_ablation_list(args.feature_ablation_list)
+    variants: list[dict[str, Any]] = []
+    variant_specs = [("baseline", args)] + [
+        (f"no_{feature}", args_with_feature_disabled(args, feature)) for feature in features
+    ]
+    for name, variant_args in tqdm(
+        variant_specs,
+        desc="feature ablations",
+        dynamic_ncols=True,
+        disable=args.no_progress,
+    ):
+        current_args = copy.copy(variant_args)
+        current_args.feature_ablation = False
+        current_args.skip_blind_adamw = not args.feature_ablation_include_blind
+        if not args.feature_ablation_include_diagnostics:
+            current_args.record_consolidation_diagnostics = False
+        result = run_experiment(current_args)
+        variants.append(
+            {
+                "name": name,
+                "disabled_features": disabled_feature_names(current_args),
+                "config": result["config"],
+                "geometry_warmup": result["geometry_warmup"],
+                "summary": result["summary"],
+                "reports": result["reports"],
+            }
+        )
+    return {
+        "feature_ablation": 1,
+        "config": experiment_config(args),
+        "variants": variants,
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+    output = run_feature_ablation(args) if args.feature_ablation else run_experiment(args)
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(output, indent=2), encoding="utf-8")
-    print_summary(output)
+    if args.feature_ablation:
+        print_feature_ablation_summary(output)
+    else:
+        print_summary(output)
     print(f"wrote_json={args.output_json}")
 
 

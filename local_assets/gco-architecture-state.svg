@@ -1,0 +1,163 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1420" height="1040" viewBox="0 0 1420 1040" role="img" aria-labelledby="title desc">
+  <title id="title">GCO full architecture state</title>
+  <desc id="desc">Diagram of the GCO architecture: experience, model geometry, behavior, time, and recurrent memory feed a geometric reasoner that produces targeted weight writes, topology rewiring, basis rearrangement, operator updates, capacity map updates, recurrent state, and targeted edit set.</desc>
+  <defs>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#73bca4"/>
+    </marker>
+    <marker id="arrowViolet" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#9c8cf0"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#d7a45d"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#d9846d"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#6ba7d8"/>
+    </marker>
+    <marker id="arrowGray" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#999"/>
+    </marker>
+    <style>
+      .bg { fill: #f4f3ee; stroke: #111; stroke-width: 2; }
+      .panel { fill: #fff; stroke: #bbb; stroke-width: 2; }
+      .module { fill: #f7f6f1; stroke: #d8d6cc; stroke-width: 1.4; }
+      .moduleFocus { fill: #eeeaff; stroke: #9d93f4; stroke-width: 2; }
+      .green { fill: #dff3ed; stroke: #14876e; }
+      .violet { fill: #e9e7ff; stroke: #5d55cc; }
+      .amber { fill: #fff0da; stroke: #a46617; }
+      .gray { fill: #eeeeea; stroke: #777; }
+      .red { fill: #fff0ec; stroke: #b14c32; }
+      .blue { fill: #e7f2ff; stroke: #2b78b8; }
+      .text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #222; }
+      .title { font-size: 28px; font-weight: 700; }
+      .h1 { font-size: 30px; font-weight: 800; }
+      .h2 { font-size: 26px; font-weight: 800; }
+      .body { font-size: 23px; font-weight: 500; }
+      .small { font-size: 18px; font-weight: 500; }
+      .pillText { font-size: 17px; font-weight: 600; }
+      .dash { fill: none; stroke-width: 2.5; stroke-dasharray: 9 10; opacity: 0.55; }
+      .solid { fill: none; stroke-width: 2.5; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="24" y="20" rx="28" ry="28" width="1372" height="1000"/>
+  <text class="text title" x="710" y="66" text-anchor="middle">Omega_t - full trainable architecture state</text>
+
+  <!-- Left inputs -->
+  <rect class="green" x="58" y="98" rx="16" ry="16" width="250" height="122"/>
+  <text class="text h2" x="183" y="145" text-anchor="middle">experience</text>
+  <text class="text body" x="183" y="182" text-anchor="middle">X_t - H_t - G_t</text>
+
+  <rect class="violet" x="58" y="252" rx="16" ry="16" width="250" height="122"/>
+  <text class="text h2" x="183" y="300" text-anchor="middle">model</text>
+  <text class="text body" x="183" y="336" text-anchor="middle">W - A - Q - R - O - C</text>
+
+  <rect class="amber" x="58" y="406" rx="16" ry="16" width="250" height="122"/>
+  <text class="text h2" x="183" y="454" text-anchor="middle">behavior</text>
+  <text class="text body" x="183" y="490" text-anchor="middle">Y_t - margins</text>
+
+  <rect class="gray" x="58" y="560" rx="16" ry="16" width="250" height="122"/>
+  <text class="text h2" x="183" y="608" text-anchor="middle">time</text>
+  <text class="text body" x="183" y="644" text-anchor="middle">tau - freq - age</text>
+
+  <rect class="red" x="58" y="714" rx="16" ry="16" width="250" height="122"/>
+  <text class="text h2" x="183" y="762" text-anchor="middle">S_{t-1}</text>
+  <text class="text body" x="183" y="798" text-anchor="middle">recurrent memory</text>
+
+  <!-- Center reasoner -->
+  <rect class="panel" x="420" y="205" rx="24" ry="24" width="580" height="655"/>
+  <text class="text h1" x="710" y="257" text-anchor="middle">Geometric Reasoner G</text>
+
+  <rect class="module" x="452" y="298" rx="14" ry="14" width="516" height="112"/>
+  <text class="text h2" x="710" y="340" text-anchor="middle">route observer xi_{l,r,t}</text>
+  <text class="text body" x="710" y="377" text-anchor="middle">activation - margin - conflict - novelty - depth</text>
+
+  <line class="solid" x1="710" y1="410" x2="710" y2="440" stroke="#bbb" marker-end="url(#arrowGray)"/>
+
+  <rect class="module" x="452" y="440" rx="14" ry="14" width="516" height="88"/>
+  <text class="text h2" x="710" y="475" text-anchor="middle">recurrent state s_{l,r,t}</text>
+  <text class="text body" x="710" y="509" text-anchor="middle">tanh(A_s s_{t-1} + B_s xi_t)</text>
+
+  <line class="solid" x1="710" y1="528" x2="710" y2="560" stroke="#8c80e8" marker-end="url(#arrowViolet)"/>
+
+  <rect class="moduleFocus" x="452" y="560" rx="16" ry="16" width="516" height="152"/>
+  <text class="text h2" x="710" y="600" text-anchor="middle">belief state b_{l,r,t}</text>
+  <text class="text body" x="710" y="634" text-anchor="middle">softmax(W_b s_{l,r,t})</text>
+  <rect x="487" y="661" rx="8" ry="8" width="102" height="36" fill="#aaa1ee"/>
+  <text class="text pillText" x="538" y="685" text-anchor="middle">forming</text>
+  <rect x="604" y="661" rx="8" ry="8" width="104" height="36" fill="#8fdcc5"/>
+  <text class="text pillText" x="656" y="685" text-anchor="middle">useful</text>
+  <rect x="724" y="661" rx="8" ry="8" width="116" height="36" fill="#f4b99d"/>
+  <text class="text pillText" x="782" y="685" text-anchor="middle">protected</text>
+  <rect x="856" y="661" rx="8" ry="8" width="96" height="36" fill="#c9c7bd"/>
+  <text class="text pillText" x="904" y="685" text-anchor="middle">obsolete</text>
+
+  <line class="solid" x1="710" y1="712" x2="710" y2="752" stroke="#8c80e8" marker-end="url(#arrowViolet)"/>
+
+  <rect class="module" x="452" y="752" rx="14" ry="14" width="516" height="114"/>
+  <text class="text h2" x="710" y="790" text-anchor="middle">write objective Delta W*</text>
+  <text class="text body" x="710" y="826" text-anchor="middle">E K^T (K K^T + lambda P_protect + lambda I)^-1</text>
+  <text class="text body" x="710" y="856" text-anchor="middle">-> targeted edit set K_t</text>
+
+  <!-- Right outputs -->
+  <rect class="green" x="1112" y="98" rx="16" ry="16" width="250" height="82"/>
+  <text class="text h2" x="1237" y="134" text-anchor="middle">Delta W_t</text>
+  <text class="text body" x="1237" y="164" text-anchor="middle">targeted weight write</text>
+
+  <rect class="violet" x="1112" y="204" rx="16" ry="16" width="250" height="82"/>
+  <text class="text h2" x="1237" y="240" text-anchor="middle">Delta A_t</text>
+  <text class="text body" x="1237" y="270" text-anchor="middle">topology rewiring</text>
+
+  <rect class="amber" x="1112" y="310" rx="16" ry="16" width="250" height="82"/>
+  <text class="text h2" x="1237" y="346" text-anchor="middle">Delta Q_t - Delta R_t</text>
+  <text class="text body" x="1237" y="376" text-anchor="middle">basis rearrangement</text>
+
+  <rect class="red" x="1112" y="416" rx="16" ry="16" width="250" height="82"/>
+  <text class="text h2" x="1237" y="452" text-anchor="middle">Delta O_t</text>
+  <text class="text body" x="1237" y="482" text-anchor="middle">create - merge - decay</text>
+
+  <rect class="blue" x="1112" y="522" rx="16" ry="16" width="250" height="82"/>
+  <text class="text h2" x="1237" y="558" text-anchor="middle">Delta C_t</text>
+  <text class="text body" x="1237" y="588" text-anchor="middle">protected / free map</text>
+
+  <rect class="red" x="1112" y="628" rx="16" ry="16" width="250" height="82"/>
+  <text class="text h2" x="1237" y="664" text-anchor="middle">S_t</text>
+  <text class="text body" x="1237" y="694" text-anchor="middle">updated geo state</text>
+
+  <rect class="gray" x="1112" y="734" rx="16" ry="16" width="250" height="82"/>
+  <text class="text h2" x="1237" y="770" text-anchor="middle">K_t</text>
+  <text class="text body" x="1237" y="800" text-anchor="middle">1 &lt;= edits &lt;&lt; |Omega|</text>
+
+  <!-- Bottom update -->
+  <rect class="panel" x="310" y="910" rx="20" ry="20" width="800" height="88"/>
+  <text class="text h2" x="710" y="950" text-anchor="middle">Omega_{t+1} = Omega_t oplus (Delta W - Delta A - Delta Q - Delta R - Delta O - Delta C)</text>
+  <text class="text body" x="710" y="982" text-anchor="middle">apply targeted writes - rewire - rearrange - update operators - update capacity</text>
+
+  <!-- Arrows from left -->
+  <path class="dash" d="M308 158 C360 215 386 270 420 310" stroke="#73bca4" marker-end="url(#arrowGreen)"/>
+  <path class="dash" d="M308 314 C358 340 382 365 420 392" stroke="#9c8cf0" marker-end="url(#arrowViolet)"/>
+  <path class="dash" d="M308 468 C358 478 383 493 420 510" stroke="#d7a45d" marker-end="url(#arrowAmber)"/>
+  <path class="dash" d="M308 620 C356 606 384 592 420 576" stroke="#999" marker-end="url(#arrowGray)"/>
+  <path class="dash" d="M308 780 C366 800 390 824 452 824" stroke="#d9846d" marker-end="url(#arrowRed)"/>
+
+  <!-- Arrows to right -->
+  <path class="dash" d="M1000 790 C1064 620 1070 210 1112 138" stroke="#73bca4" marker-end="url(#arrowGreen)"/>
+  <path class="dash" d="M1000 710 C1054 586 1074 336 1112 244" stroke="#9c8cf0" marker-end="url(#arrowViolet)"/>
+  <path class="dash" d="M1000 650 C1055 560 1076 424 1112 350" stroke="#d7a45d" marker-end="url(#arrowAmber)"/>
+  <path class="dash" d="M1000 600 C1054 550 1076 502 1112 456" stroke="#d9846d" marker-end="url(#arrowRed)"/>
+  <path class="dash" d="M1000 632 C1052 632 1076 594 1112 562" stroke="#6ba7d8" marker-end="url(#arrowBlue)"/>
+  <path class="dash" d="M1000 840 C1070 814 1076 710 1112 668" stroke="#d9846d" marker-end="url(#arrowRed)"/>
+  <path class="dash" d="M1000 862 C1082 875 1090 804 1112 774" stroke="#999" marker-end="url(#arrowGray)"/>
+
+  <!-- Feedback -->
+  <path class="dash" d="M1237 816 C1240 905 1140 955 1110 955" stroke="#999" marker-end="url(#arrowGray)"/>
+  <path class="dash" d="M710 866 C710 890 710 902 710 910" stroke="#999" marker-end="url(#arrowGray)"/>
+  <path class="dash" d="M310 954 C170 958 58 910 58 836" stroke="#999" marker-end="url(#arrowGray)"/>
+
+  <!-- Open question banner -->
+  <rect x="448" y="866" rx="12" ry="12" width="524" height="48" fill="#fff4ef" stroke="#e78363"/>
+  <text class="text body" x="710" y="898" text-anchor="middle">G parameterization: learned native reasoner is the target</text>
+</svg>
