@@ -59,3 +59,4 @@ docs/.sass-cache/
 .vscode/
 .ipynb_checkpoints/
 GCO_ARCHITECTURE.md
+local_assets/
