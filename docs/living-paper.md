@@ -14,6 +14,7 @@ actually learned.
 ## Section Chooser
 
 - [Current Thesis](#current-thesis)
+- [Abbreviation Key](#abbreviation-key)
 - [Living Log Rule](#living-log-rule)
 - [Evidence Ledger](#evidence-ledger)
   - [1. Route Drift In A Minimal Transformer](#1-route-drift-in-a-minimal-transformer)
@@ -48,6 +49,57 @@ experience geometry
 The evolved GCO target is not an AdamW wrapper. It is a structural optimizer
 that can decide whether to write, protect, split, bridge, rewire, consolidate,
 or decay.
+
+## Abbreviation Key
+
+This page mixes old prototype names with the current target architecture. Use
+these meanings when reading the evidence ledger:
+
+- **CL** means continual learning: learning from a stream without erasing
+  useful behavior learned earlier.
+- **GCO** means Geometric Continual Optimizer. This is the current target: a
+  model-native learner that reasons about where to write, what to reuse, what
+  to protect, what to rewire, and what to let decay.
+- **GFO** means Geometric Forgetting Optimizer. In this log it refers to the
+  earlier activation-anchor and living-map prototype lineage that tested
+  geometric protection before the architecture moved toward full GCO.
+- **Living map** means the earlier external concept/anchor controller used to
+  test semantic retention. It produced useful evidence, but it is not the final
+  requirement because the final learner should be model-native.
+- **AdamW** is the ordinary baseline optimizer. It updates parameters from the
+  current gradient plus moment estimates without explicit geometric ownership.
+- **Replay** means training again on stored old examples or old targets. It is a
+  baseline for retention, not the desired final mechanism.
+- **MLP** means the transformer feed-forward block. Current GCO projection work
+  focuses there because MLP writes are more local than attention writes.
+- **LM loss** means next-token language-model loss.
+- **QA objective** means question-answer probe loss or accuracy used to test
+  whether a learned fact or relation survives.
+- **WWR** means wrong-write rate: how often the reasoner writes into the wrong
+  route or memory region.
+- **DAS** means dynamic adaptation score: a compact score for action quality
+  across the simulated reasoner stream.
+- **SVD** means singular value decomposition, used for capacity and subspace
+  diagnostics.
+- **EMA** means exponential moving average, used for smooth usage or frequency
+  traces.
+- **SGD** means stochastic gradient descent, the simplest gradient optimizer
+  baseline.
+- **CE** means cross-entropy loss.
+- **GRU** means gated recurrent unit, a recurrent neural-network baseline used
+  in the reasoner tests.
+
+Common symbols:
+
+```text
+W_t  = weights
+A_t  = active topology / wiring mask
+M_t  = activation pathway matrix
+H_t  = pressure history
+P_t  = pressure gate
+S_t  = recurrent geometric reasoning state
+C_t  = protected/free capacity map
+```
 
 ## Living Log Rule
 
