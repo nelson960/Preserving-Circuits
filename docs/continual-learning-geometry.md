@@ -6,40 +6,66 @@ permalink: /continual-learning-geometry/
 
 # Continual Learning Is A Geometry Problem
 
-This is a small mechanistic case study, not a final claim about all
-continual-learning systems. The goal is to look inside one tiny transformer and
-ask a narrow question:
+This is a small mechanistic study of continual learning in one fixed-size
+transformer. The goal is not to claim a final theory. The goal is to make one
+failure mode visible:
 
 ```text
-When more data is learned, does the model merely write new facts somewhere,
-or does the internal representation reorganize?
+learning new text is not just writing new facts into unused weights
 ```
 
-The short answer from this experiment is:
+When the same architecture learns more text from scratch, its internal
+representation reorganizes. Rank rises, residual states move, and the old text
+gets represented differently even when old behavior remains good. When the
+already trained 100-word model is updated afterward, the update either protects
+the old geometry and barely learns the new text, or moves strongly and weakens
+the old solution.
+
+That points to a harder thesis:
 
 ```text
-successful extra-data learning rebases the representation
+continual learning is a representation reorganization problem
+under fixed capacity, not only a protected-write problem
 ```
-
-The model that learns both texts from scratch does not simply append the second
-text. It increases effective rank, moves old residual states, and changes the
-geometry of the original text while preserving behavior. That makes continual
-learning harder than a simple write-location problem.
 
 ## Section Chooser
 
-- [Setup]({{ site.baseurl }}/continual-learning-geometry/#setup)
+- [Question]({{ site.baseurl }}/continual-learning-geometry/#question)
+- [Shared Model Spec]({{ site.baseurl }}/continual-learning-geometry/#shared-model-spec)
 - [The Three Training Paths]({{ site.baseurl }}/continual-learning-geometry/#the-three-training-paths)
-- [Behavior Results]({{ site.baseurl }}/continual-learning-geometry/#behavior-results)
-- [Geometry: The 200-Word Model Uses More Space]({{ site.baseurl }}/continual-learning-geometry/#geometry-the-200-word-model-uses-more-space)
-- [Matched Drift: The Old Text Moves Too]({{ site.baseurl }}/continual-learning-geometry/#matched-drift-the-old-text-moves-too)
-- [Continual Updates: Safe Drift And Damaging Drift]({{ site.baseurl }}/continual-learning-geometry/#continual-updates-safe-drift-and-damaging-drift)
-- [What The Experiment Suggests]({{ site.baseurl }}/continual-learning-geometry/#what-the-experiment-suggests)
-- [What This Does Not Prove]({{ site.baseurl }}/continual-learning-geometry/#what-this-does-not-prove)
+- [Path 1: The 100-Word Model]({{ site.baseurl }}/continual-learning-geometry/#path-1-the-100-word-model)
+- [Path 2: Same Spec, More Text From Scratch]({{ site.baseurl }}/continual-learning-geometry/#path-2-same-spec-more-text-from-scratch)
+- [What From-Scratch Training Appears To Do]({{ site.baseurl }}/continual-learning-geometry/#what-from-scratch-training-appears-to-do)
+- [Left-To-Right Capacity Frontier]({{ site.baseurl }}/continual-learning-geometry/#left-to-right-capacity-frontier)
+- [Capacity Geometry On The Original 100 Words]({{ site.baseurl }}/continual-learning-geometry/#capacity-geometry-on-the-original-100-words)
+- [Capacity Geometry On The Full 500 Words]({{ site.baseurl }}/continual-learning-geometry/#capacity-geometry-on-the-full-500-words)
+- [Path 3: Continual Update On Top Of 100 Words]({{ site.baseurl }}/continual-learning-geometry/#path-3-continual-update-on-top-of-100-words)
+- [What Training On Top Appears To Do]({{ site.baseurl }}/continual-learning-geometry/#what-training-on-top-appears-to-do)
+- [What The Images Show]({{ site.baseurl }}/continual-learning-geometry/#what-the-images-show)
+- [Takeaway]({{ site.baseurl }}/continual-learning-geometry/#takeaway)
 
-## Setup
+## Question
 
-All runs used the same tiny transformer specification:
+The simple story of continual learning is:
+
+```text
+old knowledge already exists
+new data arrives
+find a safe place to write the new data
+protect the old knowledge
+```
+
+This experiment asks whether that story is enough. If successful learning only
+needed a safe write location, then a protected update should be able to add the
+second text while keeping the first text fixed. But if successful learning needs
+the whole representation to rebase, then preserving the old geometry too rigidly
+will block new learning.
+
+The test is deliberately small so the geometry can be inspected.
+
+## Shared Model Spec
+
+Every model in this page uses the same transformer specification:
 
 ```text
 vocabulary size = 2000
@@ -50,531 +76,527 @@ MLP width       = 256
 sequence length = 32
 ```
 
-Only the training path changed. This matters because the experiment is not
-comparing a larger model against a smaller model. It is comparing how the same
-architecture behaves when it learns the data in different orders.
+The comparison is therefore not bigger model versus smaller model. It is the
+same capacity trained under different data histories.
 
-The text source was split into two consecutive spans:
+The measurements are:
 
-```text
-old span = first 100 words
-new span = second 100 words
-full span = first 200 words
-```
+| measurement | meaning |
+|---|---|
+| loss | next-token cross-entropy on the training span |
+| token accuracy | fraction of next-token predictions that are correct |
+| target margin | logit(correct token) minus logit(best competing token) |
+| effective rank | how many dimensions the representation uses in practice |
+| novelty angle | angular separation between two text spans inside a layer |
+| drift | how far the same old text representation moved between models |
+| CKA | representational similarity; lower means stronger geometry change |
 
-The measurements use next-token language-model loss, token accuracy, target
-margin, residual-state geometry, and matched residual drift.
-
-Target margin means:
-
-```text
-target margin = logit(correct token) - logit(best competing token)
-```
-
-Large positive margin means the model strongly prefers the correct next token.
-Negative margin means some other token is preferred.
+This is not a held-out generalization test. It is a fixed-capacity fitting and
+geometry test: how much text can this exact tiny model absorb, and what happens
+to its representation as the amount of text increases?
 
 ## The Three Training Paths
 
-There are three different cases.
+The text was split into consecutive spans. The first 100 words are the old
+span. Later words are extra data.
 
-### 1. The 100-Word Base Model
-
-The first model starts from random initialization and trains only on the first
-100 words:
+The three paths are:
 
 ```text
-random tiny transformer -> train on first 100 words -> base100
+Path 1:
+random model -> train on first 100 words -> base100
+
+Path 2:
+random model -> train from scratch on 200, 300, 400, or 500 words
+
+Path 3:
+base100 -> update afterward on the second 100 words
 ```
 
-It learns the first span very well:
+Path 2 is the important reference. It tells us what the model can do when it is
+allowed to organize the whole representation from the beginning. Path 3 tells
+us what happens when the old solution already exists and the model tries to add
+new text afterward.
 
-```text
-loss: 7.7006 -> 0.0145
-accuracy: 0.9913
-mean target margin: +11.4909
-```
+## Path 1: The 100-Word Model
 
-This model gives us the old learned representation.
+The 100-word model fits the first span almost perfectly:
+
+| model | final loss | best loss | token accuracy | mean margin | min margin |
+|---|---:|---:|---:|---:|---:|
+| 100 words | 0.014533 | 0.014110 | 0.9913 | +11.4909 | -1.3982 |
+
+The final residual geometry on the original span is the baseline geometry that
+later comparisons use.
 
 ![Final residual geometry for the 100-word model on the original 100-word span]({{ site.baseurl }}/assets/continual-geometry/base100-only-100w-final.png)
 
-This plot is the starting geometry for the later comparisons. It shows how the
-trained 100-word model arranges residual states from the original text before
-any second-span update is attempted.
+This is the model after it has already solved the old text. The continual
+learning problem starts here: can we add new text without breaking this learned
+behavior?
 
-### 2. Continual Updates From The 100-Word Model
+## Path 2: Same Spec, More Text From Scratch
 
-The second case starts from the already trained 100-word model and then tries
-to learn the second 100 words:
+Next, the same architecture was trained from scratch on longer spans: 100, 200,
+300, 400, and 500 words.
 
-```text
-base100 -> update on second 100 words -> continual-update model
-```
+| training span | final loss | best loss | token accuracy | mean margin | min margin |
+|---:|---:|---:|---:|---:|---:|
+| 100 words | 0.014533 | 0.014110 | 0.9913 | +11.4909 | -1.3982 |
+| 200 words | 0.024659 | 0.024639 | 0.9867 | +11.6670 | -1.2406 |
+| 300 words | 0.033142 | 0.033125 | 0.9839 | +11.8152 | -1.2813 |
+| 400 words | 0.037832 | 0.037756 | 0.9826 | +12.1580 | -1.7029 |
+| 500 words | 0.040771 | 0.040746 | 0.9821 | +12.4945 | -1.6374 |
 
-This is the continual-learning setting. The model already has an old solution,
-and the new update must add new data without damaging the old behavior.
-
-Two update regimes were tested:
-
-```text
-safe continual update:
-  small protected writes
-  old behavior remains stable
-  new text is barely learned
-
-aggressive continual update:
-  larger rewiring-style changes
-  new loss improves more
-  old behavior is damaged
-  new text is still not learned well
-```
-
-### 3. The 200-Word Model From Scratch
-
-The third model starts from random initialization and trains on both spans
-together:
+The important pattern is:
 
 ```text
-random tiny transformer -> train on first 200 words -> base200
+loss rises as more text is packed into the same model
+accuracy stays high
+mean margin stays strongly positive
 ```
 
-It sees old and new text together from the beginning. It does not need to
-preserve a previously formed internal solution.
+That means the model is not simply failing. It still predicts most tokens
+correctly and confidently. But the loss no longer reaches the same near-zero
+level as the 100-word case. A small set of harder or conflicting positions keeps
+contributing error while most of the sequence is memorized.
 
-It also learns the data well:
+This is why accuracy alone hides the pressure. Accuracy says the model is still
+mostly correct. Loss and geometry show that the same fixed capacity is being
+repacked. In this page, this is treated as an overfit-like capacity strain, not
+ordinary train/test overfitting, because the measurements are on the fitted
+training span itself.
+
+## What From-Scratch Training Appears To Do
+
+The from-scratch runs are important because the model is free to organize all
+text together. It does not have to protect an old solution. Based on the loss,
+accuracy, rank, drift, and CKA measurements, the internal story appears to be:
 
 ```text
-loss: 7.6761 -> 0.0247
-accuracy: 0.9867
-mean target margin on old span: +11.8631
-mean target margin on new span: +11.5536
+early text gives the model a first geometry
+more text forces the geometry to expand
+then the model starts repacking the same space
+old states move, but old behavior can remain correct
 ```
 
-This model is important because it shows what a successful same-capacity
-solution looks like when the model is allowed to organize freely.
+This is not direct proof of the exact circuit mechanism. It is the most
+consistent interpretation of the measured geometry.
 
-## Behavior Results
+### Reuse
 
-The behavior table already shows the core tension.
+The 200-to-500 word models are not learning every token with a separate isolated
+route. Accuracy stays high while rank rises only up to a limited range and then
+plateaus. That suggests the model reuses existing computations: similar contexts
+share residual directions, MLP features, and attention routing rather than
+allocating a completely new independent direction for every new phrase.
 
-### Old 100 Words
-
-| model | loss | accuracy | mean margin | min margin |
-|---|---:|---:|---:|---:|
-| base100 | 0.014533 | 0.9913 | +11.4909 | -1.3982 |
-| base200 | 0.023803 | 0.9881 | +11.8631 | -1.2406 |
-| safe continual update | 0.014550 | 0.9913 | +11.3884 | -1.4061 |
-| aggressive continual update | 0.031328 | 0.9901 | +9.0665 | -3.7476 |
-
-The safe continual update preserves the old span almost perfectly. The
-aggressive continual update still has high token accuracy, but the margin drops
-from `+11.4909` to `+9.0665`. That is a real weakening of the old solution.
-
-### New 100 Words
-
-| model | loss | accuracy | mean margin | min margin |
-|---|---:|---:|---:|---:|
-| base100 | 13.628014 | 0.0549 | -12.8071 | -30.5011 |
-| base200 | 0.024992 | 0.9863 | +11.5536 | -0.9081 |
-| safe continual update | 12.466713 | 0.0661 | -11.4853 | -30.3192 |
-| aggressive continual update | 10.083992 | 0.0614 | -9.0928 | -20.6879 |
-
-The successful from-scratch 200-word model learns the new span. The continual
-updates do not. The safe update barely moves enough to learn the new text. The
-aggressive update improves the loss more, but not nearly enough, and it weakens
-old behavior.
-
-This is the central observation:
+In practical terms:
 
 ```text
-protecting the old representation preserves old behavior
-but does not create the successful new representation
+new text does not only create new directions
+it also bends existing useful directions into a broader solution
 ```
 
-## Geometry: The 200-Word Model Uses More Space
+### Rebase
 
-The next question is what changed internally.
+The clearest signal is that the original 100-word representation moves when the
+model is trained from scratch on 200, 300, 400, or 500 words. The old text is
+still predicted well, but it is not represented in the same place.
 
-The following plots show residual-state geometry. Each dot is a residual state
-from a token position inside a sliding text window. The two colors split the
-first and second text spans. The panels compare the 100-word model and the
-200-word model under the same probe.
-
-![Embedding geometry for the 100-word and 200-word models]({{ site.baseurl }}/assets/continual-geometry/base100-vs-base200-200w-embed.png)
-
-At the embedding level, the 200-word model already shows higher effective rank:
+That means successful learning can preserve function while changing geometry:
 
 ```text
-embedding layer
-base100 rank = 92.18
-base200 rank = 106.49
+same old behavior
+different hidden-state arrangement
 ```
 
-The more important changes appear inside the transformer blocks.
+This is the core reason continual learning is difficult. If the old geometry is
+protected too literally, the model may be prevented from finding the rebased
+representation that a from-scratch solution would use.
 
-![Block 0 residual geometry for the 100-word and 200-word models]({{ site.baseurl }}/assets/continual-geometry/base100-vs-base200-200w-block-0.png)
+### Dense Compression
+
+As the text length grows, the model keeps fitting most positions, but loss
+rises. This looks like dense compression: many token-specific constraints are
+being packed into the same finite-dimensional residual space. Most predictions
+remain correct, but a smaller number of difficult positions carry more loss.
+
+The capacity frontier therefore looks like:
 
 ```text
-block 0
-base100 rank = 64.84
-base200 rank = 87.43
-base100 novelty outside old span = 0.2569
-base200 novelty outside old span = 0.3206
+100 words: enough room for a very sharp fit
+200 words: rank expands and the geometry rebases
+300-500 words: accuracy remains high, but loss rises under packing pressure
 ```
 
-![Block 1 residual geometry for the 100-word and 200-word models]({{ site.baseurl }}/assets/continual-geometry/base100-vs-base200-200w-block-1.png)
+This is not clean modular storage. It is shared, dense, and entangled
+representation.
+
+### Capacity Packing
+
+The full 500-word probe shows that middle-layer CKA drops hard as more text is
+trained into the same architecture. That means the internal basis used by the
+model changes substantially. The model is not just adding extra points at the
+edge of the old cloud. It is changing the coordinate system of the cloud.
+
+The important distinction is:
 
 ```text
-block 1
-base100 rank = 74.52
-base200 rank = 88.94
-base100 novelty outside old span = 0.2541
-base200 novelty outside old span = 0.3294
+append-only writing:
+  old geometry stays fixed
+  new data goes somewhere else
+
+from-scratch fitting:
+  old and new data co-determine the geometry
+  old states are allowed to move
+  behavior survives because the whole solution is coordinated
 ```
 
-The final residual geometry shows the same pattern:
+## Left-To-Right Capacity Frontier
 
-![Final residual geometry for the 100-word and 200-word models]({{ site.baseurl }}/assets/continual-geometry/base100-vs-base200-200w-final.png)
+These two strips show the same fixed architecture as the training span grows
+from `100 -> 200 -> 300 -> 400 -> 500` words. Read each strip from left to
+right. The point is not that the dots form a perfectly separable cluster. The
+point is that the whole residual geometry keeps being rearranged while loss
+rises and token accuracy stays high.
+
+The first strip probes the original 100-word span through every model. This
+shows what happens to the old representation when the model is trained from
+scratch on more total text.
+
+![Left-to-right final residual geometry on the original 100-word probe: 100, 200, 300, 400, and 500 word models]({{ site.baseurl }}/assets/continual-geometry/capacity-line-100w-final.png)
+
+The second strip probes the full 500-word span through every model. This shows
+the same model family being asked to organize a larger text window, even though
+the parameter count and architecture never change.
+
+![Left-to-right final residual geometry on the full 500-word probe: 100, 200, 300, 400, and 500 word models]({{ site.baseurl }}/assets/continual-geometry/capacity-line-500w-final.png)
+
+The visual pattern matches the table above:
 
 ```text
-final layer
-base100 rank = 77.74
-base200 rank = 92.96
-base100 novelty outside old span = 0.2801
-base200 novelty outside old span = 0.3467
-base100 principal angle mean = 13.45 degrees
-base200 principal angle mean = 19.13 degrees
+loss:     0.0145 -> 0.0247 -> 0.0331 -> 0.0378 -> 0.0408
+accuracy: 0.9913 -> 0.9867 -> 0.9839 -> 0.9826 -> 0.9821
 ```
 
-The 200-word model uses a higher-rank representation and separates the two
-text spans more strongly. This means the added data is not merely placed into a
-small local patch of the old representation. The model reorganizes its residual
+The model still predicts most positions correctly, but the representation is
+not static. The same-size network keeps changing how it uses the residual
 space.
 
-The same architecture comparison can also be viewed only on the original
-100-word span. This isolates what happened to the old text itself when the
-200-word model learned both spans from scratch.
+## Capacity Geometry On The Original 100 Words
 
-![Embedding geometry for both models on the original 100-word span]({{ site.baseurl }}/assets/continual-geometry/base100-vs-base200-100w-embed.png)
+The first visualization probes the original 100-word span through every
+from-scratch model. The input is the same old text, but the model has been
+trained on more total data.
 
-```text
-original 100 words, embedding layer
-base100 rank = 91.87
-base200 rank = 100.92
-base100 novelty = 0.4020
-base200 novelty = 0.5096
-```
+If the old representation stayed fixed, the rank, drift, and CKA would remain
+close to the 100-word model. They do not.
 
-![Block 0 residual geometry for both models on the original 100-word span]({{ site.baseurl }}/assets/continual-geometry/base100-vs-base200-100w-block-0.png)
+### Original 100-Word Probe: Embedding Layer
 
-```text
-original 100 words, block 0
-base100 rank = 62.74
-base200 rank = 82.45
-base100 novelty = 0.3265
-base200 novelty = 0.4002
-```
+![Capacity frontier on the original 100-word span, embedding layer]({{ site.baseurl }}/assets/continual-geometry/capacity-frontier-100w-embed.png)
 
-![Block 1 residual geometry for both models on the original 100-word span]({{ site.baseurl }}/assets/continual-geometry/base100-vs-base200-100w-block-1.png)
+### Original 100-Word Probe: Block 0
 
-```text
-original 100 words, block 1
-base100 rank = 72.48
-base200 rank = 84.40
-base100 novelty = 0.3606
-base200 novelty = 0.4073
-```
+![Capacity frontier on the original 100-word span, transformer block 0]({{ site.baseurl }}/assets/continual-geometry/capacity-frontier-100w-block-0.png)
 
-![Final residual geometry for both models on the original 100-word span]({{ site.baseurl }}/assets/continual-geometry/base100-vs-base200-100w-final.png)
+### Original 100-Word Probe: Block 1
 
-```text
-original 100 words, final layer
-base100 rank = 74.32
-base200 rank = 87.87
-base100 novelty = 0.3726
-base200 novelty = 0.4478
-base100 principal angle mean = 21.12 degrees
-base200 principal angle mean = 27.06 degrees
-```
+![Capacity frontier on the original 100-word span, transformer block 1]({{ site.baseurl }}/assets/continual-geometry/capacity-frontier-100w-block-1.png)
 
-Even when the probe contains only the original text, the 200-word model uses a
-higher-rank geometry. The old text is not represented exactly the same way.
+### Original 100-Word Probe: Final Residual
 
-## Matched Drift: The Old Text Moves Too
+![Capacity frontier on the original 100-word span, final residual layer]({{ site.baseurl }}/assets/continual-geometry/capacity-frontier-100w-final.png)
 
-The previous plots show different geometries, but they do not answer the most
-important question:
+On the original 100-word probe, the representation changes substantially as
+more text is included in training.
 
-```text
-What happened to the original 100-word representation?
-```
+| layer | 100-word rank | 200-word rank | 500-word rank | 500-word drift | 500-word CKA |
+|---|---:|---:|---:|---:|---:|
+| embed | 91.87 | 100.92 | 100.55 | 1.3156 | 0.5632 |
+| block 0 | 62.74 | 82.45 | 81.65 | 1.7761 | 0.3305 |
+| block 1 | 72.48 | 84.40 | 81.23 | 2.2986 | 0.4151 |
+| final | 74.32 | 87.87 | 85.02 | 0.8829 | 0.3705 |
 
-To test that, both models were evaluated on the exact same original 100-word
-span. The 200-word model's residual states were aligned into the 100-word
-model's coordinates with an orthogonal Procrustes map. The arrows show how
-matched residual points moved after alignment.
+The old text is still handled well, but the internal geometry used to handle it
+is no longer the same geometry. The model trained on more text has rebased even
+the original span.
 
-![Embedding matched drift from the 100-word model to the 200-word model]({{ site.baseurl }}/assets/continual-geometry/natural-rebasing-100w-embed.png)
+## Capacity Geometry On The Full 500 Words
 
-For the embedding layer:
+The second visualization probes the full 500-word span through each model. The
+colors split the early part of the text from the later part, so the plots show
+how the same architecture organizes a larger input span as the training budget
+increases.
 
-```text
-rank: 91.87 -> 100.92
-relative matched drift: 0.6624
-CKA: 0.6021
-aligned cosine: 0.7409
-centroid shift: 0.4336
-```
+### Full 500-Word Probe: Embedding Layer
 
-![Final residual matched drift from the 100-word model to the 200-word model]({{ site.baseurl }}/assets/continual-geometry/natural-rebasing-100w-final.png)
+![Capacity frontier on the full 500-word span, embedding layer]({{ site.baseurl }}/assets/continual-geometry/capacity-frontier-500w-embed.png)
 
-For the final residual layer:
+### Full 500-Word Probe: Block 0
+
+![Capacity frontier on the full 500-word span, transformer block 0]({{ site.baseurl }}/assets/continual-geometry/capacity-frontier-500w-block-0.png)
+
+### Full 500-Word Probe: Block 1
+
+![Capacity frontier on the full 500-word span, transformer block 1]({{ site.baseurl }}/assets/continual-geometry/capacity-frontier-500w-block-1.png)
+
+### Full 500-Word Probe: Final Residual
+
+![Capacity frontier on the full 500-word span, final residual layer]({{ site.baseurl }}/assets/continual-geometry/capacity-frontier-500w-final.png)
+
+On the full 500-word probe, the geometry shows stronger capacity pressure.
+
+| layer | 100-word rank | 200-word rank | 500-word rank | 500-word drift | 500-word CKA |
+|---|---:|---:|---:|---:|---:|
+| embed | 90.23 | 104.00 | 109.40 | 1.8685 | 0.5789 |
+| block 0 | 65.99 | 90.36 | 87.48 | 2.7447 | 0.1214 |
+| block 1 | 74.82 | 90.23 | 84.60 | 3.4766 | 0.1461 |
+| final | 78.64 | 95.86 | 91.16 | 1.1968 | 0.0848 |
+
+The first jump, from 100 to 200 words, expands the used representation strongly.
+After that, rank does not keep increasing linearly. The model keeps fitting more
+text, but the middle-layer geometry drifts heavily and CKA collapses.
+
+This is the visible capacity frontier:
 
 ```text
-rank: 74.32 -> 87.87
-relative matched drift: 0.7880
-CKA: 0.4906
-aligned cosine: 0.6783
-centroid shift: 1.5824
+more data does not just occupy more empty space
+the existing representation is repacked
 ```
 
-CKA means centered kernel alignment. It measures representational similarity.
-The value `0.4906` is only moderate. The relative matched drift of `0.7880`
-means the old residual states moved by a large fraction of their natural scale.
+## Path 3: Continual Update On Top Of 100 Words
 
-The same movement appears inside the transformer blocks:
+The last experiment starts from the already trained 100-word model and tries to
+learn the second 100 words afterward.
 
-![Block 0 matched drift from the 100-word model to the 200-word model]({{ site.baseurl }}/assets/continual-geometry/natural-rebasing-100w-block-0.png)
+The from-scratch 200-word model is the target behavior: it learns both spans.
+The continual updates are the hard case: they have to add the new span while
+preserving old behavior.
+
+### Behavior On The Old 100 Words
+
+| model | old loss | old accuracy | old mean margin | old min margin |
+|---|---:|---:|---:|---:|
+| 100-word base | 0.014533 | 0.9913 | +11.4909 | -1.3982 |
+| 200-word from scratch | 0.023803 | 0.9881 | +11.8631 | -1.2406 |
+| protected continual update | 0.014550 | 0.9913 | +11.3884 | -1.4061 |
+| aggressive continual update | 0.031328 | 0.9901 | +9.0665 | -3.7476 |
+
+### Behavior On The New 100 Words
+
+| model | new loss | new accuracy | new mean margin | new min margin |
+|---|---:|---:|---:|---:|
+| 100-word base | 13.628014 | 0.0549 | -12.8071 | -30.5011 |
+| 200-word from scratch | 0.024992 | 0.9863 | +11.5536 | -0.9081 |
+| protected continual update | 12.466713 | 0.0661 | -11.4853 | -30.3192 |
+| aggressive continual update | 10.083992 | 0.0614 | -9.0928 | -20.6879 |
+
+The protected update preserves old behavior but barely learns the new text. The
+aggressive update learns more than the protected update, but still fails badly
+on the new span and weakens the old solution.
+
+### Successful Reorganization: 100-Word Model Versus 200-Word Model
+
+![Natural representation rebasing from the 100-word model to the 200-word model]({{ site.baseurl }}/assets/continual-geometry/natural-rebasing-100w-final.png)
+
+This is the successful case. It is not a continual update; it is a fresh
+200-word training run. The old text is represented differently, but behavior is
+preserved because the whole solution was allowed to organize together.
+
+### Protected Continual Update
+
+![Protected continual update drift on the original 100-word span]({{ site.baseurl }}/assets/continual-geometry/safe-update-100w-final.png)
+
+The protected update keeps the original geometry close enough that old behavior
+stays stable. But it also fails to create the large representational change
+needed to model the new span.
+
+### Aggressive Continual Update
+
+![Aggressive continual update drift on the original 100-word span]({{ site.baseurl }}/assets/continual-geometry/aggressive-update-100w-final.png)
+
+The aggressive update moves the geometry more, but the movement is not the same
+as the successful from-scratch reorganization. It damages old margins and still
+does not solve the new text.
+
+## What Training On Top Appears To Do
+
+Training on top of the solved 100-word model behaves differently from training
+from scratch because the first geometry is already load-bearing. The parameters
+are no longer blank capacity. They already implement a sharp solution for the
+old span.
+
+The update now faces a conflict:
 
 ```text
-block 0
-rank: 62.74 -> 82.45
-relative matched drift: 0.7960
-CKA: 0.3936
-aligned cosine: 0.6240
+move enough to learn the new span
+but not so much that the old span loses its margins
 ```
 
-![Block 1 matched drift from the 100-word model to the 200-word model]({{ site.baseurl }}/assets/continual-geometry/natural-rebasing-100w-block-1.png)
+The experiments show two bad regimes.
+
+### Protected Update: Stable But Underpowered
+
+The protected update keeps old behavior nearly unchanged:
 
 ```text
-block 1
-rank: 72.48 -> 84.40
-relative matched drift: 0.7351
-CKA: 0.5328
-aligned cosine: 0.6728
+old loss:     0.014533 -> 0.014550
+old accuracy: 0.9913   -> 0.9913
+old margin:   11.4909  -> 11.3884
 ```
 
-This is the key result:
+But the new text barely improves:
 
 ```text
-the successful 200-word model does not preserve exact old residual coordinates
+new loss:     13.6280 -> 12.4667
+new accuracy: 0.0549  -> 0.0661
 ```
 
-It preserves behavior while changing the internal coordinate system. The old
-text still works, but its representation has been rebased.
+Mechanistically, this looks like preserving the old coordinate system too
+strongly. The update can make small local changes, but it cannot perform the
+larger rebasing that the from-scratch 200-word model found.
 
-That is why the continual-learning problem cannot be reduced to freezing exact
-activation anchors. If the old coordinates are protected too rigidly, the model
-may be blocked from making the same kind of successful reorganization seen in
-the from-scratch 200-word solution.
+### Aggressive Update: Movement Without Coordination
 
-## Continual Updates: Safe Drift And Damaging Drift
-
-Now compare that natural rebasing with the two continual-update attempts.
-
-The safe continual update preserves the old geometry very closely:
-
-![Embedding drift after the safe continual update]({{ site.baseurl }}/assets/continual-geometry/safe-update-100w-embed.png)
+The aggressive update moves more and reduces new loss further:
 
 ```text
-safe continual update, embedding layer
-rank: 91.87 -> 91.91
-relative matched drift: 0.0556
-CKA: 0.9977
-aligned cosine: 0.9983
+new loss: 13.6280 -> 10.0840
 ```
 
-![Block 0 drift after the safe continual update]({{ site.baseurl }}/assets/continual-geometry/safe-update-100w-block-0.png)
+But it weakens old behavior:
 
 ```text
-safe continual update, block 0
-rank: 62.74 -> 62.68
-relative matched drift: 0.0669
-CKA: 0.9949
-aligned cosine: 0.9969
+old loss:   0.014533 -> 0.031328
+old margin: 11.4909  -> 9.0665
 ```
 
-![Block 1 drift after the safe continual update]({{ site.baseurl }}/assets/continual-geometry/safe-update-100w-block-1.png)
+It also still fails to learn the new span well. This is the key part: moving the
+old representation is not enough. The movement must be coordinated. The
+from-scratch model changes old and new geometry together. The aggressive
+continual update pushes on an already formed geometry and creates drift without
+finding the better joint solution.
+
+### Why This Is More Than A Write Problem
+
+The failure is not only that the update chose the wrong individual weights. The
+problem is that the model likely needs a new shared representation:
 
 ```text
-safe continual update, block 1
-rank: 72.48 -> 72.38
-relative matched drift: 0.0769
-CKA: 0.9936
-aligned cosine: 0.9961
+reuse old features where they help
+move old states where the global geometry requires it
+compress overlapping structure into shared directions
+separate conflicting contexts where reuse would cause errors
 ```
 
-![Final residual drift after the safe continual update]({{ site.baseurl }}/assets/continual-geometry/safe-update-100w-final.png)
+Training from scratch can do all of that implicitly because all constraints are
+present together. Continual updating has to do it while old behavior is already
+installed. That is a harder control problem than a local write.
+
+## What The Images Show
+
+The three paths separate three different effects.
+
+### 1. Fitting More Text Uses More Representational Degrees Of Freedom
+
+The 100-to-500 frontier shows a rise in effective rank:
 
 ```text
-safe continual update, final layer
-rank: 74.32 -> 74.18
-relative matched drift: 0.0779
-CKA: 0.9930
-aligned cosine: 0.9961
-old loss: 0.014533 -> 0.014550
-new loss: 13.628014 -> 12.466713
+final layer rank on original 100-word probe:
+74.32 -> 87.87 -> 87.38 -> 83.89 -> 85.02
+
+final layer rank on full 500-word probe:
+78.64 -> 95.86 -> 94.10 -> 90.91 -> 91.16
 ```
 
-The old model is preserved, but the new text is barely learned.
+The model opens more representational directions early, then starts repacking.
+That is why rank rises sharply at first and then plateaus or slightly drops.
 
-The aggressive continual update moves more:
+### 2. Accuracy Can Stay High While Loss Reveals Strain
 
-![Embedding drift after the aggressive continual update]({{ site.baseurl }}/assets/continual-geometry/aggressive-update-100w-embed.png)
+From 100 to 500 words:
 
 ```text
-aggressive continual update, embedding layer
-rank: 91.87 -> 93.04
-relative matched drift: 0.1106
-CKA: 0.9650
-aligned cosine: 0.9932
+accuracy: 0.9913 -> 0.9821
+loss:     0.0145 -> 0.0408
 ```
 
-![Block 0 drift after the aggressive continual update]({{ site.baseurl }}/assets/continual-geometry/aggressive-update-100w-block-0.png)
+Accuracy falls only slightly. Loss almost triples. The model still gets most
+tokens right, but the harder positions remain less perfectly fitted. This is a
+capacity-frontier signal, not a simple accuracy failure.
+
+### 3. Successful Learning Rebases Old Geometry
+
+On the original 100-word probe, the 500-word model is not using the same hidden
+geometry as the 100-word model:
 
 ```text
-aggressive continual update, block 0
-rank: 62.74 -> 63.29
-relative matched drift: 0.1180
-CKA: 0.9772
-aligned cosine: 0.9894
+block 1 drift relative to 100-word model: 2.2986
+block 1 CKA relative to 100-word model:   0.4151
+final drift relative to 100-word model:   0.8829
+final CKA relative to 100-word model:     0.3705
 ```
 
-![Block 1 drift after the aggressive continual update]({{ site.baseurl }}/assets/continual-geometry/aggressive-update-100w-block-1.png)
+The old behavior is not preserved by freezing the old representation. It is
+preserved by finding a different representation that supports more data.
+
+### 4. Continual Updating Does Not Automatically Find That Reorganization
+
+The protected update is too conservative:
 
 ```text
-aggressive continual update, block 1
-rank: 72.48 -> 73.16
-relative matched drift: 0.1383
-CKA: 0.9755
-aligned cosine: 0.9871
+old accuracy stays: 0.9913 -> 0.9913
+new loss only moves: 13.6280 -> 12.4667
 ```
 
-![Final residual drift after the aggressive continual update]({{ site.baseurl }}/assets/continual-geometry/aggressive-update-100w-final.png)
+The aggressive update is too destructive:
 
 ```text
-aggressive continual update, final layer
-rank: 74.32 -> 74.87
-relative matched drift: 0.1348
-CKA: 0.9760
-aligned cosine: 0.9872
-old loss: 0.014533 -> 0.031328
-old mean margin: +11.4909 -> +9.0665
-new loss: 13.628014 -> 10.083992
+old margin drops: 11.4909 -> 9.0665
+new loss improves: 13.6280 -> 10.0840
+new accuracy remains poor: 0.0614
 ```
 
-This update does learn slightly more about the new text, but it weakens the
-old solution and still does not produce the successful 200-word behavior.
+Neither path recreates the coordinated geometry of the from-scratch 200-word
+model.
 
-The contrast is sharp:
+## Takeaway
 
-| case | old final-layer drift | final-layer CKA | old behavior | new behavior |
-|---|---:|---:|---|---|
-| safe continual update | 0.0779 | 0.9930 | preserved | barely learned |
-| aggressive continual update | 0.1348 | 0.9760 | weakened | still poor |
-| 200-word from scratch | 0.7880 | 0.4906 | still good | learned well |
+The useful conclusion is not that protected writing is useless. Protection is
+necessary when old behavior matters. The useful conclusion is that protection
+alone is not enough.
 
-The successful solution is not just “more drift.” It is a different kind of
-drift: a large, coordinated representational rebasing that keeps behavior
-working.
-
-## What The Experiment Suggests
-
-The naive write framing is:
+A fixed-size model that learns more data from scratch appears to do three
+things together:
 
 ```text
-old knowledge is stored somewhere
-new knowledge must be written somewhere else
+increase the used representational rank
+move old residual states into a new arrangement
+preserve behavior through coordinated reorganization
 ```
 
-This experiment suggests a more difficult picture:
+A continual learner must somehow do the same thing after old behavior already
+exists:
 
 ```text
-old and new behavior may need a shared rebasing of the representation
+preserve the function
+while allowing the representation to rebase
 ```
 
-The 200-word model did not simply add a second memory next to the first. It
-changed the basis used by the first memory too.
-
-The main findings are:
-
-1. **More data increased effective rank.** The 200-word model used more
-   representational degrees of freedom than the 100-word model.
-2. **Successful learning moved old states.** The original 100-word residual
-   states moved substantially in the successful 200-word model.
-3. **Small protected updates were too rigid.** They preserved old behavior and
-   old geometry but failed to learn the new span.
-4. **Aggressive local updates were not enough.** They damaged old behavior
-   without reproducing the useful global reorganization.
-5. **The core problem is behavior-preserving rebasing.** Continual learning
-   needs a way to move representations coherently while preserving old
-   behavior.
-
-A better mechanistic target is therefore:
+That is much harder than choosing a safe write location. It suggests that the
+core problem is not only:
 
 ```text
-preserve useful behavior and useful relations
-while allowing internal coordinates to change
+where can the new data be written?
 ```
 
-That is different from:
+It is also:
 
 ```text
-freeze old activations exactly
+how can the whole representation reorganize
+without losing the old function?
 ```
 
-It is also different from:
-
-```text
-freely fine-tune and hope old behavior survives
-```
-
-The real object to preserve may be relational and behavioral: margins, causal
-routes, readout compatibility, and the ability to decode old behavior after the
-representation has moved.
-
-## What This Does Not Prove
-
-This experiment is intentionally small. It does not prove a general theory of
-continual learning.
-
-The limitations are:
-
-- one tiny transformer architecture;
-- one short text source;
-- one main seed for the reported comparison;
-- a near-memorization regime rather than a broad benchmark;
-- PCA and Procrustes views are diagnostics, not complete mechanistic proofs.
-
-Still, the result is useful because the control is clean:
-
-```text
-same architecture
-same width
-same layer count
-same tokenizer
-same text source
-different training path
-```
-
-Under that control, successful from-scratch learning of more data caused large
-representational rebasing, while continual updates either preserved old
-geometry too strongly or damaged old behavior without learning the new text.
-
-The next mechanistic question is:
-
-```text
-Can a model update old and new representations together,
-so old behavior survives while the internal geometry is allowed to rebase?
-```
+This is the next problem to study.
