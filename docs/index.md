@@ -3,10 +3,10 @@ layout: default
 title: Preserving Circuits
 ---
 
-## Continual Learning As A Write Problem
+## Continual Learning As A Geometry And Write Problem
 
-A working note on forgetting, routing, rewiring, and capacity inside neural
-networks.
+A working note on forgetting, routing, rewiring, representational rebasing, and
+capacity inside neural networks.
 
 > **Status.** This is not a final document. The framing, mechanisms, and
 > terminology may change as experiments fail, new evidence appears, or better
@@ -14,10 +14,10 @@ networks.
 
 Read this page as five steps:
 
-1. The problem: new learning writes into old model geometry.
+1. The problem: new learning changes old model geometry.
 2. What existing continual-learning work has already established.
 3. A mechanistic view of how forgetting breaks internally.
-4. A write/reuse/rewire mechanism for changing the model without blind overwrite.
+4. A read/reuse/rebase/write mechanism for changing the model without blind overwrite.
 5. What can still break this direction.
 
 Most deployed language models are still updated through discrete training or
@@ -34,14 +34,18 @@ How do we learn new data without forgetting old data?
 This page makes that question more specific:
 
 ```text
-When new data arrives, where should the learning signal be written?
+When new data arrives, what internal geometry should move,
+and what behavior should remain invariant?
 ```
 
-Forgetting is treated as a failed write. A new update can overwrite a route,
-rotate a representation, break a readout, change a gate, or consume capacity
-that old behavior still depends on. The useful question is not only whether the
-model got the next batch right. It is what the update wrote into the model, what
-it reused, what it damaged, and what capacity it consumed.
+Forgetting is treated as failed controlled change. A new update can overwrite a
+route, rotate a representation, break a readout, change a gate, or consume
+capacity that old behavior still depends on. But the opposite failure also
+matters: if the old geometry is protected too rigidly, the model may be unable
+to perform the coordinated representational rebasing needed to learn new data.
+The useful question is not only whether the model got the next batch right. It
+is what geometry the update moved, what behavior survived, what computation was
+reused, what was damaged, and what capacity was consumed.
 
 The governing principle is:
 
@@ -56,12 +60,17 @@ or reused.
 
 ## Abstract
 
-This document treats continual learning as a write problem inside a
-fixed-capacity neural network. New data should not simply push every shared
-weight in the direction of the current loss. The model should first reason over
-its own internal state: what route is active, what existing computation can be
-reused, what old geometry is still load-bearing, what capacity is free, and
-where a new write would cause interference.
+This document treats continual learning as controlled representational change
+inside a fixed-capacity neural network. New data should not simply push every
+shared weight in the direction of the current loss. But the solution is also
+not to freeze old activations forever. Small controlled experiments now suggest
+that successful extra-data learning can require coordinated representational
+rebasing: old behavior remains usable while old internal coordinates move.
+
+The model should first reason over its own internal state: what route is
+active, what existing computation can be reused, what old geometry is still
+load-bearing, what capacity is free, what behavior must be preserved, and where
+a new write or rebasing operation would cause interference.
 
 The aim is a neural network that can change itself from inside the learning
 loop. A new pattern may be routed into an existing path, bridged to a related
@@ -69,21 +78,36 @@ path, written into a newly opened direction, or blocked from damaging protected
 geometry. Dormant structure should gradually lose ownership so that capacity
 can be reused. Repeated useful structure should consolidate into slower shared
 weights. In this view, stopping catastrophic forgetting is not only a matter of
-preserving old outputs; it is a matter of learning how to place, isolate,
-merge, rewire, compress, and decay internal writes.
+preserving old outputs or protecting old coordinates. It is a matter of
+learning how to place, isolate, merge, rewire, compress, decay, and sometimes
+coherently rebase internal representations while preserving behavior.
+
+A small same-spec transformer experiment that motivated this revision is
+written separately as [Continual Learning Is A Geometry Problem]({{ site.baseurl }}/continual-learning-geometry/).
+It compares three training paths: a model trained on 100 words, the same model
+continually updated on the next 100 words, and the same architecture trained
+from scratch on all 200 words. The key observation is that the successful
+200-word model moved the old 100-word residual states substantially while
+keeping behavior good. That weakens a purely "protect exact old activations"
+view and strengthens the need for behavior-preserving rebasing.
 
 ## 1. The Core Claim
 
 The thesis is:
 
 ```text
-continual learning is controlled writing under fixed capacity
+continual learning is behavior-preserving representational change
+under fixed capacity
 ```
 
 When a model learns new data, the update is not just a movement in parameter
-space. It is a write into the model's internal geometry. That write can be good
-if it reuses or extends the right computation. It causes forgetting when it
-damages geometry that old behavior still depends on.
+space. It is a change to the model's internal geometry. Sometimes that change
+is a local write into selected structure. Sometimes it is a route adjustment.
+Sometimes it may need to be a coordinated rebasing of the representation. The
+change is useful when it preserves old behavior while making new behavior
+possible. It causes forgetting when it damages geometry that old behavior still
+depends on, or when uncontrolled movement breaks readouts, routes, or feature
+relations.
 
 The thesis has four parts:
 
@@ -92,14 +116,15 @@ The thesis has four parts:
   misalignment, gate suppression, topology collapse, or capacity exhaustion.
 - **Protection alone is insufficient.** If every old direction is protected
   forever, fixed-capacity learning runs out of room. A real learner must also
-  merge, compress, rewire, decay, and reuse.
+  merge, compress, rewire, decay, reuse, and allow coherent rebasing when old
+  behavior can survive the coordinate change.
 - **Usage determines ownership.** Stable, active, behaviorally useful geometry
   should be expensive to disturb. Dormant or redundant geometry should become
   cheap to change.
-- **The write policy should be learned from geometry.** New data should first
-  be read through the current residual stream and route state, then written by
-  a mechanism that decides whether to reuse, split, bridge, create, protect,
-  compress, or decay.
+- **The update policy should be read from geometry.** New data should first be
+  read through the current residual stream and route state, then changed by a
+  mechanism that decides whether to reuse, split, bridge, create, protect,
+  rebase, compress, or decay.
 
 The page therefore follows two levels at the same time:
 
@@ -108,10 +133,11 @@ The page therefore follows two levels at the same time:
 - weight-level and topology-level geometry: which parameter paths route,
   transform, write, gate, and read those concepts.
 
-The long-term mechanism is a route-reuse-write-consolidate learner. New
+The long-term mechanism is a route-reuse-rebase-write-consolidate learner. New
 information should first search for reusable computation, then align or bridge
-related internal structure, then write only into selected paths, and finally
-consolidate repeated useful structure into slower shared weights.
+related internal structure, then decide whether the correct move is a local
+write, a route change, or a broader basis change, and finally consolidate
+repeated useful structure into slower shared weights.
 
 This is not meant to be an external memory system wrapped around a frozen
 model. The intended endpoint is a model-native architecture in which the
@@ -122,8 +148,8 @@ dynamics.
 ### A Simple Walkthrough
 
 Imagine the model receives a new fact, relation, or skill. Ordinary training
-turns that into a gradient and moves shared weights. The write-problem view
-asks the model to do more internal work before committing the update.
+turns that into a gradient and moves shared weights. The mechanistic view asks
+the model to do more internal work before committing the update.
 
 ```text
 new input arrives
@@ -133,6 +159,7 @@ new input arrives
 -> bridge the route if it is close but not aligned
 -> split or isolate the route if it conflicts with old behavior
 -> create a new path if nothing reusable exists
+-> rebase related geometry if a local write is too constrained
 -> write only into the selected structure
 -> consolidate if the pattern repeats and remains useful
 -> decay or compress old structure when usage disappears
@@ -141,7 +168,7 @@ new input arrives
 The important point is that the model should not treat every new error as a
 license to overwrite the same shared directions. It should first decide whether
 the new pattern is a reuse problem, a routing problem, a new-capacity problem,
-or an interference problem.
+an interference problem, or a representation-rebasing problem.
 
 ## 2. What Continual Learning Work Has Established
 
@@ -233,17 +260,23 @@ not just another fine-tuning run
 ### 2.6 What This Work Adds So Far
 
 The previous section is about the outside field. This page adds a narrower
-working claim: the missing object is the write itself. It is not enough to know
-that old and new tasks interfere. We need to know what internal structure a
-candidate update will move, whether that structure is still useful, and whether
-the model can route around it.
+working claim: the missing object is the internal geometry changed by the
+update. It is not enough to know that old and new tasks interfere. We need to
+know what representation, route, readout, or capacity relationship a candidate
+update will move; whether that structure is still useful; whether old behavior
+can survive the movement; and whether the model can route around, reuse, or
+rebase the structure instead of blindly overwriting it.
 
-The current evidence, kept in the [living log](/living-paper/), supports a few
-limited points:
+The current evidence, kept in the [living log]({{ site.baseurl }}/living-paper/)
+and in the small [geometry-rebasing case study]({{ site.baseurl }}/continual-learning-geometry/),
+supports a few limited points:
 
 - forgetting can be decomposed into route drift, write drift, readout drift,
   gating failure, and overwrite collision;
 - protecting individual weights or neurons is too local to solve the problem;
+- preserving exact old activations can also be too rigid, because successful
+  same-capacity learning of more data can move old residual states substantially
+  while preserving behavior;
 - geometric route reasoning can decide when to reuse, split, or protect a path
   in controlled settings;
 - learned route construction can grow a gate for a novel key while staying
@@ -252,11 +285,12 @@ limited points:
   active, but they do not yet solve full heldout retention.
 
 So the evidence does not yet prove a finished continual learner. It narrows the
-engineering target: build a model that can read its own state, choose where the
-write belongs, reuse existing computation when possible, rewire when necessary,
-and decay unused structure without destroying useful old geometry.
+engineering target: build a model that can read its own state, choose whether a
+local write is enough, reuse existing computation when possible, rewire when
+necessary, allow coordinated rebasing when capacity pressure requires it, and
+decay unused structure without destroying useful old behavior.
 
-## 3. The Gap: We Still Do Not Know Where The Write Went
+## 3. The Gap: We Still Do Not Know What Geometry The Update Changed
 
 Existing work gives strong partial answers:
 
@@ -275,7 +309,8 @@ Existing work gives strong partial answers:
 But these approaches still leave one central question under-specified:
 
 ```text
-What latent representation and circuit does a candidate update move?
+What latent representation, circuit, route, readout, or basis
+does a candidate update move?
 ```
 
 They also leave a governing question under-specified:
@@ -286,7 +321,7 @@ Once we know what an update will move, how do we decide whether that circuit des
 
 The working answer here is usage-driven capacity ownership. Old circuits should not be protected merely because they are old or because they belong to a named task. They should be protected in proportion to their current interaction history. A circuit that has not been used for a long time should contribute little protection cost. A circuit that fires often, propagates strongly, or causally supports behavior should be expensive to disturb.
 
-This also addresses the null-space problem in subspace-projection methods. If every old activation subspace is permanently protected, the available null space shrinks with each task until there is nowhere left to write. Fixed-capacity learning cannot rely only on indefinite protection. It also needs compression: repeated or related memories must merge into abstractions, and low-usage details must fade so capacity can be reclaimed.
+This also addresses the null-space problem in subspace-projection methods. If every old activation subspace is permanently protected, the available null space shrinks with each task until there is nowhere left to write. Fixed-capacity learning cannot rely only on indefinite protection. It also needs compression and rebasing: repeated or related memories must merge into abstractions, old coordinates may need to move together, and low-usage details must fade so capacity can be reclaimed.
 
 The useful measurement chain is:
 
@@ -311,7 +346,11 @@ Task A dropped because the old concept subspace remained decodable,
 but the readout rotated away from it after the Task B update.
 ```
 
-That second diagnosis is mechanistic. It suggests a different fix than if the representation were erased or if the attention route had drifted.
+That second diagnosis is mechanistic. It suggests a different fix than if the
+representation were erased or if the attention route had drifted. It also leaves
+room for the case where a large representation movement is not failure: if the
+old behavior and functional relations survive, the movement may be useful
+rebasing rather than destructive forgetting.
 
 ## 4. How Forgetting Breaks Internally
 
@@ -579,17 +618,21 @@ Full hidden-state Jacobians are too expensive for realistic models, so the pract
 
 The Neural Tangent Kernel literature motivates viewing training dynamics in function space rather than only parameter space. See [Jacot et al., 2018](https://arxiv.org/abs/1806.07572).
 
-## 9. How I Am Aiming To Solve It: Read, Route, Reuse, Write, Consolidate
+## 9. How I Am Aiming To Solve It: Read, Route, Reuse, Rebase, Write, Consolidate
 
 The intervention is not immediate rewriting of shared computation. The model
-should first inspect what is already happening inside itself, then decide where
-the new signal belongs.
+should first inspect what is already happening inside itself, then decide what
+kind of change is needed. Sometimes the right change is a local write. Sometimes
+it is a route adjustment. Sometimes the old and new data require a coordinated
+representational rebasing where old internal coordinates move while old
+behavior remains usable.
 
 The rough loop is:
 
 ```text
 read internal state
 -> route or reuse existing computation
+-> rebase related geometry if local writing is too constrained
 -> write into selected structure
 -> protect what is still load-bearing
 -> consolidate repeated useful structure
@@ -608,6 +651,7 @@ The write question is:
 what computation is already active,
 what part of it can be reused,
 where would a new write collide,
+does the current representation need to rebase,
 and what should change inside the network?
 ```
 
@@ -616,9 +660,14 @@ also deciding the form of the update:
 
 ```text
 new input + residual stream + current routes + usage history
--> reuse / bridge / split / create / protect / decay
+-> reuse / bridge / split / create / rebase / protect / decay
 -> targeted state change
 ```
+
+The target is therefore not "hold every old residual vector fixed." The target
+is to preserve useful behavior, useful relations, and load-bearing routes while
+allowing internal coordinates to move when that movement is coherent and
+behavior-preserving.
 
 ### 9.1 Read The Internal State
 
@@ -650,7 +699,8 @@ observer_t =
 
 The observer does not need symbolic labels. It only needs enough geometry to
 answer: does this input belong to an existing computation, does it need a new
-route, or will writing here damage something still useful?
+route, will writing here damage something still useful, or is the current
+representation itself too constrained and in need of rebasing?
 
 ### 9.2 Route And Reuse Computation
 
@@ -688,9 +738,61 @@ new input
 
 If the route is close but not compatible, the model should bridge it. If the
 route collides with an old role, it should split. If there is no related
-computation, it should create a new path.
+computation, it should create a new path. If multiple related routes are being
+pulled into a new arrangement while behavior can remain stable, the model may
+need to rebase the shared representation rather than protect all old coordinates
+as fixed addresses.
 
-### 9.3 Write Into Selected Structure
+### 9.3 Rebase The Representation When Needed
+
+A controlled rebasing operation is different from a local write. A local write
+tries to place new information into selected structure while leaving most of the
+old geometry nearly fixed. A rebasing operation allows a family of related
+states to move together so that the model can create a better shared coordinate
+system.
+
+The case study on [continual-learning geometry]({{ site.baseurl }}/continual-learning-geometry/)
+shows why this matters. The same tiny transformer trained from scratch on 200
+words learned both the old and new spans well, but its old 100-word residual
+states moved substantially relative to the 100-word-only model:
+
+```text
+final-layer effective rank: 74.32 -> 87.87
+relative matched drift: 0.7880
+CKA: 0.4906
+```
+
+By contrast, a safe continual update barely moved the old geometry:
+
+```text
+relative matched drift: 0.0779
+CKA: 0.9930
+new span remained mostly unlearned
+```
+
+An aggressive continual update moved more, but still not enough or coherently
+enough:
+
+```text
+relative matched drift: 0.1348
+old margin weakened
+new span remained poorly learned
+```
+
+This suggests that useful continual learning may need a controlled operation
+between exact preservation and blind fine-tuning:
+
+```text
+old and new states move together
+old behavior remains decodable and causally usable
+readouts/routes adapt with the moved representation
+capacity rank or basis expands where needed
+```
+
+The open problem is detecting when drift is destructive and when drift is
+useful rebasing.
+
+### 9.4 Write Into Selected Structure
 
 Once routing has identified where the signal belongs, the write should be local
 and selective. The update can target several kinds of internal state:
@@ -738,7 +840,7 @@ or redirect a route into a reusable operator. The weight value says how strongly
 a path fires; the topology says whether that path should exist as a learning
 route at all.
 
-### 9.4 Consolidate, Compress, And Decay
+### 9.5 Consolidate, Compress, And Decay
 
 Only after routing and alignment are established should shared weights be considered for slower consolidation. Consolidation is the stage where new usage may be absorbed into shared computation, but only if mechanistic invariants suggest existing roles are preserved.
 
@@ -746,6 +848,7 @@ Candidate invariants include:
 
 - old route and readout behavior remain causally intact;
 - aligned representations stay close enough to their related family geometry;
+- old behavior survives if the family geometry moves coherently;
 - high-usage circuits do not suffer large latent drift;
 - new learning does not only succeed by suppressing old computation;
 - the update improves reusable structure rather than memorizing a narrow case.
@@ -811,7 +914,7 @@ Slow shared weights should change only after evidence accumulates:
 - high-usage roles are preserved under causal and geometric checks;
 - compression or abstraction can release capacity when needed.
 
-This is not "temporary memory versus permanent memory" as separate kinds of knowledge. It is one usage landscape operating across timescales. Fast state absorbs novelty. Routes connect novelty to reusable computation. Slow weights consolidate patterns only when they are repeated, useful, aligned, and safe to write into the current feature-family geometry.
+This is not "temporary memory versus permanent memory" as separate kinds of knowledge. It is one usage landscape operating across timescales. Fast state absorbs novelty. Routes connect novelty to reusable computation. Slow weights consolidate patterns only when they are repeated, useful, aligned, and safe to absorb into the current feature-family geometry. When the current geometry is too constrained, the harder question is whether related representations can rebase together without breaking old behavior.
 
 ## 11. How I Am Working On It
 
@@ -825,18 +928,20 @@ The planned direction is:
 - distinguish route failure from representation failure and readout failure;
 - study whether new information can be routed into existing reusable computation;
 - measure when related routes share latent geometry and when they diverge;
+- measure when old representations can move coherently without behavioral loss;
 - develop consolidation rules for deciding when shared weights should change;
-- study capacity boundaries where routing is not enough and abstraction or compression is required.
+- study capacity boundaries where routing is not enough and rebasing,
+  abstraction, or compression is required.
 
-The aim is not to claim a finished continual-learning algorithm. The aim is to build a mechanistic path toward models that can reuse, align, and consolidate knowledge without blindly overwriting the circuits that already support useful behavior.
+The aim is not to claim a finished continual-learning algorithm. The aim is to build a mechanistic path toward models that can reuse, align, rebase, and consolidate knowledge without blindly overwriting the circuits that already support useful behavior.
 
 ## 12. Where This Can Break
 
-The main risks are that concept subspaces may rotate across checkpoints, concepts may be superposed rather than cleanly separable, full Jacobian measurements may be too expensive, and consolidation rules may over-protect old knowledge at the cost of new learning. The practical response is to use representation-similarity methods such as CKA, treat concepts as subspaces rather than single axes, rely on JVP/VJP and blockwise approximations instead of full Jacobians, and evaluate stability and plasticity together rather than optimizing preservation alone.
+The main risks are that concept subspaces may rotate across checkpoints, concepts may be superposed rather than cleanly separable, full Jacobian measurements may be too expensive, and consolidation rules may over-protect old knowledge at the cost of new learning. The new rebasing evidence adds another risk: exact activation preservation may look safe while silently blocking the kind of coordinated movement needed for more data. The practical response is to use representation-similarity methods such as CKA, treat concepts as subspaces rather than single axes, rely on JVP/VJP and blockwise approximations instead of full Jacobians, and evaluate stability, plasticity, and behavior-preserving drift together rather than optimizing preservation alone.
 
 ## 13. What Would Change This Direction?
 
-This direction would be weakened if representation drift does not predict forgetting better than simpler measures such as parameter distance, gradient norm, or old-task loss; if usage history does not predict which circuits deserve protection; if probe-measured concept drift is mostly non-causal; if old behavior fails even when latent geometry and circuit ledgers remain stable; if compression destroys useful specifics without producing better abstraction; or if consolidation rules reduce forgetting only by preventing new learning. These outcomes would suggest that the latent-tangent and usage-driven measurements are incomplete or that the intervention is over-constraining plasticity.
+This direction would be weakened if representation drift does not predict forgetting better than simpler measures such as parameter distance, gradient norm, or old-task loss; if usage history does not predict which circuits deserve protection; if probe-measured concept drift is mostly non-causal; if old behavior fails even when latent geometry and circuit ledgers remain stable; if large coordinated drift cannot be distinguished from destructive drift; if compression destroys useful specifics without producing better abstraction; or if consolidation rules reduce forgetting only by preventing new learning. These outcomes would suggest that the latent-tangent, rebasing, and usage-driven measurements are incomplete or that the intervention is over-constraining plasticity.
 
 ## References
 

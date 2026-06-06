@@ -10755,3 +10755,1190 @@ direct geometric write solver
 structural topology and operator creation
 offline anchor/Jacobian sleep phase
 ```
+
+## 2026-06-03 Native GCO Scratch Transformer: Outcome-Controlled Writing
+
+This batch moved the native scratch transformer from "many active controllers"
+toward a cleaner test of the core learning law:
+
+```text
+backward gradients = local error signals
+GCO direct write    = native parameter edit
+outcome utility     = measured teacher
+pressure/state      = memory
+```
+
+No `torch.optim` optimizer is used in this script. Backward is still used, but
+only to expose error signals for GCO's own update.
+
+### Control bug fixed: useful writes should not be punished below neutral
+
+Problem:
+
+```text
+U_outcome > 0
+advantage = U_outcome - baseline < 0
+```
+
+Earlier, negative advantage could train the write target below neutral even
+though the edit helped the loss. This confused:
+
+```text
+less useful than recent average
+```
+
+with:
+
+```text
+harmful write
+```
+
+Current rule:
+
+```text
+target_write =
+0.5 + 0.5 * tanh(
+  warmup(t) *
+  clamp(route_advantage / route_credit_scale, -clip, +clip)
+)
+
+if U_outcome > 0:
+  target_write = max(target_write, positive_utility_write_floor)
+```
+
+With `positive_utility_write_floor = 0.5`, useful writes cannot push the write
+gate below neutral.
+
+Evidence:
+
+```text
+gco-native-positive-write-floor-fit80-seed0.json
+
+U=+1.28e-05
+adv=-4.89e-06
+target=0.500/0.500/0.500
+```
+
+This fixed the target, but revealed the next bug: the raw write gate still fell
+to about `0.388`, because the internal heuristic gate teacher was also training
+the write gate.
+
+### Write gate separated from the internal heuristic teacher
+
+Problem in code:
+
+```text
+gate_utility = hand-designed local proxy
+gate_error   = gate_utility - gates
+```
+
+For the write gate, this local proxy can say "write less" while measured
+outcome says the edit helped.
+
+Implemented a separate scale:
+
+```text
+--internal-write-gate-lr-scale
+```
+
+Run:
+
+```text
+gco-native-outcome-controlled-write-fit80-seed0.json
+```
+
+Result:
+
+```text
+write_gate_raw_mean              0.5034
+outcome_credit_write_gate_mean   0.5039
+outcome_credit_gate_error        0.0039
+```
+
+The write gate no longer collapsed. Compared with the prior floor-only run:
+
+```text
+floor-only write raw             0.3879
+outcome-controlled write raw     0.5034
+```
+
+Decision: the write gate must be trained by measured outcome credit, not only
+by local hand-designed utility.
+
+### Formation separated from write-gate advantage
+
+The next issue was that formation/hardening remained very weak. The key
+correction:
+
+```text
+advantage = U - baseline       -> trains write gate
+max(0, U)                      -> builds formation evidence
+max(0, -U)                     -> failure / rewire pressure
+inactive + old + low utility   -> decay candidate
+```
+
+Implemented route formation credit:
+
+```text
+route_formation_raw =
+max(0, U_outcome)
+* global_eligibility_share
+* total_selected_count
+
+formation_logits =
+warmup(t)
+* clamp(route_formation_raw / route_formation_scale, 0, route_formation_clip)
+
+formation_credit = tanh(formation_logits)
+
+F_ij <- F_ij + outcome_formation_lr * formation_credit_ij * (1 - F_ij)
+```
+
+Run:
+
+```text
+gco-native-positive-utility-formation-fit80-seed0.json
+```
+
+Final result:
+
+```text
+U=+1.65e-05
+adv=-6.77e-07
+target=0.500/0.500/0.500
+form=0.291/0.964
+gate=0.504
+err=0.004
+
+active_hardening_fraction    0.00881
+active_crystalline_fraction  0.00000
+```
+
+This is roughly a 10x hardening increase over the prior outcome-controlled
+write run:
+
+```text
+before formation split: active_hardening ~= 0.00085
+after formation split:  active_hardening ~= 0.00881
+```
+
+Decision: positive measured utility must build route identity even when the
+write is not above the recent baseline.
+
+### Outcome-only ablation
+
+The next question was whether the remaining bottleneck was still the internal
+heuristic reasoner. We disabled nearly all extra controllers:
+
+```text
+--reasoner-lr 0
+--internal-gate-lr-scale 0
+--internal-write-gate-lr-scale 0
+--grow-lr 0
+--prune-lr 0
+--forget-lr 0
+```
+
+Also added:
+
+```text
+--min-active-topology 0.05
+```
+
+so direct writes use:
+
+```text
+effective_write_direction = DeltaW_effective / max(A, min_active_topology)
+```
+
+instead of division by `eps`, which would become unstable if topology is ever
+pruned near zero.
+
+Run:
+
+```text
+gco-native-outcome-only-formation-fit80-seed0.json
+```
+
+Final result:
+
+```text
+write_gate_mean              0.5030
+active_hardening_fraction    0.00884
+active_crystalline_fraction  0.00000
+form                         0.293/0.964
+U                            +1.67e-05
+adv                          -5.17e-07
+rewire                       0
+forget                       0
+```
+
+This is almost identical to the positive-utility formation run:
+
+```text
+positive-utility formation: active_hardening = 0.00881
+outcome-only ablation:      active_hardening = 0.00884
+```
+
+Decision: at this stage, the internal heuristic reasoner is no longer the main
+blocker. Direct write + outcome formation is producing the same behavior.
+
+### Current interpretation
+
+What is now working:
+
+```text
+write gate stays healthy around 0.5
+same-batch direct writes reduce loss
+positive utility reaches formation state
+hardening begins
+failure, rewire, and forget remain suppressed when not justified
+```
+
+What is still not working:
+
+```text
+hardening remains small, about 0.9% active mass
+crystalline never activates
+language-model fitting is still weak
+topology rewiring is not being tested yet
+controlled forgetting is not being tested yet
+```
+
+Current bottleneck:
+
+```text
+formation is too fragmented at individual W_ij entries.
+Circuits are groups/routes, not single weights.
+```
+
+Likely next fixes:
+
+```text
+1. multi-scale formation memory:
+   F_effective_ij =
+     a F_ij
+   + b F_row_i
+   + c F_col_j
+   + d F_module
+
+2. hardening hysteresis:
+   enter_hardening if F_effective > tau_enter
+   exit_hardening  if F_effective < tau_exit
+   with tau_exit < tau_enter
+
+3. AdamW one-chunk architecture control:
+   if AdamW cannot overfit this tiny chunk, the architecture is underpowered;
+   if AdamW can, GCO direct write/error scaling is the bottleneck.
+
+4. module policy ablation:
+   direct write MLP/lm_head/embedding first;
+   treat attention more carefully because q/k/v/o writes pass through softmax.
+```
+
+Current status:
+
+```text
+The native GCO scratch loop is no longer self-sabotaging.
+It can write and build some formation from measured outcomes.
+The next problem is making formation persist at circuit/route scale.
+```
+
+## 2026-06-03 GCO-SSR: State-Space Route Reasoner
+
+GCO-SSR is the first version of the GCO reasoner that treats reasoning as a
+bounded route-state controller instead of a flat set of scalar thresholds.
+
+The core change:
+
+```text
+old direction:
+  per-weight features -> scalar gates
+
+GCO-SSR direction:
+  route observations -> bounded hidden route state -> write/value heads
+```
+
+This matters because the recent multi-scale formation experiments showed that
+useful structure does not live only at individual `W_ij` entries. It appears
+more strongly at route scale:
+
+```text
+row route     = output neuron / output feature
+column route  = input feature
+module route  = whole matrix/layer
+entry route   = selected W_ij, used only for final write targeting
+```
+
+So for each trainable matrix:
+
+```text
+W in R^{d_out x d_in}
+```
+
+GCO-SSR maintains:
+
+```text
+x_row[i] in R^d
+x_col[j] in R^d
+x_mod    in R^d
+```
+
+where `d` is small. First implementation used:
+
+```text
+d = 8
+```
+
+### Route Observation
+
+Each route receives a normalized observation vector:
+
+```text
+o_r,t = [
+  activation,
+  local_error,
+  usage,
+  recency,
+  pressure,
+  formation_effective,
+  protection,
+  decay,
+  direct_write_basis,
+  protected_capacity,
+  free_capacity,
+  plastic_capacity,
+  obsolete_capacity,
+  capacity_state,
+  recurrent_state,
+  topology
+]
+```
+
+All observations are clipped into bounded ranges. The reasoner does not see
+raw unbounded values.
+
+For row, column, and module routes, weight-level observations are pooled:
+
+```text
+o_row_i = pool_j(o_ij)
+o_col_j = pool_i(o_ij)
+o_mod   = pool_{i,j}(o_ij)
+```
+
+The current run used max pooling, matching the successful multi-scale
+formation setting:
+
+```text
+--formation-multiscale-pooling max
+```
+
+### Bounded State Update
+
+Each route state is updated by a bounded state-space equation:
+
+```text
+x_{r,t+1} =
+tanh(
+    A x_{r,t}
+  + B o_{r,t}
+  + C credit_{r,t}
+  + b
+)
+```
+
+The `tanh` bound is intentional. It prevents early state explosion while still
+allowing route memory to evolve over time.
+
+### Write And Value Heads
+
+For each route:
+
+```text
+z_r = concat(x_r, o_r)
+```
+
+The state-space reasoner predicts:
+
+```text
+g_write_r = sigmoid(w_write^T z_r + b_write)
+V_r       = w_value^T z_r + b_value
+```
+
+The row/column/module write gates are combined into a weight-level write gate:
+
+```text
+logit_write_ij =
+(
+    logit_write_row_i
+  + logit_write_col_j
+  + logit_write_mod
+) / 3
+
+g_write_ij = sigmoid(logit_write_ij)
+```
+
+The direct write remains mathematical:
+
+```text
+Delta W* =
+- E X^T (X X^T + lambda_p P_protect + lambda I)^-1
+```
+
+But GCO-SSR controls where that write lands:
+
+```text
+write_score_ij =
+g_write_ij
+* |Delta W*_ij|
+* route_eligibility_ij
+
+K_write = dynamic_top_budget(write_score)
+
+Delta W_final =
+K_write * g_write_ij * Delta W*
+```
+
+This keeps the write mechanism grounded in the local residual/error geometry,
+while making the selection policy route-state dependent.
+
+### Outcome Credit
+
+After the write is applied, the same batch is evaluated again:
+
+```text
+U_t =
+(loss_before - loss_after) / |loss_before|
+- edit_cost
+- capacity_cost
+- rewire_cost
+- forget_cost
+```
+
+Route formation receives positive utility:
+
+```text
+formation_credit_r =
+eligibility_r * max(0, U_t)
+```
+
+Write/value heads receive route credit:
+
+```text
+A_r =
+eligibility_r * (U_t - baseline)
+
+target_write_r =
+0.5 + 0.5 * tanh(A_r / route_credit_scale)
+```
+
+The value head learns a first simple route-utility prediction:
+
+```text
+delta_value_r =
+A_r - V_r
+```
+
+Later versions should replace this with a longer-horizon TD target:
+
+```text
+delta_r =
+credit_r + gamma V_{r,t+1} - V_{r,t}
+```
+
+The current implementation is deliberately Stage 1:
+
+```text
+enabled:
+  direct write
+  multi-scale formation
+  row/column/module state-space write reasoner
+  value head
+  positive outcome route credit
+
+disabled:
+  rewire
+  forget
+  compress
+  crystalline
+  strong protection
+```
+
+### Stage 1 Run
+
+Run:
+
+```text
+gco-native-ssr-write-fit80-seed0.json
+```
+
+Key command settings:
+
+```text
+--chunk-count 1
+--epochs-per-chunk 80
+--state-space-reasoner-dim 8
+--state-space-reasoner-lr 0.001
+--state-space-value-lr 0.001
+--state-space-write-blend 1
+--state-space-credit-beta 0.95
+--hardening-protection-strength 0
+--structural-protect-strength 0
+--grow-lr 0
+--prune-lr 0
+--forget-lr 0
+```
+
+Final result:
+
+```text
+eval loss                         7.2198
+canary loss                       7.2830
+canary token accuracy             0.0684
+canary target margin              -1.3998
+
+active_hardening_fraction         0.4473
+active_hardening_latch_fraction   0.4473
+formation_effective_mean          0.2848
+
+SSR row state norm mean/max       0.1272 / 0.2212
+SSR col state norm mean/max       0.1380 / 0.2268
+SSR module state norm mean/max    0.1726 / 0.2267
+
+SSR write gate mean/max           0.5210 / 0.5776
+SSR value prediction mean/max     +0.00106 / +0.0353
+SSR credit mean/max               0.3829 / 0.9640
+SSR TD error abs mean/max         0.00244 / 0.00471
+SSR update norm                   0.0238
+
+write_edit_fraction               0.0245
+safe_update_norm                  0.00207
+```
+
+Trajectory:
+
+```text
+step   loss     SSRgate mean/max   SSRcredit   SSRtd_abs   active_hardening
+1      7.6217   0.502 / 0.526      0.0000      0.0000      0.000
+100    7.4637   0.510 / 0.545      0.4153      0.0263      0.384
+300    7.3432   0.518 / 0.561      0.4098      0.0060      0.436
+600    7.2799   0.520 / 0.562      0.3932      0.0027      0.449
+950    7.2101   0.521 / 0.577      0.3816      0.0024      0.452
+```
+
+### Comparison To Previous One-Chunk Runs
+
+Earlier non-SSR runs:
+
+```text
+outcome-controlled write:
+  canary_loss              7.4380
+  canary_margin            -1.0263
+  active_hardening         0.00085
+  write_edit_fraction      0.00324
+  update_norm              0.000317
+
+positive-utility formation:
+  canary_loss              7.4516
+  canary_margin            -1.0416
+  active_hardening         0.00881
+  write_edit_fraction      0.00301
+  update_norm              0.000441
+
+multi-scale formation:
+  canary_loss              7.2946
+  canary_margin            -1.2739
+  active_hardening         0.2919
+  write_edit_fraction      0.02430
+  update_norm              0.00205
+```
+
+GCO-SSR write:
+
+```text
+canary_loss                7.2830
+canary_margin              -1.3998
+active_hardening           0.4473
+write_edit_fraction        0.02451
+update_norm                0.00207
+```
+
+Interpretation:
+
+```text
+GCO-SSR write improves fitting and route formation.
+It creates substantially more hardening than multi-scale formation alone.
+The route-state controller is not stuck at neutral gates.
+The state remains bounded.
+The value error becomes small.
+```
+
+But:
+
+```text
+canary margin worsened.
+```
+
+This means SSR is currently a stronger writer, not yet a protector. That is
+expected because Stage 1 disabled structural protection:
+
+```text
+--hardening-protection-strength 0
+--structural-protect-strength 0
+```
+
+### Current Decision
+
+GCO-SSR is promising enough to keep.
+
+Why:
+
+```text
+1. It learns non-neutral route gates.
+2. It improves one-chunk fitting.
+3. It increases active hardening from ~0.29 to ~0.45.
+4. Its state norms remain bounded.
+5. Its TD/value error falls to a small number.
+```
+
+What it does not prove yet:
+
+```text
+1. It does not yet solve forgetting.
+2. It does not yet protect semantic ranking geometry.
+3. It does not yet reason over rewire/forget/compress actions.
+4. It has only been tested as a write reasoner, not a full GCO controller.
+```
+
+Next experiment:
+
+```text
+GCO-SSR write + soft structural protection, 3 chunks
+```
+
+Goal:
+
+```text
+Keep the stronger SSR write formation,
+but recover the canary-margin stability seen in the protection runs.
+```
+
+Healthy result would look like:
+
+```text
+SSRgate > 0.5 and non-uniform
+Hlat around 0.4-0.45
+old chunk losses do not degrade
+canary margin drift improves compared with SSR-write-only pressure
+struct / Pin / lambdaP are nonzero but not large enough to starve writes
+```
+
+## 2026-06-06 Native GCO Tiny-Book CL And Geometry Pivot
+
+This update records the work after the GCO-SSR write/protect runs. The main
+shift is that the write mechanism alone is no longer treated as the whole
+solution. The recent experiments show that safe writes, projection, and route
+selection can work mechanically, but the harder problem is capacity and
+representational geometry: the model needs somewhere useful to put new
+information without only cutting through saturated old circuits.
+
+### Reasoner Direction: What Changed
+
+We tested three reasoner directions:
+
+```text
+1. Nested/SSR-style reasoner
+   A small state-space/neural controller observes route state and predicts
+   write/protect/rewire/forget/compress gates.
+
+2. Fixed algorithmic geometric reasoner
+   A non-training controller maps pressure, error, capacity, collision,
+   reuse, and route activity into edit gates.
+
+3. Two-phase optimizer schedule
+   First sculpt a usable base model. Only after base stability do CL controls
+   activate: pressure, protection, rewiring, forgetting, and compression.
+```
+
+The nested/SSR direction showed useful behavior as a writer, but it also raised
+the main concern: if the reasoner must keep training online forever, the system
+drifts toward nested learning/hypernetwork-like instability and higher compute.
+That does not match the intended GCO design. The intended reasoner should be
+dynamic because its inputs change, not because its policy keeps changing every
+step.
+
+Current stance:
+
+```text
+SSR / nested reasoner:
+  useful as a prototype for what signals matter,
+  but risky as a constantly trained inner learner.
+
+Fixed algorithmic reasoner:
+  stable and cheap,
+  but currently too weak to produce strong learning by itself.
+
+Two-phase GCO:
+  conceptually cleaner:
+  train/sculpt first, then enter CL mode once a base geometry exists.
+```
+
+### Important Recent Result: From-Scratch GCO Is Not The Right First Test
+
+The scratch transformer runs showed that when the model starts from random
+weights, the CL controls mostly stay in sculpting and the committed updates are
+very small.
+
+Representative two-phase/fixed-geometric run:
+
+```text
+final P=0.020/0.998
+S/H/C=1.00/0.00/0.00
+active=1.00/0.00/0.00
+ctrl=0.002
+update=1.67e-05
+write=0.109/0.00555->0.00555
+W_delta=1.67e-05
+old protected controls mostly off
+```
+
+Interpretation:
+
+```text
+The model is still sculpting.
+The CL machinery has little meaningful geometry to protect.
+Reasoning from the first step creates unstable or tiny edits.
+The better experiment is to start CL from a fitted tiny model with anchors.
+```
+
+So the current experimental foundation changed to:
+
+```text
+Stage 1: train a tiny transformer normally until the first text is fitted.
+Stage 2: record protected geometry and probe anchors.
+Stage 3: introduce new data with GCO write/protect/rewrite controls.
+Stage 4: measure whether new data can be learned without old geometry damage.
+```
+
+This does not abandon native GCO. It isolates the CL problem after the model has
+something real to preserve.
+
+### Tiny 100-Word Base Model
+
+Base model trained on the first meaningful 100-word book slice:
+
+```text
+loss 7.700589 -> 0.014533
+best_loss=0.014110
+token_acc=0.9913
+margin=11.4909/-1.3982
+checkpoint=model/checkpoints/gco-tiny-cl-base-100w-seed0.pt
+anchors=model/analysis/gco-tiny-cl-base-100w-anchors-seed0.pt
+```
+
+This is the first useful CL testbed because the old task is close to zero loss
+and has measurable anchor geometry.
+
+### Dense Base: Reasoned Write Sweep
+
+After fitting the 100-word base, we introduced a different new text and applied
+GCO reasoned writes without full fine-tuning.
+
+Write-strength sweep:
+
+```text
+lr=0.05
+old_loss 0.014533->0.014534
+old_acc  0.9913->0.9913
+old_margin 11.4909->11.4843
+new_loss 13.628014->13.310095
+new_acc  0.0549->0.0558
+accepted=198 rejected=22
+anchor_drift path=0.002692/0.006248 act=0.01326/0.02923 top=0.0005929/0.003327
+
+lr=0.10
+old_loss 0.014533->0.014534
+old_acc  0.9913->0.9913
+old_margin 11.4909->11.4773
+new_loss 13.628014->13.088220
+new_acc  0.0549->0.0581
+accepted=197 rejected=23
+anchor_drift path=0.005436/0.01281 act=0.02602/0.05672 top=0.001082/0.005357
+
+lr=0.20
+old_loss 0.014533->0.014534
+old_acc  0.9913->0.9913
+old_margin 11.4909->11.4556
+new_loss 13.628014->12.802119
+new_acc  0.0549->0.0593
+accepted=190 rejected=30
+anchor_drift path=0.01024/0.02397 act=0.05084/0.1188 top=0.001886/0.009967
+
+lr=0.40
+old_loss 0.014533->0.014645
+old_acc  0.9913->0.9913
+old_margin 11.4909->11.3909
+new_loss 13.628014->12.397975
+new_acc  0.0549->0.0661
+accepted=169 rejected=51
+anchor_drift path=0.01933/0.04742 act=0.08837/0.1911 top=0.004169/0.02007
+```
+
+What worked:
+
+```text
+1. Old token accuracy stayed stable.
+2. Anchor drift stayed measurable and bounded at lower write strengths.
+3. Larger writes improved new loss.
+4. The accept/reject mechanism worked mechanically.
+```
+
+What failed:
+
+```text
+1. New learning was weak even at lr=0.40.
+2. Old margin eroded as new loss improved.
+3. Global accept/reject is too blunt.
+4. Safe writing alone does not create enough useful new capacity.
+```
+
+Conclusion:
+
+```text
+Safe writes are necessary but not sufficient.
+They reduce catastrophic overwrite, but they do not solve capacity.
+```
+
+### Projection And Strict Acceptance
+
+Strict acceptance at lr=0.40:
+
+```text
+old_loss 0.014533->0.014556
+old_acc  0.9913->0.9913
+old_margin 11.4909->11.3949
+new_loss 13.628014->12.782550
+new_acc  0.0549->0.0591
+accepted=58 rejected=162
+anchor_drift path=0.01658/0.04189 act=0.07316/0.1715 top=0.002916/0.01489
+```
+
+Projected writes:
+
+```text
+proj1
+old_loss 0.014533->0.014558
+old_acc  0.9913->0.9913
+old_margin 11.4909->11.4016
+new_loss 13.628014->12.457584
+new_acc  0.0549->0.0661
+accepted=170 rejected=50
+anchor_drift path=0.0183/0.04222 act=0.08321/0.1875 top=0.00334/0.01608
+
+proj2
+old_loss 0.014533->0.014550
+old_acc  0.9913->0.9913
+old_margin 11.4909->11.3884
+new_loss 13.628014->12.466713
+new_acc  0.0549->0.0661
+accepted=178 rejected=42
+anchor_drift path=0.01582/0.03651 act=0.0799/0.1808 top=0.00325/0.01639
+```
+
+Interpretation:
+
+```text
+Projection helps.
+It reduces drift relative to naive stronger writes.
+But projection does not by itself find a better representational place for the
+new data.
+```
+
+### Rewiring Attempts
+
+Passive growth at lr=0.40:
+
+```text
+old_loss 0.014533->0.014828
+old_acc  0.9913->0.9911
+old_margin 11.4909->11.3925
+new_loss 13.628014->12.472599
+new_acc  0.0549->0.0659
+accepted=170 rejected=50
+anchor_drift path=0.01833/0.0423 act=0.08816/0.1993 top=0.003364/0.01739
+```
+
+Aggressive second-trial isolation:
+
+```text
+old_loss 0.014533->0.031328
+old_acc  0.9913->0.9901
+old_margin 11.4909->9.0665
+new_loss 13.628014->10.083992
+new_acc  0.0549->0.0614
+accepted=69 rejected=151
+rw2_attempted=220 rw2_selected=68
+anchor_drift path=0.06369/0.2541 act=0.1343/0.2982 top=0.01343/0.037
+```
+
+Safer second-trial isolation:
+
+```text
+old_loss 0.014533->0.014646
+old_acc  0.9913->0.9913
+old_margin 11.4909->11.2705
+new_loss 13.628014->12.695144
+new_acc  0.0549->0.0572
+accepted=62 rejected=158
+rw2_attempted=220 rw2_selected=57
+anchor_drift path=0.01145/0.02694 act=0.05604/0.1382 top=0.002392/0.009231
+```
+
+Interpretation:
+
+```text
+Second-trial rewiring works mechanically.
+But on a saturated dense base, isolation/pruning mostly cuts through routes
+that old behavior still depends on.
+Aggressive isolation improves new loss but damages old memory.
+Strict isolation protects old loss but weakens new learning.
+```
+
+Conclusion:
+
+```text
+Do not continue isolation-based rewiring on saturated dense topology.
+It is not a fair test of rewiring because there is no clean reserve capacity.
+```
+
+### Sparse Reserve Base Test
+
+To test whether unused routes help, the base model was retrained with sparse
+reserved topology:
+
+```text
+loss 7.663120 -> 0.019917
+best_loss=0.019917
+old_acc=0.9914
+margin=7.9301/-1.7341
+active_topology_fraction ~= 0.70
+reserve_topology_fraction ~= 0.30
+checkpoint=model/checkpoints/gco-tiny-cl-base-100w-sparse70-seed0.pt
+anchors=model/analysis/gco-tiny-cl-base-100w-sparse70-anchors-seed0.pt
+```
+
+Sparse70 growth + projection CL:
+
+```text
+old_loss 0.019917->0.049396
+old_acc  0.9914->0.9907
+old_margin 7.9301->6.6077
+new_loss 8.474907->7.786845
+new_acc  0.0724->0.0764
+accepted=14 rejected=206
+rw2_attempted=220 rw2_selected=3
+anchor_drift path=0.111/0.217 act=0.618/1.307 top=0.06526/0.1576
+routes W_old/reserve=0.056/0.008
+routes upd_old/reserve=0.0002/0.0000
+opened=0.0253
+A_old/reserve=0.000/0.014
+```
+
+What this proved:
+
+```text
+1. The sparse base can fit the 100-word text.
+2. Reserve topology exists and can be opened.
+3. Route diagnostics can measure whether edits land on old or reserved routes.
+```
+
+What failed:
+
+```text
+1. Useful weight writes still mostly landed on old active routes.
+2. Reserve routes opened structurally, but did not carry enough useful update.
+3. Old geometry drift was much larger than the dense projected runs.
+4. Sparse reserve alone does not solve routing.
+```
+
+Important conclusion:
+
+```text
+The problem is not only "how to write safely."
+It is "where can the new representation live?"
+
+GCO must solve capacity topology and representational reachability, not just
+write projection.
+```
+
+### Current Status
+
+```text
+safe write:
+  works mechanically
+
+projection:
+  partially works, reduces drift
+
+accept/reject:
+  works mechanically, but is too blunt
+
+SSR / nested reasoner:
+  useful as a signal prototype, but risky if it must train forever
+
+fixed algorithmic reasoner:
+  stable, but too weak currently
+
+rewiring:
+  not solved; dense saturated rewiring damages old routes
+
+sparse reserve topology:
+  promising as a testbed, but not enough unless writes are routed into reserve
+
+controlled forgetting/compression:
+  not tested seriously yet; should activate only when capacity pressure is real
+
+main unresolved problem:
+  representational capacity and geometry
+```
+
+The thesis is now sharper:
+
+```text
+Continual learning cannot be solved as a write problem alone.
+The write mechanism must be coupled to representational geometry:
+subspace use, route reuse, sparsity, topology, compression, and capacity limits.
+```
+
+### Geometry Visualization Pivot
+
+The next step is to inspect what the tiny models actually learned
+geometrically.
+
+Question:
+
+```text
+When a tiny transformer fits 100 words, where does that knowledge live in
+residual space?
+
+When the same architecture fits 200 words from scratch, does it:
+  reuse the 100-word geometry,
+  create new separable geometry,
+  compress old geometry,
+  or collapse everything into the same directions?
+```
+
+Metrics:
+
+```text
+effective_rank = exp(H(singular_values / sum(singular_values)))
+
+old_new_novelty =
+  ||new_states - Projection_old_span(new_states)|| / ||new_states||
+
+principal_angles(old_span, new_span)
+
+centroid_distance =
+  ||mean(old_states) - mean(new_states)||
+```
+
+The new visualization tool is:
+
+```text
+experiments/gco_math/gco_visualize_tiny_geometry.py
+```
+
+Smoke result on the existing 100-word checkpoint:
+
+```text
+checkpoint=model/checkpoints/gco-tiny-cl-base-100w-seed0.pt
+windows=32
+split_tokens=165
+
+layer=embed   rank=92.40 novelty=0.2992 angle=15.92deg centroid=0.1909
+layer=block_0 rank=64.10 novelty=0.2746 angle=12.95deg centroid=9.2506
+layer=block_1 rank=73.97 novelty=0.2817 angle=15.64deg centroid=11.4053
+layer=final   rank=76.88 novelty=0.2970 angle=16.07deg centroid=1.6079
+```
+
+This first visualization is not yet a conclusion. It confirms the measurement
+pipeline works and produces layer-level geometry numbers and PCA plots.
+
+### Next Commands
+
+Visualize the existing 100-word model on the first 200 words:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/gco_math/gco_visualize_tiny_geometry.py \
+  --device mps \
+  --checkpoint-a model/checkpoints/gco-tiny-cl-base-100w-seed0.pt \
+  --label-a base100 \
+  --word-count 200 \
+  --split-word-count 100 \
+  --stride 8 \
+  --max-windows 256 \
+  --output-dir model/analysis/tiny-geometry/base100-on-200w \
+  --output-json model/analysis/tiny-geometry/base100-on-200w/geometry.json
+```
+
+Train the same-spec 200-word base from scratch:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/gco_math/gco_prepare_tiny_cl_base.py \
+  --device mps \
+  --word-count 200 \
+  --seq-len 32 \
+  --stride 1 \
+  --max-windows 512 \
+  --epochs 1000 \
+  --batch-size 16 \
+  --target-loss 0.02 \
+  --bootstrap-optimizer adam \
+  --lr 0.001 \
+  --grad-clip 1.0 \
+  --d-model 64 \
+  --n-layers 1 \
+  --n-heads 4 \
+  --d-ff 128 \
+  --topology-mode uniform \
+  --checkpoint-path model/checkpoints/gco-tiny-cl-base-200w-samespec-seed0.pt \
+  --anchors-path model/analysis/gco-tiny-cl-base-200w-samespec-anchors-seed0.pt \
+  --output-json model/analysis/gco-tiny-cl-base-200w-samespec-seed0.json
+```
+
+Compare the 100-word model against the 200-word same-spec model:
+
+```bash
+/opt/miniconda3/envs/ml/bin/python experiments/gco_math/gco_visualize_tiny_geometry.py \
+  --device mps \
+  --checkpoint-a model/checkpoints/gco-tiny-cl-base-100w-seed0.pt \
+  --label-a base100 \
+  --checkpoint-b model/checkpoints/gco-tiny-cl-base-200w-samespec-seed0.pt \
+  --label-b base200_samespec \
+  --word-count 200 \
+  --split-word-count 100 \
+  --stride 8 \
+  --max-windows 256 \
+  --output-dir model/analysis/tiny-geometry/base100-vs-base200 \
+  --output-json model/analysis/tiny-geometry/base100-vs-base200/geometry.json
+```
+
+What to look for:
+
+```text
+If base200 has higher effective rank:
+  the added text created broader representation geometry.
+
+If old/new principal angles increase:
+  the second text occupies more separable residual directions.
+
+If novelty outside old span is low:
+  the second text is being represented mostly through reused geometry.
+
+If novelty is high but old rank collapses:
+  the model may be overwriting/compressing old geometry even in from-scratch
+  joint training.
+
+If base100 cannot represent the second 100 words geometrically but base200 can:
+  the capacity issue is real and measurable before CL writes are attempted.
+```

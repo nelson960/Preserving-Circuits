@@ -1,10 +1,10 @@
 ---
 layout: default
-title: A Living Failure Map Toward Geometric Continual Learning
+title: A Living Failure Map Toward Mechanistic Continual Learning
 permalink: /living-paper/
 ---
 
-# A Living Failure Map Toward Geometric Continual Learning
+# A Living Failure Map Toward Mechanistic Continual Learning
 
 This page is the compressed living log. It keeps only results that changed the
 research direction, plus the core math used in each important experiment. Raw
@@ -26,15 +26,27 @@ actually learned.
   - [7. Living-Map GFO On Real-Book Text](#7-living-map-gfo-on-real-book-text)
   - [8. Native Trace Writing In The Transformer](#8-native-trace-writing-in-the-transformer)
   - [9. Online GCO Projection On Transformer MLPs](#9-online-gco-projection-on-transformer-mlps)
-- [Current GCO Target](#current-gco-target)
+  - [10. Native Scratch GCO: Outcome-Controlled Writes](#10-native-scratch-gco-outcome-controlled-writes)
+  - [11. Write-Only Continual Learning Failed The Geometry Test](#11-write-only-continual-learning-failed-the-geometry-test)
+  - [12. Reasoner Design Pivot: Nested Learners Are Too Risky For Now](#12-reasoner-design-pivot-nested-learners-are-too-risky-for-now)
+- [Current Target After The Geometry Pivot](#current-target-after-the-geometry-pivot)
 - [What Is Still Unresolved](#what-is-still-unresolved)
 
 ## Current Thesis
 
-Continual learning fails because new learning collides with old internal
-geometry. Protecting individual weights or neurons is too local. Preserving
-behavior requires preserving the causal transformations, routes, readouts, and
-capacity relationships that make old behavior work.
+Continual learning fails because new learning changes old internal geometry.
+Sometimes the change is destructive: routes drift, writes collide, readouts
+misalign, or useful capacity is overwritten. But the opposite failure also
+matters: protecting exact old activations too rigidly can prevent the model from
+performing the coordinated representational rebasing needed to learn more data.
+
+The current thesis is therefore no longer "continual learning is only a write
+problem." It is:
+
+```text
+continual learning is behavior-preserving representational change
+under fixed capacity
+```
 
 The current direction is therefore:
 
@@ -43,12 +55,13 @@ experience geometry
 + model geometry
 + behavior geometry
 + time geometry
--> targeted structural transformation
+-> targeted structural transformation or coordinated rebasing
 ```
 
-The evolved GCO target is not an AdamW wrapper. It is a structural optimizer
-that can decide whether to write, protect, split, bridge, rewire, consolidate,
-or decay.
+The evolved target is not an AdamW wrapper and not merely a protection method.
+It is a model-native learner that can decide whether to reuse, write, protect,
+split, bridge, rewire, consolidate, decay, or rebase related representations
+while preserving old behavior.
 
 ## Abbreviation Key
 
@@ -58,8 +71,9 @@ these meanings when reading the evidence ledger:
 - **CL** means continual learning: learning from a stream without erasing
   useful behavior learned earlier.
 - **GCO** means Geometric Continual Optimizer. This is the current target: a
-  model-native learner that reasons about where to write, what to reuse, what
-  to protect, what to rewire, and what to let decay.
+  model-native learner that reasons about what to reuse, what to write, what
+  to protect, what to rewire, what to let decay, and when related geometry must
+  rebase instead of remaining fixed.
 - **GFO** means Geometric Forgetting Optimizer. In this log it refers to the
   earlier activation-anchor and living-map prototype lineage that tested
   geometric protection before the architecture moved toward full GCO.
@@ -79,8 +93,19 @@ these meanings when reading the evidence ledger:
   route or memory region.
 - **DAS** means dynamic adaptation score: a compact score for action quality
   across the simulated reasoner stream.
+- **SSR** means state-space reasoner: the attempted mini-controller that maps
+  evidence streams into write/protect/rewire/forget gates. It is parked as a
+  primary path because it creates a nested learner inside the learner.
 - **SVD** means singular value decomposition, used for capacity and subspace
   diagnostics.
+- **CKA** means centered kernel alignment. It measures representational
+  similarity across checkpoints or models.
+- **Rebasing** means coherent movement of a family of representations while
+  behavior remains usable. It is different from freezing old activations and
+  different from uncontrolled fine-tuning drift.
+- **Hypernetwork-like reasoner** means a controller that generates or modulates
+  parameter edits. This is parked for now because it adds policy drift and
+  compute before the invariants are clear.
 - **EMA** means exponential moving average, used for smooth usage or frequency
   traces.
 - **SGD** means stochastic gradient descent, the simplest gradient optimizer
@@ -99,6 +124,8 @@ H_t  = pressure history
 P_t  = pressure gate
 S_t  = recurrent geometric reasoning state
 C_t  = protected/free capacity map
+B_t  = behavior invariants / margins / readout constraints
+T_t  = rebasing or basis-change operator
 ```
 
 ## Living Log Rule
@@ -751,9 +778,420 @@ evolved structural GCO.
 
 **Risk.** Projection alone did not solve heldout retention or slot collapse.
 
-## Current GCO Target
+### 10. Native Scratch GCO: Outcome-Controlled Writes
 
-The evolved GCO state is:
+**Claim.** A scratch transformer can run without `torch.optim`, using backward
+gradients only as local error signals, while GCO performs targeted native
+writes. The current write mechanism is mechanically healthy, but formation does
+not yet persist strongly enough to create broad hardening.
+
+**Math.** The direct write target uses the current hidden input and output
+error:
+
+```text
+K_l = h_l
+E_l = grad_{h_{l+1}} L
+```
+
+For a linear GCO matrix:
+
+```text
+Delta W_l^* =
+E_l K_l^T
+(
+  K_l K_l^T
+  + lambda_p P_protect
+  + lambda_n I
+)^{-1}
+```
+
+The forward uses `W * A`, so the direct write is converted back through the
+active topology:
+
+```text
+Delta W_native = Delta W_effective / max(A_t, A_min)
+```
+
+with `A_min = 0.05` in the current ablation. This prevents future topology
+pruning from creating unstable division by near-zero routes.
+
+Measured same-batch utility is:
+
+```text
+U =
+(L_before - L_after) / |L_before|
+- edit_cost
+- capacity_cost
+- rewire_cost
+- forget_cost
+```
+
+The write gate is trained by comparative advantage:
+
+```text
+adv = U - EMA(U)
+
+target_write =
+0.5 + 0.5 tanh(
+  warmup(t)
+  clamp(route_advantage / route_credit_scale, -c, c)
+)
+
+if U > 0:
+  target_write = max(target_write, 0.5)
+```
+
+Formation is trained by absolute positive utility, not by advantage:
+
+```text
+route_formation_raw =
+max(0, U)
+* global_eligibility_share
+* selected_count
+
+formation_credit =
+tanh(
+  warmup(t)
+  clamp(route_formation_raw / route_formation_scale, 0, c_f)
+)
+
+F_ij <- F_ij + eta_F formation_credit_ij (1 - F_ij)
+```
+
+This distinction matters:
+
+```text
+advantage          -> should the write gate open more than baseline?
+positive utility   -> did this route help enough to become more formed?
+negative utility   -> failed write / possible rewire signal
+```
+
+**Evidence.**
+
+First, a positive-utility write floor fixed the target but exposed a write-gate
+collapse:
+
+```text
+gco-native-positive-write-floor-fit80-seed0.json
+
+U=+1.28e-05
+adv=-4.89e-06
+target=0.500/0.500/0.500
+write_gate_raw_mean=0.3879
+```
+
+Then the write gate was separated from the internal heuristic teacher:
+
+```text
+gco-native-outcome-controlled-write-fit80-seed0.json
+
+write_gate_raw_mean=0.5034
+outcome_gate_error=0.0039
+active_hardening=0.00085
+```
+
+Then positive utility was allowed to build formation even when advantage was
+negative:
+
+```text
+gco-native-positive-utility-formation-fit80-seed0.json
+
+U=+1.65e-05
+adv=-6.77e-07
+target=0.500/0.500/0.500
+form=0.291/0.964
+active_hardening=0.00881
+active_crystalline=0.00000
+```
+
+Finally, the outcome-only ablation disabled the internal reasoner and structural
+controllers:
+
+```text
+--reasoner-lr 0
+--internal-gate-lr-scale 0
+--internal-write-gate-lr-scale 0
+--grow-lr 0
+--prune-lr 0
+--forget-lr 0
+```
+
+Result:
+
+```text
+gco-native-outcome-only-formation-fit80-seed0.json
+
+write_gate_mean=0.5030
+active_hardening=0.00884
+active_crystalline=0.00000
+form=0.293/0.964
+rewire=0
+forget=0
+```
+
+This is almost identical to the positive-utility formation run, so the internal
+heuristic reasoner is not the current bottleneck.
+
+**Decision.** The native scratch loop is no longer self-sabotaging. The write
+gate, measured outcome credit, and positive-utility formation are active. The
+next problem is not "can it write?" but "can formation accumulate at
+circuit/route scale?"
+
+**Status.** Supported mechanically on a one-chunk real-book scratch run.
+
+**Risk.** The model still fits weakly, hardening remains below 1% active mass,
+and crystalline/protection has not emerged. Formation is probably too
+weight-local.
+
+### 11. Write-Only Continual Learning Failed The Geometry Test
+
+**Claim.** Continual learning is not solved by safe writing or protected local
+rewiring alone. A successful same-capacity model trained from scratch on more
+data uses coordinated representational rebasing: old behavior remains good
+while old residual states move substantially.
+
+**Math.** Three same-spec tiny transformers were compared:
+
+```text
+model spec:
+  vocab_size = 2000
+  d_model    = 128
+  layers     = 2
+  heads      = 4
+  d_ff       = 256
+  seq_len    = 32
+
+training paths:
+  base100: random -> first 100 words
+  CL:      base100 -> second 100 words
+  base200: random -> first 200 words
+```
+
+Behavior metric:
+
+```text
+margin = logit(correct token) - max_{y != correct} logit(y)
+```
+
+Geometry metrics:
+
+```text
+effective_rank(H) =
+exp(
+  -sum_i p_i log p_i
+)
+
+p_i = sigma_i / sum_j sigma_j
+```
+
+Matched drift used orthogonal Procrustes alignment:
+
+```text
+R* = argmin_R ||H_B R - H_A||_F
+subject to R^T R = I
+
+drift = mean_i ||h_B,i R* - h_A,i||
+relative_drift = drift / mean_i ||h_A,i - mean(H_A)||
+```
+
+Representational similarity used linear CKA:
+
+```text
+CKA(X, Y) =
+||X^T Y||_F^2
+/
+(
+  ||X^T X||_F ||Y^T Y||_F
+)
+```
+
+**Evidence.**
+
+Base fits:
+
+```text
+base100:
+  loss 7.7006 -> 0.0145
+  acc  = 0.9913
+  mean margin on old span = +11.4909
+
+base200:
+  loss 7.6761 -> 0.0247
+  acc  = 0.9867
+  mean margin on old span = +11.8631
+  mean margin on new span = +11.5536
+```
+
+Continual updates from `base100`:
+
+```text
+safe update:
+  old loss 0.014533 -> 0.014550
+  old acc  0.9913   -> 0.9913
+  new loss 13.6280  -> 12.4667
+
+aggressive update:
+  old loss 0.014533 -> 0.031328
+  old margin +11.4909 -> +9.0665
+  new loss 13.6280 -> 10.0840
+```
+
+The safe update preserved old behavior but did not learn the new span. The
+aggressive update learned slightly more new text but weakened old behavior and
+still did not approach the successful `base200` solution.
+
+Geometry on the same original 100 words:
+
+```text
+base100 -> base200, final layer:
+  rank 74.32 -> 87.87
+  relative matched drift = 0.7880
+  CKA = 0.4906
+  aligned cosine = 0.6783
+
+base100 -> safe CL, final layer:
+  rank 74.32 -> 74.18
+  relative matched drift = 0.0779
+  CKA = 0.9930
+
+base100 -> aggressive CL, final layer:
+  rank 74.32 -> 74.87
+  relative matched drift = 0.1348
+  CKA = 0.9760
+```
+
+Full page with images:
+[Continual Learning Is A Geometry Problem]({{ site.baseurl }}/continual-learning-geometry/).
+
+**Decision.** The research direction changes from:
+
+```text
+find the safe write location and protect old activations
+```
+
+to:
+
+```text
+preserve old behavior and useful relations
+while allowing coordinated representational rebasing
+```
+
+Exact activation protection is now treated as a diagnostic baseline, not the
+final objective. Useful drift and destructive drift must be separated.
+
+**Status.** Strongest current pivot. Supported by same-spec controlled runs,
+not yet by broad benchmarks.
+
+**Risk.** One tiny model, one text source, near-memorization regime, and one
+main seed. The conclusion is directional: it shows why write/protection alone
+is incomplete, not that the final rebasing algorithm exists.
+
+### 12. Reasoner Design Pivot: Nested Learners Are Too Risky For Now
+
+**Claim.** A reasoner is still needed, but constantly training a second
+network inside the learner is not the right default path yet. It drifts toward
+nested learning or hypernetwork-style policy learning, which adds compute,
+credit-assignment instability, and another continual-learning problem inside
+the continual-learning system.
+
+**Math.** The learned-reasoner family used evidence vectors and gates:
+
+```text
+xi_t =
+[
+  activation,
+  error,
+  pressure,
+  novelty,
+  frequency,
+  capacity,
+  collision,
+  predicted_damage,
+  recency
+]
+
+s_t = f_theta(s_{t-1}, xi_t)
+
+[
+  g_write,
+  g_protect,
+  g_rewire,
+  g_forget,
+  g_compress,
+  priority
+] = heads_theta(s_t)
+```
+
+The state-space reasoner / SSR path made this more explicit:
+
+```text
+s_{t+1} = A s_t + B xi_t
+value_t = C s_t
+gate_t = sigmoid(D s_t)
+
+theta_reasoner <- theta_reasoner + eta * outcome_credit
+```
+
+This is powerful, but it creates a second learner whose own policy changes
+during training.
+
+**Evidence.**
+
+The dynamic multi-factor reasoner beat static/current baselines in controlled
+route simulation:
+
+```text
+GCO-full action accuracy = 68.00%
+MLP-current-only         = 51.00%
+GRU-sequence-baseline    = 36.00%
+cosine-rule-baseline     = 56.50%
+
+GCO-full wrong-write rate = 4.80%
+cosine wrong-write rate   = 34.40%
+```
+
+The native SSR-style writer was mechanically active and improved some write
+signals:
+
+```text
+ssr-write-protect-coupled-3chunk:
+  update ~= 0.00202
+  active hardening ~= 0.33-0.44
+  SSRgateW ~= 0.52
+  SSRgateP ~= 0.35-0.40
+```
+
+But the practical failure mode was architectural, not just numeric:
+
+```text
+online learned reasoner
+-> changing write/protect policy
+-> policy instability risk
+-> extra forward/credit path
+-> nested continual-learning problem
+```
+
+Hypernetwork-like variants have the same problem if they generate edits from a
+small controller that itself must keep learning online. They may be useful
+later, but they are not the stable foundation for the next phase.
+
+**Decision.** Park constantly trained online reasoners, SSR controllers, and
+hypernetwork-style edit generators as primary mechanisms. Use deterministic or
+slowly parameterized algorithmic reasoning first: compute the evidence map,
+apply explicit geometry/behavior tests, and only then decide write/protect/
+rebase/decay actions. If a learned reasoner returns, it should be trained
+offline or updated slowly against stable objectives, not allowed to rewrite its
+own policy at every step.
+
+**Status.** The reasoner concept is supported; the online nested-learner
+implementation path is parked.
+
+**Risk.** A fixed algorithmic reasoner may be too rigid. Eventually the system
+may need a learned reasoner, but only after the invariants are clear.
+
+## Current Target After The Geometry Pivot
+
+The evolved state is:
 
 ```text
 Omega_t = {
@@ -762,7 +1200,8 @@ Omega_t = {
   Q_t, R_t, basis rotations or neuron permutations
   O_t,  reusable thought operators
   C_t,  capacity and protected/free subspace map
-  S_t   recurrent geometric reasoning state
+  B_t,  behavior invariants / margins / readout constraints
+  S_t   geometric reasoning state
 }
 ```
 
@@ -827,14 +1266,37 @@ K_t = TopK(e_t, k_t)
 Delta W_GCO = mask(K_t) * Delta W^*
 ```
 
-The next model object, if experiments resume, should be `GeometricMLP` with:
+The missing object after the pivot is a rebasing operator. A local write tries:
+
+```text
+Delta W K ~= E
+```
+
+A rebasing step instead asks for a joint movement:
+
+```text
+H_old' = T H_old
+H_new' = T H_new
+
+subject to:
+  behavior_old(H_old') ~= behavior_old(H_old)
+  loss_new decreases
+  relation_geometry preserved where useful
+  capacity/rank improves or interference falls
+```
+
+The next model object, if experiments resume, should be `GeometricMLP` or
+`GeometricBlock` with:
 
 ```text
 A_t topology mask
+multi-scale formation memory F_ij, F_row, F_col, F_block
+hardening hysteresis with enter/exit thresholds
 low-rank O_r operators
 route evidence xi
-recurrent route state S_t
-belief/action head
+explicit behavior invariants B_t
+algorithmic geometry reasoner before learned online reasoner
+rebasing / basis-change operator T_t
 operator create / protect / merge / decay
 ```
 
@@ -848,10 +1310,15 @@ heldout retention weakness
 real semantic conflict detection
 capacity recovery without destroying weak structure
 direct geometric write solver
+formation persistence at circuit/route scale
 structural topology mask A_t
 basis or neuron rearrangement Q_t, R_t
 operator creation and consolidation
-offline anchor/Jacobian sleep phase
+behavior-preserving rebasing operator T_t
+distinguishing useful drift from destructive drift
+offline anchor/Jacobian/behavior audit phase
+architecture/direct-write control against AdamW one-chunk fitting
+multi-seed and longer-text geometry checks
 ```
 
 The strongest current conclusion is:
@@ -859,7 +1326,10 @@ The strongest current conclusion is:
 ```text
 geometric reasoning works in controlled route-space;
 dynamic route reasoning beats static/current baselines;
-native writing and online projection work mechanically;
-but full model-native continual learning needs structural routing,
-operator creation, and capacity-aware targeted writes.
+native writing, outcome-controlled direct writes, and online projection work mechanically;
+write/protection-only CL preserves old geometry or damages it without learning enough new data;
+successful same-capacity learning can require coordinated representational rebasing;
+full model-native continual learning needs structural routing,
+multi-scale formation, operator creation, capacity-aware targeted writes,
+and behavior-preserving geometry rebasing.
 ```

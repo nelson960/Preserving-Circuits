@@ -11,6 +11,7 @@ plugins:
 
 header_pages:
   - index.md
+  - continual-learning-geometry.md
   - living-paper.md
 
 kramdown:
