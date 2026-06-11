@@ -11942,3 +11942,766 @@ If novelty is high but old rank collapses:
 If base100 cannot represent the second 100 words geometrically but base200 can:
   the capacity issue is real and measurable before CL writes are attempted.
 ```
+
+## 2026-06-09 Controlled CL Pivot: Geometry, Behavior Paths, Dynamic Commit, And Compute Wall
+
+This section compresses the work after the tiny-book geometry pivot.
+
+The research direction changed from:
+
+```text
+Can we solve continual learning as a safe write/projection problem?
+```
+
+to:
+
+```text
+Can we preserve behavior while allowing coordinated representational
+reorganization under finite capacity?
+```
+
+### Same-Spec Geometry: 100 Words, 200 Words, And Drift
+
+We trained:
+
+```text
+base100:
+  same tiny transformer spec
+  trained on first 100 words
+  loss 0.014533
+  accuracy 0.9913
+
+base200:
+  same model spec
+  trained from scratch on first 200 words
+  loss 0.024659
+  accuracy 0.9867
+```
+
+Then we compared residual geometry on the same text.
+
+Important finding:
+
+```text
+Training the same architecture from scratch on more data does not simply append
+new facts into unused slots.
+
+It reorganizes the representation.
+```
+
+On the original 100-word region, base100 -> base200 drift was large:
+
+```text
+embed:
+  rank 91.87 -> 100.92
+  relative drift 0.6624
+  CKA 0.6021
+
+block_0:
+  rank 62.74 -> 82.45
+  relative drift 0.7960
+  CKA 0.3936
+
+block_1:
+  rank 72.48 -> 84.40
+  relative drift 0.7351
+  CKA 0.5328
+
+final:
+  rank 74.32 -> 87.87
+  relative drift 0.7880
+  CKA 0.4906
+```
+
+Interpretation:
+
+```text
+Successful joint learning changes the old representation substantially while
+preserving old behavior.
+
+Therefore the CL target is not "keep hidden geometry fixed."
+It is "find a behavior-preserving path through representation space."
+```
+
+### Capacity Frontier On Same Spec
+
+We trained the same tiny model spec from scratch on larger word counts:
+
+```text
+300w:
+  loss 0.033142
+  accuracy 0.9839
+
+400w:
+  loss 0.037832
+  accuracy 0.9826
+
+500w:
+  loss 0.040771
+  accuracy 0.9821
+```
+
+Capacity-frontier geometry on the original 100-word probe showed:
+
+```text
+as word count increases:
+  CKA to 100w geometry decreases
+  relative drift increases
+  effective rank rises, then saturates
+  behavior can remain high while geometry changes strongly
+```
+
+Conclusion:
+
+```text
+Capacity pressure appears before total behavior collapse.
+The model can keep token accuracy high while the internal representation is
+moving and compressing.
+```
+
+### Continual Update On Base100
+
+We tried reasoned writes from `base100` into the second 100 words.
+
+Safe/projection variants preserved old behavior but barely learned the new text:
+
+```text
+old accuracy stayed around 0.9913
+new accuracy stayed around 0.06
+```
+
+Aggressive second-trial rewiring improved new loss but damaged old behavior:
+
+```text
+old_loss 0.014533 -> 0.031328
+old_margin 11.4909 -> 9.0665
+new_loss 13.628014 -> 10.083992
+anchor drift increased strongly
+```
+
+Sparse reserve topology also failed to route useful updates into reserve:
+
+```text
+sparse70 base fit old data
+reserve routes opened structurally
+but useful weight writes still landed mostly on old active routes
+old geometry drift became large
+```
+
+Conclusion:
+
+```text
+Safe writing is necessary but not sufficient.
+The real missing piece is representational reorganization and usable capacity.
+```
+
+### Behavior-Preserving Path Test
+
+We tested whether a base100 model can move toward base200-like behavior by
+learning the second 100 words while preserving old output behavior.
+
+This was not RL. It was supervised new loss plus old behavior distillation.
+
+Result:
+
+```text
+old_loss 0.014533 -> 0.016142
+old_acc  0.9913   -> 0.9909
+old_margin 11.4909 -> 11.8400
+
+new_loss 13.628014 -> 0.090436
+new_acc  0.0549    -> 0.9832
+
+target200_new_loss = 0.024992
+
+geometry to_base200:
+  relative distance 1.1093 -> 0.9994
+  CKA 0.5370 -> 0.5439
+```
+
+Interpretation:
+
+```text
+A behavior-preserving path exists in this toy setting.
+Output-behavior preservation gives the model enough constraint to learn new
+data without catastrophic forgetting.
+```
+
+Caveat:
+
+```text
+This does not prove scale.
+It proves that the earlier failure was not simply "base100 cannot become a
+200-word-capable model."
+```
+
+### Behavior Signal Budget Sweep
+
+We swept how much old behavior signal was needed.
+
+500-epoch focused run:
+
+```text
+oldN=32:
+  old_loss 0.07485
+  old_acc 0.9810
+  new_loss 0.03689
+  new_acc 0.9888
+  to200 0.9701
+  cka200 0.5405
+
+oldN=64:
+  old_loss 0.04096
+  old_acc 0.9857
+  new_loss 0.04787
+  new_acc 0.9876
+  to200 0.9734
+  cka200 0.5422
+
+oldN=168:
+  old_loss 0.01693
+  old_acc 0.9913
+  new_loss 0.06410
+  new_acc 0.9827
+  to200 0.9862
+  cka200 0.5448
+```
+
+Interpretation:
+
+```text
+More old behavior preservation protects old behavior better but slows new
+learning.
+
+Less old behavior allows stronger new learning but forgets more.
+
+This is the basic behavior-anchor budget tradeoff.
+```
+
+### Bridge Adapter And Consolidation
+
+We tested:
+
+```text
+behavior anchors + bridge windows + plastic adapter + consolidation
+```
+
+Result:
+
+```text
+initial:
+  old=0.01453/0.9913
+  new=13.62801/0.0549
+  bridge=7.76870/0.3958
+
+plastic adapter:
+  old=0.02823/0.9901
+  new=5.70662/0.1551
+  bridge=1.29424/0.7718
+
+consolidated:
+  old=0.02903/0.9846
+  new=0.16839/0.9800
+  bridge=0.06252/0.9972
+
+target200:
+  old=0.02380/0.9881
+  new=0.02499/0.9863
+  bridge=0.02825/0.9811
+```
+
+Interpretation:
+
+```text
+The adapter can act as a temporary plastic path.
+Consolidation can move useful new behavior into the core while preserving much
+of the old behavior.
+```
+
+Caveat:
+
+```text
+This is still a training loop, not a final compact CL algorithm.
+```
+
+### Controlled Preserve / Drop
+
+We tested role-controlled learning:
+
+```text
+preserve selected old behavior
+drop selected obsolete behavior
+learn new behavior
+guard neutral behavior
+```
+
+Result:
+
+```text
+preserve_suppress:
+  preserve exact = 1.000
+  drop exact = 0.000
+  new exact = 1.000
+  neutral exact = 0.000
+
+preserve_guard_suppress:
+  preserve exact = 1.000
+  drop exact = 0.000
+  new exact = 1.000
+  neutral exact = 1.000
+```
+
+Interpretation:
+
+```text
+Active forgetting is unsafe without neutral guards.
+Neutral guard behavior is required to prevent collateral damage.
+```
+
+### Recursive Controlled CL And Auto Role Controller
+
+Recursive controlled architecture result:
+
+```text
+direct:
+  preserve exact = 1.000
+  drop exact = 0.000
+  neutral exact = 1.000
+  stage2 exact = 1.000
+  stage3 exact = 1.000
+  eval_all exact = 0.900
+
+adapter:
+  preserve exact = 1.000
+  drop exact = 0.000
+  neutral exact = 1.000
+  stage2 exact = 1.000
+  stage3 exact = 1.000
+  eval_all exact = 0.900
+```
+
+Auto role controller:
+
+```text
+roles inferred correctly in the toy setup:
+  preserve = Alice, Bruno
+  drop     = Clara, Darin
+  guard    = Elena, Farah
+
+auto_direct:
+  preserve exact = 1.000
+  drop exact = 0.000
+  guard exact = 1.000
+  stage2 exact = 1.000
+  stage3 exact = 1.000
+  eval_all exact = 0.783
+```
+
+Interpretation:
+
+```text
+The toy role controller can select preserve/drop/guard categories when evidence
+is clean.
+
+But the controller is not trusted with unconstrained deletion.
+Hard verification and guardrails remain mandatory.
+```
+
+### Dynamic Committed Anchors
+
+Static preservation is not enough.
+
+If the model only protects the original base behavior, newly learned behavior
+can be overwritten in the next stage.
+
+Dynamic committed anchors fix this:
+
+```text
+after each stage:
+  evaluate newly learned probes
+  if verified, promote them into committed memory K_t
+  protect B_t union K_t in future stages
+```
+
+This changed the architecture from:
+
+```text
+protect old base while learning new data
+```
+
+to:
+
+```text
+protect old base plus previously committed learned behavior
+```
+
+Important result in the mini CL world:
+
+```text
+controlled + dynamic committed anchors:
+  preserve exact = 1.000
+  guard exact = 1.000
+  changed exact = 1.000
+  new exact = 1.000
+  compose exact = 1.000
+  oldWrong exact = 0.000
+```
+
+Conclusion:
+
+```text
+Dynamic commit is a real architectural fix in the toy setting.
+It prevents recursive overwriting of successful new learning.
+```
+
+### 5000-Word Mini CL World
+
+We scaled the toy CL world to a larger 5000-word staged setting.
+
+Earlier controlled run:
+
+```text
+base:
+  preserve/guard exact = 1.000
+  changed/new exact = 0.000
+
+naive:
+  preserve exact = 0.000
+  guard exact = 0.000
+  changed/new partially learned
+
+controlled:
+  preserve exact = 1.000
+  guard exact = 1.000
+  changed exact around 0.333
+  new exact around 0.400
+  compose exact around 0.611
+
+joint:
+  all main categories exact = 1.000
+```
+
+Interpretation:
+
+```text
+Controlled CL protects old behavior strongly.
+But new learning is still weaker than joint training when the world is larger.
+```
+
+Adapter diagnostics:
+
+```text
+adapter preserved residual/role/feature geometry better than direct controlled
+updates, but learned new behavior more weakly.
+```
+
+Direction:
+
+```text
+dynamic committed anchors fix recursive protection,
+but scaling requires better update efficiency and better capacity control.
+```
+
+### Reusable Computation And Composition
+
+Reusable-computation toy tests showed:
+
+```text
+naive CL forgets old/reuse behavior
+anchor/rebase preserve old and reuse behavior
+held-out composition remains hard unless the task is made easy or explicitly
+structured
+```
+
+Interpretation:
+
+```text
+Preserving behavior is not the same as learning robust composition.
+Composition generalization needs its own tests and architecture support.
+```
+
+### Storage Frontier And Capacity Equations
+
+We added a storage frontier sweep to measure capacity before CL.
+
+Core quantities:
+
+```text
+W      = word count
+T      = token count
+V_T    = unique tokens
+P      = trainable parameters
+S      = sequence length
+r      = stride
+N_win  = training windows
+N_pos  = trained token positions
+```
+
+Token pressure:
+
+```text
+alpha_kind = T / W
+u_tok      = V_T / T
+```
+
+Window pressure:
+
+```text
+N_win = 1 + floor((T - S - 1) / r)
+N_pos = N_win * S
+```
+
+Storage load:
+
+```text
+rho_token = T / P
+rho_pos   = N_pos / P
+```
+
+Strict fit:
+
+```text
+strict_fit =
+  1[
+    loss <= tau_loss
+    and token_accuracy >= tau_accuracy
+  ]
+```
+
+Loose fit:
+
+```text
+loose_fit =
+  1[
+    loss <= tau_loss
+    or token_accuracy >= tau_accuracy
+  ]
+```
+
+Representation drift:
+
+```text
+G_drift = 1 - CKA(H_reference, H_candidate)
+```
+
+Effective rank:
+
+```text
+p_i = sigma_i / sum_j sigma_j
+R_eff = exp(-sum_i p_i log p_i)
+```
+
+Capacity should be recorded as an interval:
+
+```text
+T_capacity in [T_pass_max, T_fail_min)
+```
+
+Boundary result for relation-heavy facts:
+
+```text
+3000 words ~= 8447 tokens:
+  strict fit passes
+
+5000 words ~= 14078 tokens:
+  strict fit fails
+
+8000 words ~= 22526 tokens:
+  strict fit fails
+```
+
+Rough current frontier:
+
+```text
+facts strict-storage frontier is between 8.4k and 14.1k tokens
+for the tested tiny/mini transformer setup and training budget.
+```
+
+Important signs of capacity pressure:
+
+```text
+strict fit fails while loose fit may pass
+relative weight movement grows
+CKA to reference falls
+effective rank saturates
+window exact match drops
+loss improves slowly despite longer training
+```
+
+### Compute Wall
+
+The laptop can still support:
+
+```text
+toy-world CL mechanisms
+anchor compression tests
+low-rank protection tests
+event-trigger tests
+block-local update tests
+small geometry visualizations
+single-seed demos
+```
+
+But it is not suitable for:
+
+```text
+large sweeps
+multi-seed scaling claims
+large context conversation learning
+full-scale transformer CL proofs
+many repeated 5000+ word variants
+```
+
+Conclusion:
+
+```text
+Stop trying to prove scale locally.
+Use laptop experiments to find principles and compact math.
+```
+
+### Current Architecture Direction
+
+The architecture should become a small set of mathematical operations:
+
+```text
+1. decide whether an update is needed
+2. build compact constraint matrices
+3. update weights under protected constraints
+4. verify behavior and geometry
+5. commit useful learned probes
+6. compress memory
+```
+
+This does not remove training entirely.
+
+The model still has to change weights when it learns.
+
+But the algorithm should avoid waste:
+
+```text
+do not train on every input
+do not check every anchor every time
+do not store every probe forever
+do not run a nested learned reasoner continuously
+```
+
+Compact objective:
+
+```text
+L(theta) =
+  L_new(theta)
+  + lambda_P KL(f_theta(P_t), Z_P)
+  + lambda_G KL(f_theta(G_t), Z_G)
+  + lambda_H ||H_theta(P_t union G_t) - H_anchor||^2
+  + lambda_D L_drop(theta, D_t)
+  + lambda_C L_capacity(theta, C_t)
+```
+
+Protected set:
+
+```text
+P_t = B_t union K_t
+```
+
+where:
+
+```text
+B_t = long-term base preserve anchors
+K_t = committed learned anchors
+G_t = guard anchors
+D_t = drop candidates
+```
+
+Commit:
+
+```text
+commit(theta') = 1
+if:
+  new behavior learned
+  preserve behavior safe
+  guard behavior safe
+  drop behavior controlled
+  capacity/geometry not damaged beyond tolerance
+```
+
+Memory update:
+
+```text
+K_{t+1} = compress(K_t union verified_new_probes)
+P_{t+1} = B_t union K_{t+1}
+```
+
+### Mathematical Shortcuts To Investigate
+
+The next progress likely comes from math shortcuts, not bigger Python loops.
+
+Candidate shortcuts:
+
+```text
+event-triggered learning:
+  update only when novelty * usefulness * error crosses threshold
+
+anchor compression:
+  preserve prototypes instead of every probe
+
+low-rank protection:
+  remove gradient components in a small protected subspace
+
+block-local updates:
+  update only the layer/block with useful free capacity
+
+cached teacher signals:
+  store logits/margins instead of rerunning the old model
+
+capacity-triggered forgetting:
+  forget only when capacity pressure is real
+
+two-timescale learning:
+  temporary plastic path first, core consolidation after verification
+
+geometry summaries:
+  preserve regions using centroid/covariance/basis/margin/importance
+```
+
+### Consequences
+
+The honest claim is not:
+
+```text
+the model learns everything continuously
+```
+
+The honest claim is:
+
+```text
+the model learns selectively under finite capacity,
+preserves chosen behavior,
+guards uncertain behavior,
+forgets only selected obsolete behavior,
+and reorganizes geometry only when verification passes.
+```
+
+The hard problems left:
+
+```text
+automatic role assignment
+anchor compression without losing important behavior
+capacity pressure detection
+block/route selection
+composition generalization
+scaling the loop without excessive compute
+```
+
+### Immediate Next Work
+
+Do not run large sweeps next.
+
+Next research tasks:
+
+```text
+1. formalize the compact math version in CL_Architecture.md
+2. implement one shortcut at a time
+3. compare each shortcut against the best toy controlled CL baseline
+4. keep only shortcuts that preserve behavior and reduce compute
+5. return to larger demos only after the compact loop is cleaner
+```
