@@ -557,11 +557,15 @@ def project_gradient_away_from_constraints(
     raw_gradient: torch.Tensor,
     constraint_gradients: list[torch.Tensor],
     damping: float,
+    solver: str,
+    rank_tolerance: float,
+    plasticity_audit: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     positive_float("projected_update_damping", damping)
-    projected = raw_gradient.clone()
-    active_constraints = 0
-    constraint_norm_sum = 0.0
+    positive_float("plasticity_audit_rank_tolerance", rank_tolerance)
+    if solver not in {"sequential", "gram"}:
+        raise ValueError(f"Unknown projected solver {solver!r}.")
+    active_rows: list[torch.Tensor] = []
     for constraint in constraint_gradients:
         if constraint.shape != raw_gradient.shape:
             raise RuntimeError(
@@ -572,21 +576,99 @@ def project_gradient_away_from_constraints(
         norm = float(torch.sqrt(norm_sq.clamp_min(0.0)).detach().cpu())
         if norm <= 1e-12:
             continue
-        active_constraints += 1
-        constraint_norm_sum += norm
-        coefficient = torch.dot(projected, constraint) / (norm_sq + damping)
-        projected = projected - coefficient * constraint
+        active_rows.append(constraint)
+
+    projected = raw_gradient.clone()
+    if solver == "sequential":
+        for constraint in active_rows:
+            norm_sq = torch.dot(constraint, constraint)
+            coefficient = torch.dot(projected, constraint) / (norm_sq + damping)
+            projected = projected - coefficient * constraint
+    elif active_rows:
+        matrix = torch.stack(active_rows, dim=0)
+        gram = matrix @ matrix.T
+        identity = torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
+        rhs = matrix @ raw_gradient
+        coefficients = torch.linalg.solve(gram + damping * identity, rhs)
+        projected = raw_gradient - matrix.T @ coefficients
+
     raw_norm = torch.linalg.vector_norm(raw_gradient)
     projected_norm = torch.linalg.vector_norm(projected)
     removed_norm = torch.linalg.vector_norm(raw_gradient - projected)
-    return projected, {
-        "constraint_count": float(active_constraints),
-        "constraint_norm_mean": constraint_norm_sum / float(active_constraints) if active_constraints > 0 else 0.0,
+    stats = {
+        "constraint_count": float(len(active_rows)),
+        "constraint_norm_mean": 0.0,
         "raw_grad_norm": float(raw_norm.detach().cpu()),
         "projected_grad_norm": float(projected_norm.detach().cpu()),
         "projection_removed_fraction": float((removed_norm / raw_norm.clamp_min(1e-12)).detach().cpu()),
         "safe_grad_fraction": float((projected_norm / raw_norm.clamp_min(1e-12)).detach().cpu()),
     }
+    if not active_rows:
+        stats.update(
+            {
+                "constraint_effective_rank": 0.0,
+                "constraint_numerical_rank": 0.0,
+                "constraint_redundancy": 0.0,
+                "constraint_condition": 0.0,
+                "raw_constraint_cosine_mean": 0.0,
+                "raw_constraint_cosine_max": 0.0,
+                "projected_constraint_cosine_mean": 0.0,
+                "projected_constraint_cosine_max": 0.0,
+            }
+        )
+        return projected, stats
+
+    matrix = torch.stack(active_rows, dim=0)
+    row_norms = torch.linalg.vector_norm(matrix, dim=1).clamp_min(1e-12)
+    stats["constraint_norm_mean"] = float(row_norms.mean().detach().cpu())
+    if plasticity_audit:
+        gram = matrix @ matrix.T
+        eigenvalues = torch.linalg.eigvalsh(gram).clamp_min(0.0)
+        singular_values = torch.sqrt(eigenvalues)
+        positive = singular_values[singular_values > 1e-12]
+        if positive.numel() > 0:
+            weights = positive / positive.sum().clamp_min(1e-12)
+            entropy = -(weights * torch.log(weights.clamp_min(1e-12))).sum()
+            effective_rank_value = torch.exp(entropy)
+            max_singular = positive.max()
+            numerical_rank = torch.sum(positive > max_singular * rank_tolerance)
+            min_kept = positive[positive > max_singular * rank_tolerance].min()
+            condition = max_singular / min_kept.clamp_min(1e-12)
+        else:
+            effective_rank_value = singular_values.new_tensor(0.0)
+            numerical_rank = singular_values.new_tensor(0)
+            condition = singular_values.new_tensor(0.0)
+        raw_cosines = torch.abs((matrix @ raw_gradient) / (row_norms * raw_norm.clamp_min(1e-12)))
+        projected_cosines = torch.abs((matrix @ projected) / (row_norms * projected_norm.clamp_min(1e-12)))
+        count = float(len(active_rows))
+        stats.update(
+            {
+                "constraint_effective_rank": float(effective_rank_value.detach().cpu()),
+                "constraint_numerical_rank": float(numerical_rank.detach().cpu()),
+                "constraint_redundancy": float(
+                    (1.0 - effective_rank_value / singular_values.new_tensor(count)).detach().cpu()
+                ),
+                "constraint_condition": float(condition.detach().cpu()),
+                "raw_constraint_cosine_mean": float(raw_cosines.mean().detach().cpu()),
+                "raw_constraint_cosine_max": float(raw_cosines.max().detach().cpu()),
+                "projected_constraint_cosine_mean": float(projected_cosines.mean().detach().cpu()),
+                "projected_constraint_cosine_max": float(projected_cosines.max().detach().cpu()),
+            }
+        )
+    else:
+        stats.update(
+            {
+                "constraint_effective_rank": 0.0,
+                "constraint_numerical_rank": 0.0,
+                "constraint_redundancy": 0.0,
+                "constraint_condition": 0.0,
+                "raw_constraint_cosine_mean": 0.0,
+                "raw_constraint_cosine_max": 0.0,
+                "projected_constraint_cosine_mean": 0.0,
+                "projected_constraint_cosine_max": 0.0,
+            }
+        )
+    return projected, stats
 
 
 def distillation_loss_for_batch(
@@ -938,10 +1020,24 @@ def train_controlled(
             "geometry": 0.0,
             "constraint_count": 0.0,
             "constraint_norm_mean": 0.0,
+            "constraint_effective_rank": 0.0,
+            "constraint_numerical_rank": 0.0,
+            "constraint_redundancy": 0.0,
+            "constraint_condition": 0.0,
             "raw_grad_norm": 0.0,
             "projected_grad_norm": 0.0,
+            "final_update_grad_norm": 0.0,
+            "restore_grad_norm": 0.0,
             "projection_removed_fraction": 0.0,
             "safe_grad_fraction": 0.0,
+            "final_update_fraction": 0.0,
+            "restore_fraction": 0.0,
+            "raw_constraint_cosine_mean": 0.0,
+            "raw_constraint_cosine_max": 0.0,
+            "projected_constraint_cosine_mean": 0.0,
+            "projected_constraint_cosine_max": 0.0,
+            "final_constraint_cosine_mean": 0.0,
+            "final_constraint_cosine_max": 0.0,
         }
         grad_total = 0.0
         grad_max = 0.0
@@ -1048,10 +1144,24 @@ def train_controlled(
             projection_stats = {
                 "constraint_count": 0.0,
                 "constraint_norm_mean": 0.0,
+                "constraint_effective_rank": 0.0,
+                "constraint_numerical_rank": 0.0,
+                "constraint_redundancy": 0.0,
+                "constraint_condition": 0.0,
                 "raw_grad_norm": 0.0,
                 "projected_grad_norm": 0.0,
+                "final_update_grad_norm": 0.0,
+                "restore_grad_norm": 0.0,
                 "projection_removed_fraction": 0.0,
                 "safe_grad_fraction": 1.0,
+                "final_update_fraction": 1.0,
+                "restore_fraction": 0.0,
+                "raw_constraint_cosine_mean": 0.0,
+                "raw_constraint_cosine_max": 0.0,
+                "projected_constraint_cosine_mean": 0.0,
+                "projected_constraint_cosine_max": 0.0,
+                "final_constraint_cosine_mean": 0.0,
+                "final_constraint_cosine_max": 0.0,
             }
             if args.controlled_update_mode == "loss":
                 loss.backward()
@@ -1078,7 +1188,11 @@ def train_controlled(
                     raw_gradient=raw_gradient,
                     constraint_gradients=constraint_gradients,
                     damping=args.projected_update_damping,
+                    solver=args.projected_solver,
+                    rank_tolerance=args.plasticity_audit_rank_tolerance,
+                    plasticity_audit=args.plasticity_audit,
                 )
+                restore_gradient = torch.zeros_like(safe_gradient)
                 if args.projected_restore_strength > 0.0:
                     restore_gradient = flat_autograd_gradient(
                         constraint_loss,
@@ -1088,6 +1202,26 @@ def train_controlled(
                         label="constraint_loss",
                     )
                     safe_gradient = safe_gradient + args.projected_restore_strength * restore_gradient
+                raw_norm = torch.linalg.vector_norm(raw_gradient).clamp_min(1e-12)
+                final_norm = torch.linalg.vector_norm(safe_gradient)
+                restore_norm = torch.linalg.vector_norm(args.projected_restore_strength * restore_gradient)
+                projection_stats["final_update_grad_norm"] = float(final_norm.detach().cpu())
+                projection_stats["restore_grad_norm"] = float(restore_norm.detach().cpu())
+                projection_stats["final_update_fraction"] = float((final_norm / raw_norm).detach().cpu())
+                projection_stats["restore_fraction"] = float((restore_norm / raw_norm).detach().cpu())
+                if args.plasticity_audit and constraint_gradients:
+                    active_rows = [
+                        constraint.to(device=raw_gradient.device, dtype=raw_gradient.dtype)
+                        for constraint in constraint_gradients
+                        if constraint.shape == raw_gradient.shape
+                        and float(torch.linalg.vector_norm(constraint).detach().cpu()) > 1e-12
+                    ]
+                    if active_rows:
+                        matrix = torch.stack(active_rows, dim=0)
+                        row_norms = torch.linalg.vector_norm(matrix, dim=1).clamp_min(1e-12)
+                        final_cosines = torch.abs((matrix @ safe_gradient) / (row_norms * final_norm.clamp_min(1e-12)))
+                        projection_stats["final_constraint_cosine_mean"] = float(final_cosines.mean().detach().cpu())
+                        projection_stats["final_constraint_cosine_max"] = float(final_cosines.max().detach().cpu())
                 assign_flat_gradient(trainable_params, safe_gradient)
             else:
                 raise ValueError(f"Unknown controlled update mode {args.controlled_update_mode!r}.")
@@ -1146,6 +1280,13 @@ def train_controlled(
                     epoch_row["projection_removed_fraction"],
                     epoch_row["constraint_count"],
                 )
+                if args.plasticity_audit:
+                    message += " rank={:.2f} red={:.2f} rawCos={:.3f} finalCos={:.3f}".format(
+                        epoch_row["constraint_effective_rank"],
+                        epoch_row["constraint_redundancy"],
+                        epoch_row["raw_constraint_cosine_mean"],
+                        epoch_row["final_constraint_cosine_mean"],
+                    )
             print(message)
     return trace
 
@@ -2365,6 +2506,87 @@ def plot_committed_memory_budget(
     plt.close(fig)
 
 
+def plot_plasticity_audit(
+    *,
+    controlled_trace: list[dict[str, Any]],
+    output_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    if not controlled_trace:
+        raise ValueError("Cannot plot plasticity audit without controlled trace.")
+
+    def last_metric(stage_row: dict[str, Any], metric: str) -> float:
+        if not stage_row["trace"]:
+            raise RuntimeError(f"Stage {stage_row['stage']} has empty trace.")
+        last = stage_row["trace"][-1]
+        if metric not in last:
+            raise RuntimeError(f"Plasticity audit metric {metric!r} missing from stage {stage_row['stage']}.")
+        return float(last[metric])
+
+    stages = [int(row["stage"]) for row in controlled_trace]
+    safe = [last_metric(row, "safe_grad_fraction") for row in controlled_trace]
+    final = [last_metric(row, "final_update_fraction") for row in controlled_trace]
+    removed = [last_metric(row, "projection_removed_fraction") for row in controlled_trace]
+    count = [last_metric(row, "constraint_count") for row in controlled_trace]
+    rank = [last_metric(row, "constraint_effective_rank") for row in controlled_trace]
+    redundancy = [last_metric(row, "constraint_redundancy") for row in controlled_trace]
+    raw_cos = [last_metric(row, "raw_constraint_cosine_mean") for row in controlled_trace]
+    final_cos = [last_metric(row, "final_constraint_cosine_mean") for row in controlled_trace]
+    new_loss = [last_metric(row, "new") for row in controlled_trace]
+    geometry_loss = [last_metric(row, "geometry") for row in controlled_trace]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    ax = axes[0, 0]
+    ax.plot(stages, safe, marker="o", linewidth=2, label="projected/raw")
+    ax.plot(stages, final, marker="o", linewidth=2, label="final/raw")
+    ax.plot(stages, removed, marker="o", linewidth=2, label="removed/raw")
+    ax.set_title("Plasticity retained by tangent update")
+    ax.set_xlabel("CL stage")
+    ax.set_ylabel("gradient fraction")
+    ax.set_ylim(0.0, max(1.05, max(final + safe + removed) * 1.1))
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+
+    ax = axes[0, 1]
+    ax.plot(stages, count, marker="o", linewidth=2, label="constraint rows")
+    ax.plot(stages, rank, marker="o", linewidth=2, label="effective rank")
+    ax2 = ax.twinx()
+    ax2.plot(stages, redundancy, color="tab:red", marker="s", linestyle="--", linewidth=2, label="redundancy")
+    ax.set_title("Constraint basis size")
+    ax.set_xlabel("CL stage")
+    ax.set_ylabel("rows / effective rank")
+    ax2.set_ylabel("redundancy")
+    ax.grid(alpha=0.25)
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines + lines2, labels + labels2, fontsize=8)
+
+    ax = axes[1, 0]
+    ax.plot(stages, raw_cos, marker="o", linewidth=2, label="raw gradient")
+    ax.plot(stages, final_cos, marker="o", linewidth=2, label="final update")
+    ax.set_title("Alignment with protected constraint normals")
+    ax.set_xlabel("CL stage")
+    ax.set_ylabel("mean absolute cosine")
+    ax.set_ylim(0.0, max(0.05, max(raw_cos + final_cos) * 1.15))
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 1]
+    ax.plot(stages, new_loss, marker="o", linewidth=2, label="new loss")
+    ax.plot(stages, geometry_loss, marker="o", linewidth=2, label="geometry loss")
+    ax.set_title("Learning pressure vs geometry pressure")
+    ax.set_xlabel("CL stage")
+    ax.set_ylabel("loss")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+
+    fig.suptitle("Plasticity audit across the continual-learning loop")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
 def write_summary_plots(
     *,
     plot_dir: Path,
@@ -2375,6 +2597,7 @@ def write_summary_plots(
     encoded: dict[str, list[EncodedExample]],
     device: torch.device,
     memory_budget: int,
+    plasticity_audit: bool,
 ) -> dict[str, str]:
     plot_dir.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -2385,6 +2608,8 @@ def write_summary_plots(
         "final_residual_pca_roles": plot_dir / "05_final_residual_pca_roles.png",
         "committed_memory_budget": plot_dir / "06_committed_memory_budget.png",
     }
+    if plasticity_audit:
+        paths["plasticity_audit"] = plot_dir / "07_plasticity_audit.png"
     plot_behavior_outcome(metrics=metrics, output_path=paths["behavior_outcome"])
     plot_stage_trajectory(
         controlled_trace=controlled_trace,
@@ -2410,6 +2635,11 @@ def write_summary_plots(
         output_path=paths["committed_memory_budget"],
         memory_budget=memory_budget,
     )
+    if plasticity_audit:
+        plot_plasticity_audit(
+            controlled_trace=controlled_trace,
+            output_path=paths["plasticity_audit"],
+        )
     return {key: str(path) for key, path in paths.items()}
 
 
@@ -2497,6 +2727,11 @@ def validate_args(args: argparse.Namespace) -> None:
     constraint_mode_parts(args.projected_constraint_mode)
     positive_float("projected_update_damping", args.projected_update_damping)
     nonnegative_float("projected_restore_strength", args.projected_restore_strength)
+    bounded_float("plasticity_audit_rank_tolerance", args.plasticity_audit_rank_tolerance, 0.0, 1.0)
+    if args.plasticity_audit_rank_tolerance <= 0.0:
+        raise ValueError(
+            f"plasticity_audit_rank_tolerance must be positive, got {args.plasticity_audit_rank_tolerance}."
+        )
     nonnegative_float("lambda_adapter", args.lambda_adapter)
     nonnegative_float("lambda_adapter_distill", args.lambda_adapter_distill)
     bounded_float("commit_min_exact", args.commit_min_exact, 0.0, 1.0)
@@ -3250,8 +3485,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "optimizer": args.optimizer,
             "controlled_update_mode": args.controlled_update_mode,
             "projected_constraint_mode": args.projected_constraint_mode,
+            "projected_solver": args.projected_solver,
             "projected_update_damping": args.projected_update_damping,
             "projected_restore_strength": args.projected_restore_strength,
+            "plasticity_audit": args.plasticity_audit,
+            "plasticity_audit_rank_tolerance": args.plasticity_audit_rank_tolerance,
             "lambda_preserve": args.lambda_preserve,
             "lambda_guard": args.lambda_guard,
             "lambda_geometry_anchor": args.lambda_geometry_anchor,
@@ -3312,6 +3550,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             encoded=encoded,
             device=device,
             memory_budget=args.commit_memory_budget,
+            plasticity_audit=args.plasticity_audit,
         )
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     with args.output_json.open("w", encoding="utf-8") as handle:
@@ -3467,6 +3706,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
 
+    if args.plasticity_audit:
+        print("\nCONTROLLED PLASTICITY AUDIT BY STAGE")
+        print("-" * 112)
+        print(
+            "{:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
+                "stage",
+                "safe/raw",
+                "final/raw",
+                "removed",
+                "rank",
+                "rows",
+                "redund",
+                "rawCos",
+            )
+        )
+        for stage_row in controlled_trace:
+            last_trace = stage_row["trace"][-1]
+            print(
+                "{:8d} {:10.4f} {:10.4f} {:10.4f} {:10.3f} {:10.1f} {:10.4f} {:10.4f}".format(
+                    int(stage_row["stage"]),
+                    float(last_trace["safe_grad_fraction"]),
+                    float(last_trace["final_update_fraction"]),
+                    float(last_trace["projection_removed_fraction"]),
+                    float(last_trace["constraint_effective_rank"]),
+                    float(last_trace["constraint_count"]),
+                    float(last_trace["constraint_redundancy"]),
+                    float(last_trace["raw_constraint_cosine_mean"]),
+                )
+            )
+
     def print_commit_summary(label: str, rows: list[dict[str, Any]]) -> None:
         if not args.dynamic_committed_anchors:
             return
@@ -3569,8 +3838,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["scalar", "category", "category_centroid", "category_centroid_separation"],
         default="scalar",
     )
+    parser.add_argument("--projected-solver", choices=["sequential", "gram"], default="sequential")
     parser.add_argument("--projected-update-damping", type=float, default=1e-6)
     parser.add_argument("--projected-restore-strength", type=float, default=0.0)
+    parser.add_argument("--plasticity-audit", action="store_true")
+    parser.add_argument("--plasticity-audit-rank-tolerance", type=float, default=1e-6)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--adapter-lr", type=float, default=1e-3)
     parser.add_argument("--consolidation-lr", type=float, default=3e-4)

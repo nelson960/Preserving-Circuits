@@ -1292,49 +1292,112 @@ Behavior distillation and replay-style constraints are known tools. The novel
 direction here is to turn selected behavior and geometry measurements into a
 constraint matrix that shapes the weight update.
 
-The learning gradient is:
+Let the incoming learn set be:
 
 ```text
-g_new = grad_theta L_new(theta)
+N_t = {(x_j, y_j)}
 ```
 
-Protected invariants define constraint rows:
+Let the protected memory be:
 
 ```text
-A_t = stack({
-  grad_theta KL_preserve_category,
-  grad_theta KL_guard_category,
-  grad_theta KL_committed_category,
-  grad_theta residual_exact_category,
-  grad_theta residual_centroid_category,
-  grad_theta role_separation_geometry,
-  grad_theta feature_separation_geometry
-})
+P_t = B_t union K_t
 ```
 
-These rows are not raw examples. They are local normals to directions that would
-damage protected function or protected geometry.
+where `B_t` contains long-term preserve anchors and `K_t` contains verified
+committed anchors from earlier continual-learning stages.
 
-The safe update is the component of the new-learning gradient that lies in the
-tangent space of those invariants:
+The new-learning objective is:
 
 ```text
-g_safe =
-  g_new - A_t^T (A_t A_t^T + rho I)^-1 A_t g_new
+L_N(theta) =
+  CE(f_theta(N_t), Y_N)
 ```
 
-Then:
+The new-learning gradient is:
 
 ```text
-theta' = theta_t - eta * precondition(g_safe)
+g_N = grad_theta L_N(theta_t)
+```
+
+Protected invariants are functions whose values should remain stable during the
+update. Define:
+
+```text
+c_i(theta) : model -> scalar or vector invariant
+```
+
+Examples:
+
+```text
+c_behavior(theta, x) =
+  KL(softmax(z_anchor(x) / T), softmax(f_theta(x) / T))
+
+c_margin(theta, x) =
+  max(0, m_anchor(x) - m_theta(x))
+
+c_state(theta, x, l) =
+  ||h_theta,l(x) - h_anchor,l(x)||_2^2
+
+c_centroid(theta, S, l) =
+  ||mean_{x in S} h_theta,l(x) - mu_anchor,S,l||_2^2
+
+c_separation(theta, S_a, S_b, l) =
+  (||mu_theta,S_a,l - mu_theta,S_b,l||_2^2
+   - d_anchor,S_a,S_b,l)^2
+```
+
+The constraint matrix is the Jacobian of selected invariants:
+
+```text
+A_t =
+  [ grad_theta c_1(theta_t)
+    grad_theta c_2(theta_t)
+    ...
+    grad_theta c_m(theta_t) ]
+```
+
+Each row is a local normal vector in parameter space. Moving along that row
+changes a protected behavior or protected geometry measurement.
+
+The tangent-space update removes the normal component of `g_N`:
+
+```text
+Pi_A(g_N) =
+  A_t^T (A_t A_t^T + rho I)^-1 A_t g_N
+
+g_tangent =
+  g_N - Pi_A(g_N)
+```
+
+Equivalent constrained view:
+
+```text
+g_tangent =
+  argmin_g ||g - g_N||_2^2
+  subject to A_t g = 0
+```
+
+with damping `rho` for numerical stability and soft constraints.
+
+The final update includes a bounded restore vector:
+
+```text
+g_restore =
+  grad_theta sum_i w_i c_i(theta_t)
+
+g_update =
+  g_tangent + alpha_restore * g_restore
+
+theta_{t+1/2} =
+  theta_t - eta * precondition(g_update)
 ```
 
 Interpretation:
 
 ```text
-learn the new behavior
-but remove the part of the update that points through protected behavior
-or protected representational geometry
+g_tangent  learns through directions locally compatible with protected invariants
+g_restore  corrects accumulated drift back toward the protected manifold
 ```
 
 The protected invariants are deliberately richer than exact hidden-state
@@ -1391,8 +1454,15 @@ category_centroid_separation:
   category rows plus centroid rows plus pairwise separation rows
 ```
 
-The full architecture should eventually move from explicit dense gradient rows
-to cheaper approximations:
+The resolution is a capacity and compute control knob:
+
+```text
+higher row count  -> stronger geometric protection, higher compute
+lower row count   -> cheaper update, weaker protection
+```
+
+The architecture should move from explicit dense gradient rows to cheaper
+approximations when scaling:
 
 ```text
 low-rank A_t
@@ -1401,6 +1471,32 @@ MLP-only A_t
 cached anchor gradients
 periodic refresh of A_t
 event-triggered projection
+```
+
+Low-rank form:
+
+```text
+A_t ~= U_t R_t
+
+Pi_A(g) ~= U_t (U_t^T U_t + rho I)^-1 U_t^T g
+```
+
+Block-local form:
+
+```text
+g_update,l =
+  project_tangent(g_N,l, A_t,l)
+```
+
+where each layer or MLP block gets its own small constraint matrix.
+
+Cached form:
+
+```text
+A_t is refreshed only when:
+  drift(P_t) > tau_drift
+  or new committed anchors enter K_t
+  or capacity pressure changes enough
 ```
 
 Each constrained update exposes the following diagnostic quantities:
