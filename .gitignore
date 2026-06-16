@@ -58,6 +58,6 @@ docs/.sass-cache/
 .idea/
 .vscode/
 .ipynb_checkpoints/
-GCO_ARCHITECTURE.md
+CL_Architecture.md
 local_assets/
 paper/

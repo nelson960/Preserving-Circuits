@@ -29,6 +29,8 @@ scores, run outcomes, or claims of scalability.
 - [Composition Generalization](#composition-generalization)
 - [Compact Mathematical Loop](#compact-mathematical-loop)
 - [Invariant-Tangent Update](#invariant-tangent-update)
+- [Current Toy Implementation Details](#current-toy-implementation-details)
+- [Researcher Questions And Current Answers](#researcher-questions-and-current-answers)
 - [What Must Stay Conservative](#what-must-stay-conservative)
 - [Target Architecture](#target-architecture)
 
@@ -1380,14 +1382,61 @@ g_tangent =
 
 with damping `rho` for numerical stability and soft constraints.
 
-The final update includes a bounded restore vector:
+The current stable mechanism is not projection alone. Projection gives the
+new-learning update a locally safe tangent direction, but finite steps,
+minibatch noise, and low-rank constraint approximations can still accumulate
+drift away from the protected manifold. The update therefore has two coupled
+terms:
+
+```text
+1. projected new-learning tangent update
+2. bounded restore correction to the protected behavior / geometry manifold
+```
+
+The restore vector is:
 
 ```text
 g_restore =
   grad_theta sum_i w_i c_i(theta_t)
+```
 
+Formal target architecture:
+
+```text
+C_t(theta) = 1/2 r_t(theta)^T W_t r_t(theta)
+g_restore = grad_theta C_t(theta_t)
+W_t >= 0
+```
+
+`W_t` is positive semidefinite and block-normalized so behavior, guard,
+residual-state, role-centroid, feature-centroid, and separation residuals
+contribute on comparable scales.
+
+The restore term must be bounded relative to the tangent update:
+
+```text
+s_restore =
+  min(
+    1,
+    tau_restore * ||g_tangent||
+    / (alpha_restore * ||g_restore|| + epsilon)
+  )
+
+g_restore_bar = s_restore * g_restore
+```
+
+This gives the explicit bound:
+
+```text
+||alpha_restore * g_restore_bar||
+<= tau_restore * ||g_tangent||
+```
+
+The complete update is:
+
+```text
 g_update =
-  g_tangent + alpha_restore * g_restore
+  g_tangent + alpha_restore * g_restore_bar
 
 theta_{t+1/2} =
   theta_t - eta * precondition(g_update)
@@ -1397,8 +1446,41 @@ Interpretation:
 
 ```text
 g_tangent  learns through directions locally compatible with protected invariants
-g_restore  corrects accumulated drift back toward the protected manifold
+g_restore_bar  corrects accumulated drift back toward the protected manifold
 ```
+
+This is the important distinction from ordinary distillation. Distillation adds
+an auxiliary loss and lets the optimizer negotiate all gradients together. The
+Invariant-Tangent update first removes the component of the new-learning
+gradient that points into protected constraint normals, then applies a smaller
+restore correction:
+
+```text
+new information moves along the manifold
+restore keeps the trajectory near the manifold
+```
+
+The protected manifold is:
+
+```text
+M_t = {theta : c_i(theta) = c_i(theta_ref), i in protected set}
+```
+
+and the desired step is:
+
+```text
+theta_{t+1} =
+  theta_t
+  - eta [
+      (I - A_t^T(A_t A_t^T + rho I)^-1 A_t) grad_theta L_N
+      + alpha_restore * g_restore_bar
+    ]
+
+C_t(theta) = 1/2 r_t(theta)^T W_t r_t(theta)
+```
+
+The projection term should preserve plasticity. The restore term should stay
+bounded so it does not become the main learner.
 
 The protected invariants are deliberately richer than exact hidden-state
 freezing.
@@ -1546,7 +1628,7 @@ a bounded restorative correction:
 ```text
 g_update =
   project_tangent(g_new, A_t)
-  + alpha_restore * g_restore
+  + alpha_restore * g_restore_bar
 ```
 
 where:
@@ -1558,6 +1640,9 @@ g_restore =
     + KL_guard
     + geometry_drift
   ]
+
+g_restore_bar =
+  clipped(g_restore, relative_to = ||g_tangent||)
 ```
 
 The restore term is not the main learner. It is a small corrective field that
@@ -1579,6 +1664,37 @@ M_t = { theta : c_i(theta) = c_i(theta_t), for protected invariants i }
 
 where the tangent component enables plasticity and the restorative component
 keeps accumulated error bounded.
+
+The diagnostic quantities for this operator are:
+
+```text
+safe/raw     = ||g_tangent|| / ||g_new||
+final/raw    = ||g_update|| / ||g_new||
+removed/raw  = ||g_new - g_tangent|| / ||g_new||
+rank(A_t)    = effective rank of the active constraint basis
+redundancy   = 1 - rank(A_t) / rows(A_t)
+normal_cos   = mean cosine(update, constraint normal)
+```
+
+Healthy behavior is not simply "small update." A useful CL step should keep
+`safe/raw` high enough to learn, keep protected behavior verified after the
+step, and avoid a growing `normal_cos` that indicates the update is pushing
+through protected geometry. If `redundancy` is high, the next optimization is to
+compress the constraint bank into a low-rank basis before projection.
+
+Implementation status:
+
+```text
+current toy code:
+  uses projected_restore_strength * g_restore
+
+formal target math:
+  uses alpha_restore * g_restore_bar with an explicit norm bound
+```
+
+The scaled restore result is useful evidence that restore helps, but the formal
+bounded restore rule is the architecture that should replace it before claiming
+a mathematical restore bound.
 
 ### Commit Function
 
@@ -1696,6 +1812,530 @@ compressed committed memory
 cheap geometric damage estimates
 verification-gated commit
 ```
+
+## Current Toy Implementation Details
+
+This section records what the current miniature implementation actually does.
+It is not the final scalable form.
+
+### Protected Measurement Selection
+
+Protected measurements are chosen from explicit role sets:
+
+```text
+B_t = preserve examples from the base world
+G_t = guard examples from uncertain or neutral old behavior
+K_t = committed examples learned in earlier CL stages
+D_t = drop / obsolete examples
+```
+
+The current toy implementation receives these role labels from the protocol.
+The model does not yet infer preserve / guard / drop / new roles by itself.
+
+At the start of each CL stage, the system snapshots the current model:
+
+```text
+theta_ref = theta_before_stage
+```
+
+For preserve and guard examples, it records:
+
+```text
+teacher logits:
+  z_ref(x)
+
+final residual states:
+  h_ref(x)
+```
+
+The protected measurements are:
+
+```text
+behavior residuals:
+  KL(softmax(z_ref(x) / T), softmax(z_theta(x) / T))
+
+state residuals:
+  ||h_theta(x) - h_ref(x)||^2
+
+category centroid residuals:
+  ||mean_x h_theta(x) - mean_x h_ref(x)||^2
+
+category separation residuals:
+  ||D_theta(categories) - D_ref(categories)||^2
+```
+
+where `D(categories)` is a pairwise distance matrix between category
+centroids.
+
+After a stage, successful new probes are committed:
+
+```text
+if exact_q(theta_after) = 1
+and token_accuracy_q(theta_after) >= tau_acc
+and loss_q(theta_after) <= tau_loss:
+    add q to K_{t+1}
+    store z_ref(q) = z_theta_after(q)
+    store h_ref(q) = h_theta_after(q)
+```
+
+This makes the reference manifold moving, not fixed forever to the original
+base model. Successful new behavior becomes part of the protected set in later
+stages.
+
+### Current Constraint Basis Size
+
+The implementation does not build a full Jacobian over all hidden dimensions or
+all output logits. It builds scalar constraint losses and takes one gradient
+row per scalar constraint:
+
+```text
+a_i = grad_theta c_i(theta_t)
+A_t = stack_i a_i
+```
+
+The active row types are controlled by:
+
+```text
+projected_constraint_mode = category_centroid_separation
+```
+
+That mode includes:
+
+```text
+behavior category rows
+geometry exact/category rows
+centroid rows
+separation rows
+```
+
+In the current toy setup, active rows are small:
+
+```text
+early stage: about 6 rows per batch
+later stages: about 18-21 rows per batch
+```
+
+The important point is that row count and independent rank are not the same.
+Later stages can have roughly 18-21 active rows while the effective rank is
+near 1 in some batches. That means many constraint rows are redundant and point
+in overlapping protected directions.
+
+This supports the next optimization:
+
+```text
+compress many raw constraint rows into a smaller low-rank basis
+```
+
+### Current Constraint Normalization
+
+Current implementation uses partial normalization:
+
+```text
+behavior:
+  KL losses are averaged within category
+
+geometry:
+  MSE losses are averaged within category / centroid / separation block
+
+global weights:
+  lambda_preserve = 1.0
+  lambda_guard = 1.0
+  lambda_geometry_anchor = 0.05
+```
+
+This is not yet the full block-normalized `W_t` from the target math.
+
+Target normalization:
+
+```text
+r_t =
+  [r_behavior, r_guard, r_state, r_role, r_feature, r_separation]
+
+C_t(theta) =
+  1/2 r_t(theta)^T W_t r_t(theta)
+
+W_t =
+  blockdiag(
+    w_behavior / scale_behavior^2,
+    w_guard / scale_guard^2,
+    w_state / scale_state^2,
+    w_role / scale_role^2,
+    w_feature / scale_feature^2,
+    w_separation / scale_separation^2
+  )
+```
+
+Each `scale_*` should be estimated from the corresponding residual block so one
+measurement type cannot dominate only because it has larger units.
+
+### Current Update Target
+
+The current direct controlled path applies the constrained update directly to
+the trainable model weights selected by the experiment code. The architecture
+does not require this to be the only target.
+
+Allowed update targets:
+
+```text
+full model weights
+MLP-only weights
+attention-only weights
+last blocks
+LoRA / adapter subspace
+memory or routing modules
+block-local editable subspaces
+```
+
+For scale, the preferred target is the smallest editable subspace that can
+learn the new behavior while passing preserve / guard / geometry verification.
+
+## Researcher Questions And Current Answers
+
+### What is the larger architecture around this?
+
+The update operator is one module inside a larger controlled CL loop:
+
+```text
+role controller
+behavior / guard / drop memory
+committed memory
+constraint builder
+invariant-tangent update
+bounded restore
+verification gate
+memory compression
+capacity manager
+```
+
+It is the main learning mechanism during the controlled CL phase, but it is not
+the whole system. The surrounding architecture decides when to update, what to
+protect, what to drop, and whether the candidate update is safe.
+
+### How are preserve, guard, drop, and new roles assigned?
+
+Current toy implementation:
+
+```text
+roles are provided by the protocol
+```
+
+Target architecture:
+
+```text
+roles are inferred from evidence
+then constrained by hard policy
+then verified after update
+```
+
+Evidence can include:
+
+```text
+frequency
+recency
+loss
+margin
+usefulness
+composition use
+conflict
+obsolete signal
+capacity pressure
+uncertainty
+```
+
+The model or controller may propose roles, but destructive roles require hard
+verification:
+
+```text
+uncertain -> guard
+drop requires repeated obsolete evidence
+drop requires capacity pressure or explicit replacement
+drop cannot bypass preserve / guard verification
+```
+
+### What exactly are protected measurements?
+
+Current protected measurements:
+
+```text
+teacher logits for preserve / guard / committed probes
+final residual stream states for preserve / guard / committed probes
+category centroid geometry
+category separation geometry
+```
+
+Potential future measurements:
+
+```text
+attention patterns
+MLP feature activations
+role vectors
+feature vectors
+route ownership
+adapter activations
+task outputs
+CKA-style structure
+canary margins
+composition probes
+```
+
+The architecture should not protect every possible signal. It should protect
+the smallest measurement set that predicts damage to important behavior.
+
+### How expensive is the protected Jacobian?
+
+A full transformer Jacobian is not feasible.
+
+The intended computation is not:
+
+```text
+build full d_output x d_parameter Jacobian
+```
+
+It is:
+
+```text
+build m scalar constraint losses
+take m gradient rows
+solve an m x m system
+```
+
+Current projection solve:
+
+```text
+A_t in R^{m x p}
+Gram = A_t A_t^T in R^{m x m}
+coeff = solve(Gram + rho I, A_t g_new)
+g_tangent = g_new - A_t^T coeff
+```
+
+The solve cost is dominated by:
+
+```text
+gradient-row construction
+small m x m Gram solve
+```
+
+not by an explicit full Jacobian matrix. Scaling still requires cheaper row
+construction:
+
+```text
+low-rank constraints
+random projected constraints
+Fisher or Gauss-Newton approximations
+LoRA-space constraints
+activation-space constraints
+per-layer local constraints
+periodic rather than every-step refresh
+```
+
+### Where is the update applied?
+
+Current toy path applies the constrained update directly to trainable model
+weights.
+
+Target architecture should support several edit surfaces:
+
+```text
+full weights when model is small
+LoRA / adapter subspace for cheaper plasticity
+MLP blocks for feature-level edits
+attention blocks for routing-level edits
+memory modules for fast updates
+route/topology modules for capacity management
+```
+
+The architecture should choose the smallest surface that satisfies:
+
+```text
+new learning succeeds
+preserve / guard pass
+geometry drift stays within bound
+plasticity remains nonzero
+```
+
+### Is the restore reference fixed or moving?
+
+It is moving.
+
+For a stage:
+
+```text
+theta_ref = theta_before_stage
+```
+
+Preserve and guard measurements are compared to this stage reference.
+Successful new behavior is committed after verification:
+
+```text
+phi_i_ref <- phi_i(theta_after_verified_update)
+```
+
+Then it becomes part of `K_t` and is protected in later stages.
+
+### How do you prevent overconstraint?
+
+Overconstraint happens when the protected basis grows until no useful new
+direction remains.
+
+Required controls:
+
+```text
+memory budget
+anchor deduplication
+category-level aggregation
+centroid/separation prototypes
+low-rank basis compression
+age/usefulness decay
+drop/retire rules under capacity pressure
+plasticity audit
+```
+
+The active diagnostic is:
+
+```text
+safe/raw = ||g_tangent|| / ||g_new||
+redundancy = 1 - effective_rank(A_t) / rows(A_t)
+```
+
+If `safe/raw` collapses, plasticity is dying. If redundancy is high, many
+anchors can likely be compressed into fewer basis directions.
+
+### What happens when new learning genuinely conflicts with preserve behavior?
+
+The architecture should not silently overwrite preserve behavior.
+
+Conflict outcomes:
+
+```text
+reject update
+reduce step size
+increase guard / preserve weight
+route into adapter or separate subspace
+create a contextual split
+ask for external arbitration
+reclassify preserve -> drop only with repeated evidence
+```
+
+The safest default is:
+
+```text
+conflict with preserve and no explicit replacement -> reject or guard
+```
+
+### How do you choose restore strength?
+
+Current toy implementation:
+
+```text
+projected_restore_strength is fixed
+```
+
+Target architecture:
+
+```text
+restore is trust-region bounded
+```
+
+Useful adaptive rule:
+
+```text
+alpha_restore_bar =
+  min(
+    alpha_max,
+    tau_restore * ||g_tangent||
+    / (||g_restore|| + epsilon)
+  )
+```
+
+Increase restore when:
+
+```text
+preserve KL rises
+guard KL rises
+role / feature geometry drift rises
+obsolete behavior revives
+```
+
+Decrease restore when:
+
+```text
+new learning stalls
+safe/raw becomes too small
+restore dominates final/raw
+```
+
+### What is the first non-toy benchmark?
+
+Order of tests:
+
+```text
+1. toy controlled CL world
+2. Split MNIST / Split CIFAR as sanity checks
+3. class-incremental learning with no task labels
+4. factual update benchmarks
+5. model editing benchmarks
+6. safety behavior preservation
+7. task-free continual pretraining slices
+```
+
+The key benchmark requirement is not just accuracy. It must measure:
+
+```text
+new learning
+old preservation
+explicit controlled forgetting
+guard preservation
+geometry drift
+plasticity across stages
+memory budget
+compute cost
+```
+
+### Does this work without replay?
+
+The current toy system uses compact behavior probes and committed anchors. That
+is not full replay, but it is still memory.
+
+Honest framing:
+
+```text
+not "no replay"
+but "geometry-aware compact behavioral memory"
+```
+
+A stronger future claim would be:
+
+```text
+the method reduces forgetting with much less memory than full replay
+```
+
+That requires equal-memory comparisons against replay baselines.
+
+### What part of the big architecture decides when to forget?
+
+Current toy system uses explicit role labels.
+
+Target architecture uses evidence-gated controlled forgetting:
+
+```text
+forget if:
+  obsolete evidence is repeated
+  usefulness is low
+  capacity pressure is present
+  replacement behavior is verified
+  neutral guard remains healthy
+  preserve behavior remains healthy
+```
+
+Forgetting has three levels:
+
+```text
+stop protecting
+actively suppress obsolete answer
+release capacity / prune route
+```
+
+The system should prefer the weakest sufficient forgetting action.
 
 ## What Must Stay Conservative
 

@@ -2267,19 +2267,20 @@ def plot_behavior_outcome(
     *,
     metrics: dict[str, dict[str, dict[str, float]]],
     output_path: Path,
+    controlled_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
-    methods = ["naive", "controlled", "joint"]
+    methods = [("naive", "Naive sequential"), ("controlled", controlled_label), ("joint", "Joint reference")]
     groups = ["preserve", "guard", "changed", "new", "composition", "obsolete_old_answer"]
     labels = ["preserve", "guard", "changed", "new", "compose", "old-wrong"]
     width = 0.24
     x_values = list(range(len(groups)))
     fig, ax = plt.subplots(figsize=(11, 5))
-    for method_index, method in enumerate(methods):
+    for method_index, (method, label) in enumerate(methods):
         offsets = [x + (method_index - 1) * width for x in x_values]
         values = [float(metrics[method][group]["exact_match"]) for group in groups]
-        ax.bar(offsets, values, width=width, label=method)
+        ax.bar(offsets, values, width=width, label=label)
     ax.set_ylim(0.0, 1.05)
     ax.set_ylabel("exact match")
     ax.set_title("Behavior after continual learning")
@@ -2297,6 +2298,7 @@ def plot_stage_trajectory(
     controlled_trace: list[dict[str, Any]],
     output_path: Path,
     memory_budget: int,
+    controlled_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -2324,7 +2326,7 @@ def plot_stage_trajectory(
     ax.set_ylim(-0.02, 1.05)
     ax.set_xlabel("CL stage")
     ax.set_ylabel("exact match")
-    ax.set_title("Controlled CL stage trajectory")
+    ax.set_title(f"{controlled_label} stage trajectory")
     ax.grid(alpha=0.25)
     ax2 = ax.twinx()
     memory_sizes = [int(row["committed_anchor_count_after_stage"]) for row in controlled_trace]
@@ -2344,10 +2346,16 @@ def plot_protected_geometry_cka(
     *,
     role_geometry: dict[str, Any],
     output_path: Path,
+    controlled_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
     comparisons = ["naive_vs_base", "controlled_vs_base", "joint_vs_base"]
+    comparison_labels = {
+        "naive_vs_base": "Naive sequential",
+        "controlled_vs_base": controlled_label,
+        "joint_vs_base": "Joint reference",
+    }
     roles = ["preserve", "guard", "changed", "new"]
     width = 0.24
     x_values = list(range(len(roles)))
@@ -2358,7 +2366,7 @@ def plot_protected_geometry_cka(
             for role in roles
         ]
         offsets = [x + (comparison_index - 1) * width for x in x_values]
-        ax.bar(offsets, values, width=width, label=comparison.replace("_vs_base", ""))
+        ax.bar(offsets, values, width=width, label=comparison_labels[comparison])
     ax.set_ylim(0.0, 1.05)
     ax.set_ylabel("CKA to base geometry")
     ax.set_title("Protected role geometry health")
@@ -2375,11 +2383,17 @@ def plot_role_geometry_drift_heatmap(
     *,
     role_geometry: dict[str, Any],
     output_path: Path,
+    controlled_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
     roles = ["preserve", "guard", "changed", "new", "composition", "obsolete_old_answer"]
     comparisons = ["naive_vs_base", "controlled_vs_base", "joint_vs_base"]
+    comparison_labels = {
+        "naive_vs_base": "Naive sequential",
+        "controlled_vs_base": controlled_label,
+        "joint_vs_base": "Joint reference",
+    }
     matrix = [
         [
             mean_role_geometry_metric(role_geometry[comparison], role=role, metric="centroid_drift")
@@ -2391,7 +2405,7 @@ def plot_role_geometry_drift_heatmap(
     image = ax.imshow(matrix, aspect="auto", cmap="magma")
     ax.set_title("Role centroid drift")
     ax.set_xticks(range(len(comparisons)))
-    ax.set_xticklabels([value.replace("_vs_base", "") for value in comparisons], rotation=20, ha="right")
+    ax.set_xticklabels([comparison_labels[value] for value in comparisons], rotation=20, ha="right")
     ax.set_yticks(range(len(roles)))
     ax.set_yticklabels(["old-wrong" if role == "obsolete_old_answer" else role for role in roles])
     for row_index, row in enumerate(matrix):
@@ -2410,6 +2424,7 @@ def plot_final_residual_pca_roles(
     groups: dict[str, list[EncodedExample]],
     device: torch.device,
     output_path: Path,
+    controlled_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -2440,6 +2455,7 @@ def plot_final_residual_pca_roles(
         raise RuntimeError(f"Need at least two PCA components, got {vh.shape}.")
     basis = vh[:2].T
     fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharex=True, sharey=True)
+    titles = {"naive": "Naive sequential", "controlled": controlled_label}
     for axis, method in zip(axes, panel_methods, strict=True):
         for role in roles:
             projected = (raw[method][role] - matrix.mean(dim=0, keepdim=True)) @ basis
@@ -2452,7 +2468,7 @@ def plot_final_residual_pca_roles(
                 label=label,
                 color=colors[role],
             )
-        axis.set_title(method)
+        axis.set_title(titles[method])
         axis.set_xlabel("PC1")
         axis.grid(alpha=0.2)
     axes[0].set_ylabel("PC2")
@@ -2598,6 +2614,7 @@ def write_summary_plots(
     device: torch.device,
     memory_budget: int,
     plasticity_audit: bool,
+    controlled_label: str,
 ) -> dict[str, str]:
     plot_dir.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -2610,25 +2627,33 @@ def write_summary_plots(
     }
     if plasticity_audit:
         paths["plasticity_audit"] = plot_dir / "07_plasticity_audit.png"
-    plot_behavior_outcome(metrics=metrics, output_path=paths["behavior_outcome"])
+    plot_behavior_outcome(
+        metrics=metrics,
+        output_path=paths["behavior_outcome"],
+        controlled_label=controlled_label,
+    )
     plot_stage_trajectory(
         controlled_trace=controlled_trace,
         output_path=paths["stage_trajectory"],
         memory_budget=memory_budget,
+        controlled_label=controlled_label,
     )
     plot_protected_geometry_cka(
         role_geometry=role_feature_geometry["roles"],
         output_path=paths["protected_geometry_cka"],
+        controlled_label=controlled_label,
     )
     plot_role_geometry_drift_heatmap(
         role_geometry=role_feature_geometry["roles"],
         output_path=paths["role_geometry_drift"],
+        controlled_label=controlled_label,
     )
     plot_final_residual_pca_roles(
         models=models,
         groups=role_groups(encoded),
         device=device,
         output_path=paths["final_residual_pca_roles"],
+        controlled_label=controlled_label,
     )
     plot_committed_memory_budget(
         controlled_trace=controlled_trace,
@@ -2653,6 +2678,16 @@ def count_trainable_parameters(model: GCONativeTransformer) -> int:
 
 def count_parameters(model: GCONativeTransformer) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
+
+
+def controlled_method_label(args: argparse.Namespace) -> str:
+    if args.controlled_update_mode == "loss":
+        return "Controlled-loss baseline"
+    if args.controlled_update_mode == "projected_invariant_tangent":
+        if args.projected_restore_strength > 0.0:
+            return f"Invariant-Tangent CL + restore {args.projected_restore_strength:g}"
+        return "Invariant-Tangent CL"
+    raise ValueError(f"Unknown controlled update mode {args.controlled_update_mode!r}.")
 
 
 @torch.no_grad()
@@ -3551,6 +3586,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             device=device,
             memory_budget=args.commit_memory_budget,
             plasticity_audit=args.plasticity_audit,
+            controlled_label=controlled_method_label(args),
         )
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     with args.output_json.open("w", encoding="utf-8") as handle:

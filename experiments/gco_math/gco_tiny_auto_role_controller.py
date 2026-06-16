@@ -1,15 +1,24 @@
-"""Automatic role-controller diagnostic for toy continual learning.
+"""Evidence-based role-controller diagnostic for toy continual learning.
 
 The previous controlled architecture used explicit preserve/drop/neutral
-labels. This script removes those direct role labels. Instead, it gives the
-controller evidence:
+labels. This script tests whether a controller can choose those behavior-level
+roles from evidence before any weight-level forgetting is attempted.
+
+Controller modes:
+
+    oracle: use the intended preserve/drop/guard split.
+    evidence: infer roles from learned behavior, usefulness, obsolete evidence,
+        and capacity pressure.
+    random: assign the same role counts as the oracle, but to random people.
+
+The evidence controller receives:
 
     learned behavior quality from the model
     current usefulness from the incoming task stream
     obsolete evidence from an external event stream
     capacity pressure
 
-The controller maps evidence to roles:
+It maps evidence to roles:
 
     preserve: learned and currently useful
     drop: learned, obsolete, not useful, and capacity pressure is high
@@ -17,6 +26,10 @@ The controller maps evidence to roles:
 
 The model still does not get final authority over deletion. The hard rule is:
 if evidence is uncertain, guard rather than drop.
+
+All methods are evaluated against the intended roles, not against whatever role
+the controller selected. This prevents a bad controller from hiding failure by
+moving the target labels.
 """
 
 from __future__ import annotations
@@ -92,6 +105,22 @@ def parse_people(raw: str, *, name: str, allow_empty: bool = False) -> set[str]:
     return people
 
 
+def stage1_people() -> set[str]:
+    return {item.person for item in relation_items() if item.stage == 1}
+
+
+def validate_stage1_people(people: set[str], *, name: str) -> None:
+    unknown = people.difference(stage1_people())
+    if unknown:
+        raise ValueError(f"--{name.replace('_', '-')} can only contain stage-1 people; got {sorted(unknown)}.")
+
+
+def validate_disjoint_roles(*, preserve_people: set[str], drop_people: set[str]) -> None:
+    overlap = preserve_people.intersection(drop_people)
+    if overlap:
+        raise ValueError(f"People cannot be both preserve and drop: {sorted(overlap)}.")
+
+
 def build_raw_stream(
     *,
     useful_evidence_people: set[str],
@@ -134,6 +163,77 @@ def examples_by_stage1_person() -> dict[str, list[QAExample]]:
         if item.stage == 1:
             result[item.person] = possession_examples(item)
     return result
+
+
+def oracle_roles(*, preserve_people: set[str], drop_people: set[str]) -> dict[str, str]:
+    validate_stage1_people(preserve_people, name="oracle_preserve_people")
+    validate_stage1_people(drop_people, name="oracle_drop_people")
+    validate_disjoint_roles(preserve_people=preserve_people, drop_people=drop_people)
+    roles: dict[str, str] = {}
+    for person in sorted(stage1_people()):
+        if person in preserve_people:
+            roles[person] = "preserve"
+        elif person in drop_people:
+            roles[person] = "drop"
+        else:
+            roles[person] = "guard"
+    return roles
+
+
+def random_roles_matching_counts(
+    *,
+    true_roles: dict[str, str],
+    seed: int,
+) -> dict[str, str]:
+    people = sorted(true_roles)
+    preserve_count = sum(1 for role in true_roles.values() if role == "preserve")
+    drop_count = sum(1 for role in true_roles.values() if role == "drop")
+    guard_count = len(people) - preserve_count - drop_count
+    if preserve_count <= 0 or drop_count <= 0 or guard_count <= 0:
+        raise ValueError(
+            "Random controller requires non-empty preserve, drop, and guard oracle groups; "
+            f"counts preserve={preserve_count} drop={drop_count} guard={guard_count}."
+        )
+    generator = random.Random(seed)
+    shuffled = list(people)
+    generator.shuffle(shuffled)
+    preserve_people = set(shuffled[:preserve_count])
+    drop_people = set(shuffled[preserve_count : preserve_count + drop_count])
+    return oracle_roles(preserve_people=preserve_people, drop_people=drop_people)
+
+
+def role_match_report(
+    *,
+    predicted_roles: dict[str, str],
+    true_roles: dict[str, str],
+) -> dict[str, Any]:
+    if set(predicted_roles) != set(true_roles):
+        raise ValueError(
+            "Predicted and true role maps must cover the same people; "
+            f"predicted={sorted(predicted_roles)} true={sorted(true_roles)}."
+        )
+    labels = ["preserve", "drop", "guard"]
+    confusion = {true: {predicted: 0 for predicted in labels} for true in labels}
+    correct = 0
+    per_person: dict[str, dict[str, str | bool]] = {}
+    for person in sorted(true_roles):
+        predicted = predicted_roles[person]
+        true = true_roles[person]
+        if predicted not in labels:
+            raise ValueError(f"Unknown predicted role {predicted!r} for {person}.")
+        if true not in labels:
+            raise ValueError(f"Unknown true role {true!r} for {person}.")
+        confusion[true][predicted] += 1
+        matched = predicted == true
+        correct += int(matched)
+        per_person[person] = {"predicted": predicted, "true": true, "match": matched}
+    return {
+        "accuracy": float(correct) / float(len(true_roles)),
+        "correct": correct,
+        "total": len(true_roles),
+        "confusion": confusion,
+        "per_person": per_person,
+    }
 
 
 def encode_raw_groups(
@@ -225,6 +325,53 @@ def assign_roles(
     return role_by_person, evidence_by_person
 
 
+def choose_controller_roles(
+    *,
+    args: argparse.Namespace,
+    controller: str,
+    model: torch.nn.Module,
+    raw_groups: dict[str, list[QAExample]],
+    encoded_people: dict[str, list[EncodedExample]],
+    true_roles: dict[str, str],
+    obsolete_evidence_people: set[str],
+    pad_id: int,
+    device: torch.device,
+    seed: int,
+) -> tuple[dict[str, str], dict[str, dict[str, float]]]:
+    if controller == "oracle":
+        evidence = {
+            person: {
+                "oracle_preserve": float(role == "preserve"),
+                "oracle_drop": float(role == "drop"),
+                "oracle_guard": float(role == "guard"),
+            }
+            for person, role in sorted(true_roles.items())
+        }
+        return dict(true_roles), evidence
+    if controller == "random":
+        roles = random_roles_matching_counts(true_roles=true_roles, seed=seed)
+        evidence = {
+            person: {
+                "random_preserve": float(role == "preserve"),
+                "random_drop": float(role == "drop"),
+                "random_guard": float(role == "guard"),
+            }
+            for person, role in sorted(roles.items())
+        }
+        return roles, evidence
+    if controller == "evidence":
+        return assign_roles(
+            args=args,
+            model=model,
+            raw_groups=raw_groups,
+            encoded_people=encoded_people,
+            obsolete_evidence_people=obsolete_evidence_people,
+            pad_id=pad_id,
+            device=device,
+        )
+    raise ValueError(f"Unknown role controller {controller!r}.")
+
+
 def build_role_groups(
     *,
     role_by_person: dict[str, str],
@@ -284,6 +431,23 @@ def evaluate_category_breakdown(
     }
 
 
+def parse_methods(raw: str) -> list[str]:
+    aliases = {
+        "auto_direct": "evidence",
+        "evidence_direct": "evidence",
+        "oracle_direct": "oracle",
+        "random_direct": "random",
+    }
+    methods = [aliases.get(item.strip(), item.strip()) for item in raw.split(",") if item.strip()]
+    if not methods:
+        raise ValueError("--methods must contain at least one method.")
+    allowed = {"naive", "oracle", "evidence", "random"}
+    unknown = sorted(set(methods).difference(allowed))
+    if unknown:
+        raise ValueError(f"Unknown methods {unknown}; allowed={sorted(allowed)}.")
+    return methods
+
+
 def run_method(
     *,
     args: argparse.Namespace,
@@ -292,13 +456,16 @@ def run_method(
     raw_groups: dict[str, list[QAExample]],
     encoded_base_groups: dict[str, list[EncodedExample]],
     encoded_people: dict[str, list[EncodedExample]],
+    true_roles: dict[str, str],
+    true_role_groups: dict[str, list[EncodedExample]],
     obsolete_evidence_people: set[str],
     pad_id: int,
     device: torch.device,
 ) -> dict[str, Any]:
-    if method not in {"naive", "auto_direct"}:
+    if method not in {"naive", "oracle", "evidence", "random"}:
         raise ValueError(f"Unknown method: {method!r}.")
-    model = make_model_from_config(checkpoint=checkpoint, device=device, seed=args.seed + {"naive": 11, "auto_direct": 22}[method])
+    seed_offsets = {"naive": 11, "oracle": 22, "evidence": 33, "random": 44}
+    model = make_model_from_config(checkpoint=checkpoint, device=device, seed=args.seed + seed_offsets[method])
     traces: list[dict[str, Any]] = []
     trace1 = train_bootstrap_stage(
         args=args,
@@ -312,21 +479,37 @@ def run_method(
     )
     traces.append({"stage": 1, "mode": "bootstrap", "trace": trace1})
 
-    role_by_person, role_evidence = assign_roles(
-        args=args,
-        model=model,
-        raw_groups=raw_groups,
-        encoded_people=encoded_people,
-        obsolete_evidence_people=obsolete_evidence_people,
-        pad_id=pad_id,
-        device=device,
-    )
-    role_groups = build_role_groups(role_by_person=role_by_person, encoded_people=encoded_people)
-    groups = {
+    if method == "naive":
+        role_by_person = dict(true_roles)
+        role_evidence = {
+            person: {"not_used_for_training": 1.0}
+            for person in sorted(true_roles)
+        }
+    else:
+        role_by_person, role_evidence = choose_controller_roles(
+            args=args,
+            controller=method,
+            model=model,
+            raw_groups=raw_groups,
+            encoded_people=encoded_people,
+            true_roles=true_roles,
+            obsolete_evidence_people=obsolete_evidence_people,
+            pad_id=pad_id,
+            device=device,
+            seed=args.seed + 1000 + seed_offsets[method],
+        )
+    training_role_groups = build_role_groups(role_by_person=role_by_person, encoded_people=encoded_people)
+    train_groups = {
         **encoded_base_groups,
-        "preserve": role_groups["preserve"],
-        "drop": role_groups["drop"],
-        "neutral": role_groups["neutral"],
+        "preserve": training_role_groups["preserve"],
+        "drop": training_role_groups["drop"],
+        "neutral": training_role_groups["neutral"],
+    }
+    eval_groups = {
+        **encoded_base_groups,
+        "preserve": true_role_groups["preserve"],
+        "drop": true_role_groups["drop"],
+        "neutral": true_role_groups["neutral"],
     }
 
     if method == "naive":
@@ -334,7 +517,7 @@ def run_method(
             trace = train_bootstrap_stage(
                 args=args,
                 model=model,
-                stage_examples=groups[stage_name],
+                stage_examples=train_groups[stage_name],
                 pad_id=pad_id,
                 device=device,
                 epochs=args.stage_epochs,
@@ -343,9 +526,9 @@ def run_method(
             )
             traces.append({"stage": stage_number, "mode": "naive", "trace": trace})
     else:
-        preserve_examples = cap_examples(groups["preserve"], budget=args.preserve_budget)
-        drop_examples = cap_examples(groups["drop"], budget=args.drop_budget)
-        guard_examples = cap_examples(groups["neutral"], budget=args.guard_budget)
+        preserve_examples = cap_examples(train_groups["preserve"], budget=args.preserve_budget)
+        drop_examples = cap_examples(train_groups["drop"], budget=args.drop_budget)
+        guard_examples = cap_examples(train_groups["neutral"], budget=args.guard_budget)
         for stage_number, stage_name in enumerate(["stage2", "stage3"], start=2):
             preserve_logits = collect_example_logits(
                 model,
@@ -364,7 +547,7 @@ def run_method(
             trace = train_direct_stage(
                 args=args,
                 model=model,
-                stage_examples=groups[stage_name],
+                stage_examples=train_groups[stage_name],
                 preserve_examples=preserve_examples,
                 preserve_logits=preserve_logits,
                 guard_examples=guard_examples,
@@ -376,27 +559,30 @@ def run_method(
                 seed=args.seed + 200 * stage_number,
                 label=f"{method} {stage_name}",
             )
-            traces.append({"stage": stage_number, "mode": "auto_direct", "trace": trace})
+            traces.append({"stage": stage_number, "mode": method, "trace": trace})
             if args.add_learned_stage_to_guard:
-                guard_examples = cap_examples(guard_examples + groups[stage_name], budget=args.guard_budget)
+                guard_examples = cap_examples(guard_examples + train_groups[stage_name], budget=args.guard_budget)
 
     metrics = evaluate_role_summary(
         model=model,
-        groups=groups,
+        groups=eval_groups,
         pad_id=pad_id,
         batch_size=args.eval_batch_size,
         device=device,
     )
     category_breakdown = evaluate_category_breakdown(
         model=model,
-        examples=groups["eval_all"],
+        examples=eval_groups["eval_all"],
         pad_id=pad_id,
         batch_size=args.eval_batch_size,
         device=device,
     )
+    role_report = role_match_report(predicted_roles=role_by_person, true_roles=true_roles)
     return {
         "method": method,
         "role_by_person": role_by_person,
+        "true_role_by_person": true_roles,
+        "role_match_report": role_report,
         "role_evidence": role_evidence,
         "metrics": metrics,
         "category_breakdown": category_breakdown,
@@ -431,6 +617,12 @@ def validate_args(args: argparse.Namespace) -> None:
     probability("capacity_pressure", args.capacity_pressure)
     probability("preserve_threshold", args.preserve_threshold)
     probability("drop_threshold", args.drop_threshold)
+    parse_methods(args.methods)
+    oracle_preserve_people = parse_people(args.oracle_preserve_people, name="oracle_preserve_people")
+    oracle_drop_people = parse_people(args.oracle_drop_people, name="oracle_drop_people")
+    validate_stage1_people(oracle_preserve_people, name="oracle_preserve_people")
+    validate_stage1_people(oracle_drop_people, name="oracle_drop_people")
+    validate_disjoint_roles(preserve_people=oracle_preserve_people, drop_people=oracle_drop_people)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -444,10 +636,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("Tokenizer must define [PAD].")
     useful_evidence_people = parse_people(args.useful_evidence_people, name="useful_evidence_people")
     obsolete_evidence_people = parse_people(args.obsolete_evidence_people, name="obsolete_evidence_people")
+    oracle_preserve_people = parse_people(args.oracle_preserve_people, name="oracle_preserve_people")
+    oracle_drop_people = parse_people(args.oracle_drop_people, name="oracle_drop_people")
     composition_holdout_people = parse_people(args.composition_holdout_people, name="composition_holdout_people", allow_empty=True)
     overlap = useful_evidence_people.intersection(obsolete_evidence_people)
     if overlap:
         raise ValueError(f"People cannot have both useful and obsolete evidence: {sorted(overlap)}.")
+    true_roles = oracle_roles(preserve_people=oracle_preserve_people, drop_people=oracle_drop_people)
 
     _config_model, checkpoint = load_checkpoint(args.config_checkpoint, device)
     max_seq_len = int(checkpoint["model_config"]["max_seq_len"])
@@ -459,15 +654,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     raw_people = examples_by_stage1_person()
     encoded_base_groups = encode_raw_groups(raw_groups, tokenizer, max_seq_len=max_seq_len)
     encoded_people = encode_raw_groups(raw_people, tokenizer, max_seq_len=max_seq_len)
-    methods = [item.strip() for item in args.methods.split(",") if item.strip()]
-    if not methods:
-        raise ValueError("--methods must contain at least one method.")
+    true_role_groups = build_role_groups(role_by_person=true_roles, encoded_people=encoded_people)
+    methods = parse_methods(args.methods)
 
     print("TINY AUTO ROLE-CONTROLLER CL")
     print("=" * 112)
     print(
         f"device={device} methods={methods} useful_evidence={sorted(useful_evidence_people)} "
         f"obsolete_evidence={sorted(obsolete_evidence_people)} capacity={args.capacity_pressure:.3f}"
+    )
+    print(
+        f"true_roles preserve={sorted(oracle_preserve_people)} drop={sorted(oracle_drop_people)} "
+        f"guard={sorted(person for person, role in true_roles.items() if role == 'guard')}"
     )
     print(
         f"examples stage1={len(encoded_base_groups['stage1'])} stage2={len(encoded_base_groups['stage2'])} "
@@ -482,6 +680,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raw_groups=raw_groups,
             encoded_base_groups=encoded_base_groups,
             encoded_people=encoded_people,
+            true_roles=true_roles,
+            true_role_groups=true_role_groups,
             obsolete_evidence_people=obsolete_evidence_people,
             pad_id=pad_id,
             device=device,
@@ -492,6 +692,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "question": "Can a bounded controller assign preserve/drop/guard roles from evidence and drive recursive CL?",
         "evidence_config": {
+            "oracle_preserve_people": sorted(oracle_preserve_people),
+            "oracle_drop_people": sorted(oracle_drop_people),
+            "true_role_by_person": true_roles,
             "useful_evidence_people": sorted(useful_evidence_people),
             "obsolete_evidence_people": sorted(obsolete_evidence_people),
             "composition_holdout_people": sorted(composition_holdout_people),
@@ -526,11 +729,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     print("\nTINY AUTO ROLE-CONTROLLER SUMMARY")
     print("=" * 112)
     for result in results:
-        print(f"method={result['method']} roles={result['role_by_person']}")
+        role_report = result["role_match_report"]
+        print(
+            f"method={result['method']} role_accuracy={role_report['accuracy']:.3f} "
+            f"roles={result['role_by_person']}"
+        )
     print("-" * 112)
     print(
-        "{:>12} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}".format(
+        "{:>12} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}".format(
             "method",
+            "roleAcc",
             "preserve",
             "drop",
             "guard",
@@ -540,7 +748,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
     )
     print(
-        "{:>12} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}".format(
+        "{:>12} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}".format(
+            "",
             "",
             "loss/exact",
             "loss/exact",
@@ -557,8 +766,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for result in results:
         metrics = result["metrics"]
         print(
-            "{:>12} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}".format(
+            "{:>12} {:>8.3f} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}".format(
                 result["method"],
+                result["role_match_report"]["accuracy"],
                 compact(metrics["preserve"]),
                 compact(metrics["drop"]),
                 compact(metrics["neutral"]),
@@ -600,7 +810,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config-checkpoint", type=Path, default=Path("model/checkpoints/gco-tiny-cl-base-100w-seed0.pt"))
     parser.add_argument("--tokenizer-path", type=Path, default=Path("data/real_book/tokenizer.json"))
     parser.add_argument("--output-json", type=Path, default=Path("model/analysis/gco-tiny-auto-role-controller-seed0.json"))
-    parser.add_argument("--methods", type=str, default="naive,auto_direct")
+    parser.add_argument("--methods", type=str, default="naive,oracle,evidence,random")
+    parser.add_argument("--oracle-preserve-people", type=str, default="Alice,Bruno")
+    parser.add_argument("--oracle-drop-people", type=str, default="Clara,Darin")
     parser.add_argument("--useful-evidence-people", type=str, default="Alice,Bruno")
     parser.add_argument("--obsolete-evidence-people", type=str, default="Clara,Darin")
     parser.add_argument("--composition-holdout-people", type=str, default="Kira,Luca")
@@ -629,7 +841,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distill-temperature", type=float, default=2.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu")
     return parser
 
 
