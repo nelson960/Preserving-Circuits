@@ -1,237 +1,275 @@
-# Controlled CL Run Results
+# Continual Learning Evidence Ledger
 
-This file is the evidence ledger for controlled continual-learning experiments.
-It records meaningful results and what they imply. It is separate from
-`CL_Architecture.md`, which should describe the architecture and math rather
-than every run.
+Updated: 2026-06-20
 
-## Current Claim
+## Purpose
 
-The current evidence supports this limited claim:
+This file records only experiments that directly support or constrain the
+current architecture. It is intentionally not a chronological notebook. Failed
+branches and superseded hypotheses remain in `docs/archive/`.
 
-```text
-In a toy staged continual-learning setting, an invariant-tangent update with
-a bounded restore correction can preserve selected old behavior, guard behavior,
-learn changed facts, learn new facts, suppress obsolete answers, and keep
-residual geometry healthier than naive sequential learning.
-```
+## Evidence Chain
 
-The current evidence does not yet support these stronger claims:
+| stage | experiment | result | role in current architecture |
+|---:|---|---|---|
+| 1 | Same-spec 100/200-word geometry | More-data training reorganized old geometry while preserving behavior | Established geometry as a CL problem |
+| 2 | Behavior-preserving path | Learned new text while retaining old output behavior | Showed a protected path can exist |
+| 3 | Invariant-Tangent plus restore | Projection plus restore succeeded where projection-only failed | Defined the weight-update operator |
+| 4 | Controlled preserve/drop/guard | Selective suppression worked with neutral protection | Established controlled forgetting requirements |
+| 5 | Dynamic committed anchors | Newly learned behavior survived later stages | Established recursive commit |
+| 6 | Autonomous trace field | Merge, branch, novelty, noise rejection, and release emerged under fixed slots | Defined evidence organization |
+| 7 | Recurrent trace summary | Five bounded summaries approximated full history | Established bounded memory feasibility |
+| 8 | Functional dependency field | Output, geometry, and feature-family sensitivity produced a compressed protection basis | Connected traces to parameter directions |
+| 9 | Integrated delayed autonomous CL | Sparse novelty matured, obsolete behavior was replaced, noise was ignored, geometry survived | First complete toy loop |
+| 10 | Real-text dependency bridge | Preservation improved but correction learning failed | Current transformer boundary |
 
-```text
-the method solves continual learning
-the method scales to large models
-restore strength 0.05 is robust or optimal
-the role controller can fully decide preserve/drop/guard roles by itself
-the method works across seeds or hard open-ended streams
-```
+## Current Primary Run
 
-## Mechanism Under Test
-
-The unique update mechanism under test is:
+Artifact:
 
 ```text
-g_N = grad_theta L_new(theta)
-
-A_t = protected behavior + protected geometry constraint rows
-
-g_tangent =
-  g_N - A_t^T (A_t A_t^T + rho I)^-1 A_t g_N
-
-g_restore =
-  grad_theta (L_preserve + L_guard + L_geometry)
-
-g_update =
-  g_tangent + alpha_restore * g_restore
+research/02_trace_dependency_plasticity/results/gco-tiny-autonomous-delayed-dependency-invariant-cl-seed0/
+  autonomous_dependency_invariant_cl.json
+  autonomous_behavior.png
+  autonomous_trace_lifecycle.png
+  autonomous_geometry.png
+  autonomous_capacity_dependency.png
 ```
 
-Projection alone failed. Projection plus restore succeeded.
+Protocol:
 
-## Main Evidence Pair
+| property | value |
+|---|---:|
+| model parameters | 246 |
+| trace slots | 5 |
+| online singleton events | 62 |
+| persistent trace scalars | 155 |
+| hidden training roles | none |
+| seed | 0 |
 
-Source artifacts:
+Final behavior:
+
+| group | model MSE | trace error | dominant slot | dominant share |
+|---|---:|---:|---:|---:|
+| branch down | 0.00979 | 0.16160 | 2 | 1.0000 |
+| branch root | 0.00218 | 0.20171 | 2 | 0.9067 |
+| branch up | 0.00529 | 0.04078 | 4 | 1.0000 |
+| merge A | 0.00172 | 0.03516 | 1 | 1.0000 |
+| merge B | 0.00254 | 0.04310 | 1 | 1.0000 |
+| noise | 0.37029 | 1.83054 | 3 | 0.3308 |
+| novel replacement | 0.00330 | 0.06860 | 3 | 1.0000 |
+| obsolete | 0.29352 | 1.23218 | 3 | 0.9988 |
+| stable | 0.00227 | 0.05597 | 0 | 1.0000 |
+
+Geometry and capacity:
+
+| metric | value |
+|---|---:|
+| hidden CKA | 0.999385 |
+| hidden relative drift | 0.049031 |
+| pair-geometry drift | 0.013072 |
+| final pending fraction | 0.675509 |
+| dependency retained rank | 40–48 |
+| mean raw gradient fraction removed | 0.898809 |
+| mean final/raw predicted damage | 0.334465 |
+| maximum final/raw predicted damage | 1.326809 |
+
+Delayed novel maturation:
+
+| novel occurrence | write | support | verified gain |
+|---:|---:|---:|---:|
+| 1 | 0.000019 | 0.000019 | 0.000006 |
+| 2 | 0.007818 | 0.007818 | 0.025128 |
+| 3 | 0.059440 | 0.059440 | 0.213182 |
+| 7 | 0.246755 | 0.246755 | 0.418956 |
+| 13 | 0.600316 | 0.600316 | 0.307384 |
+| 16 | 0.547681 | 0.547681 | 0.290246 |
+
+Noise boundary:
+
+| metric | value |
+|---|---:|
+| maximum isolated-noise write | 0.000336 |
+| maximum isolated-noise verified gain | 0.000440 |
+
+Interpretation:
 
 ```text
-model/analysis/colab-plasticity-audit/colab-plasticity-audit.json
-model/analysis/colab-plasticity-audit2/colab-plasticity-audit2.json
+delayed recurrence created increasing permission to learn
+verified gain converted successful writes into learned mass
+novel evidence repurposed the obsolete trace region
+isolated noise remained effectively unwritten
+stable and branched functions survived
+trace storage remained fixed
 ```
 
-Both runs used the same staged continual-learning protocol:
+Primary limitation exposed by this run:
 
 ```text
-base_word_target          5000
-conversation_word_target  1800
-conversation_stages       4
-d_model                   192
-layers                    3
-heads                     4
-d_ff                      768
-controlled_update_mode    projected_invariant_tangent
-projected_solver          gram
-constraint_mode           category_centroid_separation
-commit_memory_budget      48
+pending fraction reached 67.55%
 ```
 
-The only decisive difference:
+The next run must determine whether pending pressure reaches equilibrium or
+eventually dilutes verified memory.
+
+## Foundational Invariant-Tangent Evidence
+
+Historical detailed report:
 
 ```text
-projection-only run:
-  projected_restore_strength = 0.0
-
-successful restore run:
-  projected_restore_strength = 0.05
+docs/archive/invariant_tangent_early_results.md
 ```
 
-## Behavior Accuracy
+Primary artifacts:
 
-Exact-match success scores:
+```text
+research/01_invariant_tangent/results/colab-loss-baseline/colab-loss-baseline.json
+research/01_invariant_tangent/results/colab-plasticity-audit/colab-plasticity-audit.json
+research/01_invariant_tangent/results/colab-plasticity-audit2/colab-plasticity-audit2.json
+research/01_invariant_tangent/results/colab-rich-invariant/colab-rich-invariant.json
+```
 
-| method | preserve | guard | changed | new | composition | suppress obsolete |
+The important result was not that projection alone worked. It did not.
+Projection plus bounded restore preserved old/guard behavior and learned the
+controlled target categories in the successful toy run.
+
+| mechanism | preserve | guard | changed | new | composition | obsolete retained |
 |---|---:|---:|---:|---:|---:|---:|
-| base | 1.000 | 1.000 | 0.000 | 0.000 | 0.333 | 0.000 |
-| naive sequential | 0.000 | 0.000 | 0.000 | 0.300 | 0.167 | 1.000 |
-| invariant-tangent, no restore | 0.000 | 0.000 | 0.000 | 0.300 | 0.167 | 1.000 |
-| invariant-tangent + restore | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
-| joint from scratch | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| naive sequential | 0.000 | 0.000 | 0.000 | 0.300 | 0.167 | 0.000 |
+| projection only | 0.000 | 0.000 | 0.000 | 0.300 | 0.167 | 0.000 |
+| projection plus restore | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 0.000 |
 
-Interpretation:
+This result established the update operator but relied on externally defined
+behavior roles. The autonomous trace work later removed those roles from the
+learning mechanism.
 
-```text
-naive learns a little new data but catastrophically forgets preserve/guard
-projection-only also forgets preserve/guard
-projection + restore preserves old behavior and learns all target categories
-joint is an upper reference, not a continual-learning method
-```
+## Bounded Evidence Results
 
-## Behavior Loss
+### Autonomous Trace Field
 
-| method | preserve loss | guard loss | changed loss | new loss | composition loss |
-|---|---:|---:|---:|---:|---:|
-| naive sequential | 5.9348 | 5.5818 | 5.9220 | 2.6712 | 3.7792 |
-| invariant-tangent, no restore | 8.1709 | 8.4551 | 7.3757 | 4.3208 | 6.1792 |
-| invariant-tangent + restore | 0.0001 | 0.0001 | 0.0026 | 0.0020 | 0.0014 |
-
-Interpretation:
+Artifact:
 
 ```text
-pure tangent projection left enough plasticity, but failed stability
-restore correction pulled the trajectory back to the protected manifold
+research/02_trace_dependency_plasticity/results/gco-tiny-autonomous-trace-field-seed0/trace_field.json
 ```
 
-## Residual Geometry
+Supported structure checks:
 
-Mean residual geometry relative to the base model:
+- duplicate sources merged;
+- contextual branches remained distinct;
+- the shared root remained compositional;
+- recurring novelty replaced released obsolete structure;
+- stable evidence survived;
+- isolated noise received no exclusive slot.
 
-| comparison | drift relative | CKA | rank delta |
+### Recurrent Summary
+
+Artifact:
+
+```text
+research/02_trace_dependency_plasticity/results/gco-tiny-recurrent-trace-field-seed0/recurrent_trace_field.json
+```
+
+| metric | full history | recurrent summary | current only |
 |---|---:|---:|---:|
-| naive vs base | 0.5753 | 0.6715 | -0.0033 |
-| invariant-tangent, no restore vs base | 0.5693 | 0.6280 | -1.5120 |
-| invariant-tangent + restore vs base | 0.3934 | 0.8608 | +8.3101 |
-| joint vs base | 0.8196 | 0.5498 | +8.5128 |
+| final MSE | 1.0499 | 1.1052 | 7.4637 |
+| retained-old error | 0.5040 | 0.5799 | 8.3803 |
+| persistent scalars | 1736 | 365 | 0 |
+
+Recurrent versus full attention CKA was `0.9984`, with `4.76x` storage
+compression.
+
+### Covariance Compression
+
+Artifact:
+
+```text
+research/02_trace_dependency_plasticity/results/gco-tiny-trace-covariance-sweep-seed0/trace_covariance_sweep.json
+```
+
+Full covariance, diagonal, variance trace, and tested low-rank summaries had the
+same result in this toy stream. The variance-trace representation used `50`
+scalars versus `365` for full covariance. This does not prove covariance is
+unnecessary in richer streams.
+
+## Trace-To-Weight Integration
+
+### Initial Trace/Invariant Bridge
+
+Artifact:
+
+```text
+research/02_trace_dependency_plasticity/results/gco-tiny-trace-invariant-integration-seed0/trace_invariant_integration.json
+```
+
+The bridge showed that trace-weighted loss, invariant projection, and bounded
+restore could preserve retained behavior while learning novelty. It did not yet
+derive a compact dependency basis.
+
+### Functional Dependency Field
+
+Artifact:
+
+```text
+research/02_trace_dependency_plasticity/results/gco-tiny-functional-dependency-field-seed0/functional_dependency_field.json
+```
+
+The dependency field combined direct output rows, pair-geometry rows, and
+hidden feature-family directions. In the toy run it matched behavior protection
+while reducing geometry drift relative to the direct trace-invariant basis.
+
+## Real-Text Boundary Run
+
+Artifact:
+
+```text
+research/03_semantic_reasoning/results/gco-tiny-text-dependency-cl-answer-balanced-seed0/text_dependency_cl.json
+```
+
+| method | stable loss | new-book loss | novel loss | corrected loss | new over old | CKA |
+|---|---:|---:|---:|---:|---:|---:|
+| naive | 0.5865 | 4.8440 | 1.3344 | 0.6617 | 0.3750 | 0.7334 |
+| trace loss mix | 0.1860 | 6.2399 | 1.3653 | 0.6747 | 0.3750 | 0.8329 |
+| trace invariant | 0.1771 | 6.2998 | 1.3265 | 0.6769 | 0.3750 | 0.8394 |
+| dependency field | 0.1785 | 6.2793 | 1.3487 | 0.6633 | 0.3750 | 0.8356 |
 
 Interpretation:
 
 ```text
-restore run has lower residual drift than naive and joint
-restore run has much higher CKA with base than naive and joint
-joint learns everything but creates a more different internal geometry
+protection and geometry retention improved
+new-book plasticity weakened
+corrected answers did not defeat obsolete answers
 ```
 
-## Role And Feature Geometry
+This run is a boundary/failure result, not evidence that real-text CL is solved.
 
-Successful restore run, mean role geometry:
+## Reproduction
 
-| comparison | centroid drift | centroid cosine | group CKA | separation drift |
-|---|---:|---:|---:|---:|
-| naive vs base | 4.2723 | 0.5320 | 0.6838 | 0.1421 |
-| invariant-tangent + restore vs base | 2.6439 | 0.7942 | 0.7662 | 0.1591 |
-| joint vs base | 6.2848 | -0.0083 | 0.7106 | 0.2587 |
+Current integrated delayed run:
 
-Successful restore run, mean feature geometry:
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-cache \
+python experiments/gco_math/gco_tiny_autonomous_dependency_invariant_cl.py \
+  --device mps
+```
 
-| comparison | centroid drift | centroid cosine | group CKA | separation drift |
-|---|---:|---:|---:|---:|
-| naive vs base | 4.3988 | 0.5431 | 0.6474 | 0.1474 |
-| invariant-tangent + restore vs base | 2.6149 | 0.8188 | 0.6969 | 0.2237 |
-| joint vs base | 6.2571 | 0.0055 | 0.6551 | 0.2155 |
-
-Interpretation:
+Default output:
 
 ```text
-restore run strongly improves centroid drift and centroid cosine versus naive
-separation drift is mixed and should not be overclaimed
+research/02_trace_dependency_plasticity/results/gco-tiny-autonomous-delayed-dependency-invariant-cl-seed0
 ```
 
-## Plasticity Audit
+## Excluded From The Active Claim
 
-Projection-only run:
+The following categories were useful exploration but do not independently
+support the current claim:
 
-| stage | safe/raw | final/raw | removed | effective rank | rows | redundancy | committed memory |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.9987 | 0.9987 | 0.0480 | 3.026 | 6.0 | 0.4957 | 9 |
-| 2 | 0.9982 | 0.9982 | 0.0588 | 1.106 | 19.0 | 0.9413 | 18 |
-| 3 | 0.9930 | 0.9930 | 0.1169 | 1.081 | 21.2 | 0.9480 | 27 |
-| 4 | 0.9981 | 0.9981 | 0.0614 | 1.072 | 18.2 | 0.9404 | 36 |
+- heuristic role classifiers;
+- consequence-action classifiers that collapsed to majority actions;
+- probabilistic plasticity mechanisms that collapsed to always-write;
+- recurrent controllers whose role accuracy did not produce learning;
+- routing and adapter variants superseded by the trace/dependency formulation;
+- large chronological command dumps without a stable interpretation.
 
-Restore run:
-
-| stage | safe/raw | final/raw | removed | effective rank | rows | redundancy | committed memory |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.9995 | 1.4272 | 0.0273 | 5.282 | 6.0 | 0.1197 | 9 |
-| 2 | 0.9988 | 1.4413 | 0.0466 | 1.107 | 19.0 | 0.9412 | 18 |
-| 3 | 0.9972 | 1.0591 | 0.0739 | 1.046 | 21.2 | 0.9495 | 27 |
-| 4 | 0.9990 | 1.2120 | 0.0436 | 1.078 | 18.2 | 0.9399 | 36 |
-
-Interpretation:
-
-```text
-plasticity did not collapse
-safe/raw stayed close to 1.0 across all stages
-restore makes final/raw exceed 1.0 because it adds corrective force
-constraint rows become highly redundant after stage 1
-```
-
-The next optimization target is therefore:
-
-```text
-compress redundant constraint rows into a low-rank protective basis
-```
-
-## Current Interpretation
-
-The strongest evidence now:
-
-```text
-1. Naive sequential learning catastrophically forgets.
-2. Projection-only tangent updates are not stable enough.
-3. Projection + bounded restore succeeds on the staged toy CL task.
-4. Successful run preserves old/guard behavior, learns changed/new/composed facts,
-   and suppresses obsolete old answers.
-5. Successful run keeps residual geometry closer to base than naive or joint.
-6. Plasticity does not collapse; the bottleneck is stable protection, not lack
-   of new-learning direction.
-```
-
-## Current Open Problems
-
-```text
-restore strength has not been swept
-results are not yet multi-seed
-role labels are still externally supplied by the protocol
-constraint basis is redundant
-checkpoint-free plot regeneration is limited
-longer loops and larger models remain untested
-```
-
-## What To Show In The Report
-
-The report should show:
-
-```text
-1. Projection-only failed.
-2. Projection + restore fixed the failure.
-3. Naive forgot.
-4. Restore run learned all target categories.
-5. Restore run preserved residual geometry better than naive/joint.
-6. The claim is promising but limited: one strong run, not robustness proof.
-```
+Their historical context is retained in `docs/archive/`, but they should not be
+presented as components of the current architecture.

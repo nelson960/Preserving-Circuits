@@ -7,13 +7,16 @@ This experiment separates two questions:
        learn new data better than the selector's weak adapter-write path?
 
 The recurrent selector is trained on the same staged toy stream as
-gco_tiny_recurrent_trace_plasticity.py. Its predicted roles build preserve,
-guard, and drop groups. A separate bridge adapter then performs the actual
-continual update with:
+gco_tiny_recurrent_trace_plasticity.py. The preferred bridge mode does not
+collapse its output into one symbolic role. Instead, it uses the continuous
+trace gates directly:
 
-    raw gradient = new CE + drop suppression
-    protected constraints = preserve + guard distillation rows
+    raw gradient = write-weighted new CE + drop-weighted suppression
+    protected constraints = protect/guard/commit-weighted distillation rows
     update = projected raw gradient + bounded restore gradient
+
+The older role-collapsed path is still available for comparison with
+--bridge-update-mode roles.
 
 This is still a toy adapter-space bridge, not the final full-model optimizer.
 It tests whether the recurrent selector can feed the invariant-tangent math.
@@ -51,8 +54,8 @@ from experiments.gco_math.gco_tiny_auto_role_controller import (
     oracle_roles,
     role_match_report,
 )
-from experiments.gco_math.gco_tiny_cl_behavior_path import load_checkpoint
-from experiments.gco_math.gco_tiny_end_to_end_cl_controller import teacher_logits_by_person
+from experiments.gco_math.gco_tiny_cl_behavior_path import distillation_kl, load_checkpoint
+from experiments.gco_math.gco_tiny_end_to_end_cl_controller import person_for_example, teacher_logits_by_person
 from experiments.gco_math.gco_tiny_recurrent_trace_plasticity import (
     RecurrentTracePlasticityNet,
     TRACE_FEATURE_NAMES,
@@ -153,10 +156,17 @@ def validate_args(args: argparse.Namespace) -> None:
         "projected_update_damping",
         "plasticity_audit_rank_tolerance",
         "restore_bound_fraction",
+        "min_bridge_weight_sum",
     ]:
         positive_float(name, getattr(args, name))
     for name in [
         "adapter_scale",
+        "write_gate_scale",
+        "protect_gate_scale",
+        "guard_gate_scale",
+        "commit_gate_scale",
+        "drop_gate_scale",
+        "unassigned_write_weight",
         "lambda_new",
         "lambda_protect",
         "lambda_guard",
@@ -245,6 +255,144 @@ def sample_encoded_batch(
     )
     inputs, targets, mask, selected = batch_examples(examples, indices=indices, pad_id=pad_id, device=device)
     return inputs, targets, mask, selected, indices
+
+
+def per_example_gate_weights(
+    *,
+    selected: list[EncodedExample],
+    people: list[str],
+    gates: torch.Tensor,
+    gate_scales: dict[str, float],
+    unassigned_weight: float | None,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if gates.shape != (len(people), len(TRACE_GATE_NAMES)):
+        raise ValueError(f"{name} gate shape mismatch: expected {(len(people), len(TRACE_GATE_NAMES))}, got {tuple(gates.shape)}.")
+    if not selected:
+        raise RuntimeError(f"{name} selected batch is empty.")
+    weights: list[torch.Tensor] = []
+    gate_indices = {gate_name: TRACE_GATE_NAMES.index(gate_name) for gate_name in gate_scales}
+    for example in selected:
+        person = person_for_example(example, people)
+        if person is None:
+            if unassigned_weight is None:
+                raise RuntimeError(f"{name} cannot assign gate weight to unpersoned example: {example.prompt!r}{example.answer!r}")
+            weights.append(gates.new_tensor(float(unassigned_weight)))
+            continue
+        person_index = people.index(person)
+        weight = gates.new_zeros(())
+        for gate_name, scale in gate_scales.items():
+            weight = weight + float(scale) * gates[person_index, gate_indices[gate_name]].detach()
+        weights.append(weight.clamp_min(0.0))
+    return torch.stack(weights).to(device=device)
+
+
+def weighted_masked_ce_loss(
+    *,
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    example_weights: torch.Tensor,
+    min_weight_sum: float,
+    name: str,
+) -> torch.Tensor:
+    if logits.shape[:-1] != targets.shape or targets.shape != mask.shape:
+        raise ValueError(f"{name} shape mismatch: logits={logits.shape} targets={targets.shape} mask={mask.shape}.")
+    if example_weights.shape != (targets.shape[0],):
+        raise ValueError(f"{name} expected example weights shape {(targets.shape[0],)}, got {tuple(example_weights.shape)}.")
+    token_weights = mask * example_weights.reshape(-1, 1)
+    denom = token_weights.sum()
+    if float(denom.detach().cpu()) <= min_weight_sum:
+        raise RuntimeError(f"{name} has insufficient positive token weight: {float(denom.detach().cpu()):.6g}.")
+    losses = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction="none").reshape_as(targets)
+    return (losses * token_weights).sum() / denom
+
+
+def weighted_drop_suppression_loss(
+    *,
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    example_weights: torch.Tensor,
+    target_probability: float,
+    min_weight_sum: float,
+    name: str,
+) -> torch.Tensor:
+    positive_float("target_probability", target_probability)
+    if target_probability >= 1.0:
+        raise ValueError(f"target_probability must be below 1.0, got {target_probability}.")
+    if logits.shape[:-1] != targets.shape or targets.shape != mask.shape:
+        raise ValueError(f"{name} shape mismatch: logits={logits.shape} targets={targets.shape} mask={mask.shape}.")
+    if example_weights.shape != (targets.shape[0],):
+        raise ValueError(f"{name} expected example weights shape {(targets.shape[0],)}, got {tuple(example_weights.shape)}.")
+    token_weights = mask * example_weights.reshape(-1, 1)
+    denom = token_weights.sum()
+    if float(denom.detach().cpu()) <= min_weight_sum:
+        raise RuntimeError(f"{name} has insufficient positive token weight: {float(denom.detach().cpu()):.6g}.")
+    log_probs = F.log_softmax(logits, dim=-1)
+    old_answer_log_probs = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    threshold = math.log(target_probability)
+    penalty = F.relu(old_answer_log_probs - threshold).square()
+    return (penalty * token_weights).sum() / denom
+
+
+def aggregate_weighted_losses_by_category(
+    losses: list[tuple[str, torch.Tensor, torch.Tensor]],
+    *,
+    prefix: str,
+    min_weight_sum: float,
+) -> dict[str, torch.Tensor]:
+    grouped: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+    for category, loss, weight in losses:
+        grouped.setdefault(category, []).append((loss, weight))
+    rows: dict[str, torch.Tensor] = {}
+    for category, category_losses in sorted(grouped.items()):
+        loss_values = torch.stack([loss for loss, _weight in category_losses])
+        weights = torch.stack([weight for _loss, weight in category_losses])
+        denom = weights.sum()
+        if float(denom.detach().cpu()) <= min_weight_sum:
+            continue
+        rows[f"{prefix}:{category}"] = (loss_values * weights).sum() / denom
+    if not rows:
+        raise RuntimeError(f"No weighted constraint rows remained for {prefix}.")
+    return rows
+
+
+def weighted_distillation_loss_and_constraint_rows_for_batch(
+    current_logits: torch.Tensor,
+    selected: list[EncodedExample],
+    teacher_logits: list[torch.Tensor],
+    global_indices: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    temperature: float,
+    device: torch.device,
+    constraint_mode: str,
+    prefix: str,
+    min_weight_sum: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if weights.shape != (len(selected),):
+        raise ValueError(f"{prefix} weights shape mismatch: expected {(len(selected),)}, got {tuple(weights.shape)}.")
+    losses: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+    for row_index, example in enumerate(selected):
+        length = len(example.target_ids)
+        current = current_logits[row_index, :length].unsqueeze(0)
+        teacher = teacher_logits[int(global_indices[row_index].item())].to(device).unsqueeze(0)
+        losses.append((example.category, distillation_kl(current, teacher, temperature=temperature), weights[row_index]))
+    if not losses:
+        raise RuntimeError(f"No distillation losses were built for {prefix}.")
+    weight_values = torch.stack([weight for _category, _loss, weight in losses])
+    denom = weight_values.sum()
+    if float(denom.detach().cpu()) <= min_weight_sum:
+        raise RuntimeError(f"{prefix} has insufficient positive constraint weight: {float(denom.detach().cpu()):.6g}.")
+    loss_values = torch.stack([loss for _category, loss, _weight in losses])
+    overall = (loss_values * weight_values).sum() / denom
+    if constraint_mode == "scalar":
+        return overall, {f"{prefix}:all": overall}
+    if constraint_mode != "category":
+        raise ValueError(f"Gate-weighted bridge currently supports scalar/category constraints, got {constraint_mode!r}.")
+    return overall, aggregate_weighted_losses_by_category(losses, prefix=prefix, min_weight_sum=min_weight_sum)
 
 
 def bounded_restore_gradient(
@@ -394,7 +542,7 @@ def train_projected_bridge_stage(
                 damping=args.projected_update_damping,
                 solver=args.projected_solver,
                 rank_tolerance=args.plasticity_audit_rank_tolerance,
-                plasticity_audit=True,
+                plasticity_audit=args.projected_plasticity_audit,
             )
             restore_gradient = flat_autograd_gradient(
                 constraint_loss,
@@ -454,6 +602,223 @@ def train_projected_bridge_stage(
     return trace
 
 
+def train_gate_weighted_bridge_stage(
+    *,
+    args: argparse.Namespace,
+    adapter: torch.nn.Module,
+    update_examples: list[EncodedExample],
+    memory_examples: list[EncodedExample],
+    memory_logits: list[torch.Tensor],
+    gates: torch.Tensor,
+    people: list[str],
+    pad_id: int,
+    device: torch.device,
+    seed: int,
+    label: str,
+) -> list[dict[str, float]]:
+    if not update_examples:
+        raise ValueError(f"{label} received no update examples.")
+    if not memory_examples:
+        raise ValueError(f"{label} received no memory examples.")
+    if len(memory_examples) != len(memory_logits):
+        raise ValueError(f"{label} memory/logit count mismatch: {len(memory_examples)} vs {len(memory_logits)}.")
+    params = trainable_adapter_parameters(adapter)
+    optimizer = torch.optim.AdamW(params, lr=args.bridge_lr, weight_decay=args.weight_decay)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    protect_scales = {
+        "protect": args.protect_gate_scale,
+        "guard": args.guard_gate_scale,
+        "commit": args.commit_gate_scale,
+    }
+    write_scales = {"write": args.write_gate_scale}
+    drop_scales = {"drop": args.drop_gate_scale}
+    trace: list[dict[str, float]] = []
+    for epoch in range(1, args.bridge_epochs + 1):
+        permutation = torch.randperm(len(update_examples), generator=generator)
+        totals = {
+            "loss": 0.0,
+            "new": 0.0,
+            "drop": 0.0,
+            "protected": 0.0,
+            "raw_grad_norm": 0.0,
+            "projected_grad_norm": 0.0,
+            "restore_grad_norm": 0.0,
+            "projection_removed_fraction": 0.0,
+            "safe_grad_fraction": 0.0,
+            "constraint_count": 0.0,
+            "write_weight_mean": 0.0,
+            "drop_weight_mean": 0.0,
+            "protect_weight_mean": 0.0,
+        }
+        batches = 0
+        pbar = tqdm(range(0, len(update_examples), args.batch_size), desc=f"{label} {epoch}/{args.bridge_epochs}")
+        for start in pbar:
+            update_indices = permutation[start : start + args.batch_size]
+            inputs, targets, mask, selected = batch_examples(
+                update_examples,
+                indices=update_indices,
+                pad_id=pad_id,
+                device=device,
+            )
+            batch_count = int(update_indices.numel())
+            memory_inputs, memory_targets, memory_mask, memory_selected, memory_indices = sample_encoded_batch(
+                examples=memory_examples,
+                count=batch_count,
+                generator=generator,
+                pad_id=pad_id,
+                device=device,
+            )
+            write_weights = per_example_gate_weights(
+                selected=selected,
+                people=people,
+                gates=gates,
+                gate_scales=write_scales,
+                unassigned_weight=args.unassigned_write_weight,
+                device=device,
+                name=f"{label}:write",
+            )
+            protect_weights = per_example_gate_weights(
+                selected=memory_selected,
+                people=people,
+                gates=gates,
+                gate_scales=protect_scales,
+                unassigned_weight=None,
+                device=device,
+                name=f"{label}:protect",
+            )
+            drop_weights = per_example_gate_weights(
+                selected=memory_selected,
+                people=people,
+                gates=gates,
+                gate_scales=drop_scales,
+                unassigned_weight=None,
+                device=device,
+                name=f"{label}:drop",
+            )
+
+            optimizer.zero_grad(set_to_none=True)
+            adapter.set_action_gates(learn_action_gates())
+            update_logits = adapter(inputs)
+            new_loss = weighted_masked_ce_loss(
+                logits=update_logits,
+                targets=targets,
+                mask=mask,
+                example_weights=write_weights,
+                min_weight_sum=args.min_bridge_weight_sum,
+                name=f"{label}:new",
+            )
+            memory_logits_current = adapter(memory_inputs)
+            drop_loss = weighted_drop_suppression_loss(
+                logits=memory_logits_current,
+                targets=memory_targets,
+                mask=memory_mask,
+                example_weights=drop_weights,
+                target_probability=args.drop_target_probability,
+                min_weight_sum=args.min_bridge_weight_sum,
+                name=f"{label}:drop",
+            )
+            protected_loss, protected_rows = weighted_distillation_loss_and_constraint_rows_for_batch(
+                memory_logits_current,
+                memory_selected,
+                memory_logits,
+                memory_indices,
+                protect_weights,
+                temperature=args.distill_temperature,
+                device=device,
+                constraint_mode=args.projected_constraint_mode,
+                prefix="protected_behavior",
+                min_weight_sum=args.min_bridge_weight_sum,
+            )
+            raw_loss = args.lambda_new * new_loss + args.lambda_drop * drop_loss
+            constraint_loss = (args.lambda_protect + args.lambda_guard) * 0.5 * protected_loss
+            raw_gradient = flat_autograd_gradient(
+                raw_loss,
+                params,
+                retain_graph=True,
+                require_nonzero=True,
+                label=f"{label}:raw_loss",
+            )
+            constraint_gradients = [
+                flat_autograd_gradient(
+                    loss,
+                    params,
+                    retain_graph=True,
+                    require_nonzero=False,
+                    label=f"{label}:{name}",
+                )
+                for name, loss in sorted(protected_rows.items())
+            ]
+            safe_gradient, projection_stats = project_gradient_away_from_constraints(
+                raw_gradient=raw_gradient,
+                constraint_gradients=constraint_gradients,
+                damping=args.projected_update_damping,
+                solver=args.projected_solver,
+                rank_tolerance=args.plasticity_audit_rank_tolerance,
+                plasticity_audit=args.projected_plasticity_audit,
+            )
+            restore_gradient = flat_autograd_gradient(
+                constraint_loss,
+                params,
+                retain_graph=False,
+                require_nonzero=False,
+                label=f"{label}:restore",
+            )
+            restore_update = bounded_restore_gradient(
+                restore_gradient=restore_gradient,
+                safe_gradient=safe_gradient,
+                restore_strength=args.projected_restore_strength,
+                bound_fraction=args.restore_bound_fraction,
+            )
+            final_gradient = safe_gradient + restore_update
+            optimizer.zero_grad(set_to_none=True)
+            assign_flat_gradient(params, final_gradient)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(params, args.grad_clip).detach().cpu())
+            optimizer.step()
+
+            row = {
+                "loss": float((raw_loss + constraint_loss).detach().cpu()),
+                "new": float(new_loss.detach().cpu()),
+                "drop": float(drop_loss.detach().cpu()),
+                "protected": float(protected_loss.detach().cpu()),
+                "raw_grad_norm": projection_stats["raw_grad_norm"],
+                "projected_grad_norm": projection_stats["projected_grad_norm"],
+                "restore_grad_norm": float(torch.linalg.vector_norm(restore_update).detach().cpu()),
+                "projection_removed_fraction": projection_stats["projection_removed_fraction"],
+                "safe_grad_fraction": projection_stats["safe_grad_fraction"],
+                "constraint_count": projection_stats["constraint_count"],
+                "write_weight_mean": float(write_weights.mean().detach().cpu()),
+                "drop_weight_mean": float(drop_weights.mean().detach().cpu()),
+                "protect_weight_mean": float(protect_weights.mean().detach().cpu()),
+                "grad_norm": grad_norm,
+            }
+            for key in totals:
+                totals[key] += row[key]
+            batches += 1
+            pbar.set_postfix(
+                {
+                    "new": f"{row['new']:.3g}",
+                    "drop": f"{row['drop']:.3g}",
+                    "prot": f"{row['protected']:.3g}",
+                    "rem": f"{row['projection_removed_fraction']:.2f}",
+                }
+            )
+        if batches <= 0:
+            raise RuntimeError(f"{label} epoch {epoch} saw zero batches.")
+        epoch_row = {key: value / float(batches) for key, value in totals.items()}
+        epoch_row["epoch"] = float(epoch)
+        trace.append(epoch_row)
+        if epoch == 1 or epoch == args.bridge_epochs or epoch % args.print_every == 0:
+            print(
+                f"{label} epoch={epoch:4d} new={epoch_row['new']:.5f} "
+                f"drop={epoch_row['drop']:.5f} protected={epoch_row['protected']:.5f} "
+                f"removed={epoch_row['projection_removed_fraction']:.3f} "
+                f"writeW={epoch_row['write_weight_mean']:.3f} protectW={epoch_row['protect_weight_mean']:.3f} "
+                f"dropW={epoch_row['drop_weight_mean']:.3f}"
+            )
+    return trace
+
+
 def role_groups_from_predicted(
     *,
     predicted_roles: dict[str, str],
@@ -495,6 +860,16 @@ def run_recurrent_bridge(
         people=people,
         old_people=set(true_roles),
         hidden_dim=args.plasticity_hidden_dim,
+        device=device,
+    )
+    memory_examples = [example for person in people for example in encoded_people[person]]
+    if not memory_examples:
+        raise RuntimeError("No memory examples were available for gate-weighted bridge update.")
+    memory_logits = collect_example_logits(
+        base_model,
+        memory_examples,
+        pad_id=pad_id,
+        batch_size=args.eval_batch_size,
         device=device,
     )
     final_gates = torch.zeros((len(people), len(TRACE_GATE_NAMES)), dtype=torch.float32, device=device)
@@ -567,9 +942,60 @@ def run_recurrent_bridge(
             "selector_trace": selector_trace,
             "bridge_trace": None,
             "bridge_role_timing": args.bridge_role_timing,
+            "bridge_update_mode": args.bridge_update_mode,
             "trace_state": serialize_trace_state(people=people, trace_state=trace_state),
         }
         if args.bridge_role_timing == "online":
+            if args.bridge_update_mode == "roles":
+                role_groups = role_groups_from_predicted(predicted_roles=predicted_roles, encoded_people=encoded_people)
+                preserve_logits = collect_example_logits(
+                    base_model,
+                    role_groups["preserve"],
+                    pad_id=pad_id,
+                    batch_size=args.eval_batch_size,
+                    device=device,
+                )
+                guard_logits = collect_example_logits(
+                    base_model,
+                    role_groups["guard"],
+                    pad_id=pad_id,
+                    batch_size=args.eval_batch_size,
+                    device=device,
+                )
+                stage_report["bridge_trace"] = train_projected_bridge_stage(
+                    args=args,
+                    adapter=bridge_adapter,
+                    update_examples=encoded_groups[stage_name],
+                    preserve_examples=role_groups["preserve"],
+                    guard_examples=role_groups["guard"],
+                    drop_examples=role_groups["drop"],
+                    preserve_logits=preserve_logits,
+                    guard_logits=guard_logits,
+                    pad_id=pad_id,
+                    device=device,
+                    seed=args.seed + 5000 + stage_number,
+                    label=f"bridge {stage_name}",
+                )
+            elif args.bridge_update_mode == "gates":
+                stage_report["bridge_trace"] = train_gate_weighted_bridge_stage(
+                    args=args,
+                    adapter=bridge_adapter,
+                    update_examples=encoded_groups[stage_name],
+                    memory_examples=memory_examples,
+                    memory_logits=memory_logits,
+                    gates=final_gates,
+                    people=people,
+                    pad_id=pad_id,
+                    device=device,
+                    seed=args.seed + 5000 + stage_number,
+                    label=f"bridge {stage_name}",
+                )
+            else:
+                raise ValueError(f"Unknown bridge_update_mode={args.bridge_update_mode!r}.")
+        stage_reports.append(stage_report)
+    predicted_roles = predicted_roles_from_trace_gates(people=people, gates=final_gates)
+    if args.bridge_role_timing == "warmup":
+        if args.bridge_update_mode == "roles":
             role_groups = role_groups_from_predicted(predicted_roles=predicted_roles, encoded_people=encoded_people)
             preserve_logits = collect_example_logits(
                 base_model,
@@ -585,55 +1011,40 @@ def run_recurrent_bridge(
                 batch_size=args.eval_batch_size,
                 device=device,
             )
-            stage_report["bridge_trace"] = train_projected_bridge_stage(
-                args=args,
-                adapter=bridge_adapter,
-                update_examples=encoded_groups[stage_name],
-                preserve_examples=role_groups["preserve"],
-                guard_examples=role_groups["guard"],
-                drop_examples=role_groups["drop"],
-                preserve_logits=preserve_logits,
-                guard_logits=guard_logits,
-                pad_id=pad_id,
-                device=device,
-                seed=args.seed + 5000 + stage_number,
-                label=f"bridge {stage_name}",
-            )
-        stage_reports.append(stage_report)
-    predicted_roles = predicted_roles_from_trace_gates(people=people, gates=final_gates)
-    if args.bridge_role_timing == "warmup":
-        role_groups = role_groups_from_predicted(predicted_roles=predicted_roles, encoded_people=encoded_people)
-        preserve_logits = collect_example_logits(
-            base_model,
-            role_groups["preserve"],
-            pad_id=pad_id,
-            batch_size=args.eval_batch_size,
-            device=device,
-        )
-        guard_logits = collect_example_logits(
-            base_model,
-            role_groups["guard"],
-            pad_id=pad_id,
-            batch_size=args.eval_batch_size,
-            device=device,
-        )
         for stage_report in stage_reports:
             stage_number = int(stage_report["stage"])
             stage_name = str(stage_report["stage_name"])
-            stage_report["bridge_trace"] = train_projected_bridge_stage(
-                args=args,
-                adapter=bridge_adapter,
-                update_examples=encoded_groups[stage_name],
-                preserve_examples=role_groups["preserve"],
-                guard_examples=role_groups["guard"],
-                drop_examples=role_groups["drop"],
-                preserve_logits=preserve_logits,
-                guard_logits=guard_logits,
-                pad_id=pad_id,
-                device=device,
-                seed=args.seed + 5000 + stage_number,
-                label=f"bridge {stage_name}",
-            )
+            if args.bridge_update_mode == "roles":
+                stage_report["bridge_trace"] = train_projected_bridge_stage(
+                    args=args,
+                    adapter=bridge_adapter,
+                    update_examples=encoded_groups[stage_name],
+                    preserve_examples=role_groups["preserve"],
+                    guard_examples=role_groups["guard"],
+                    drop_examples=role_groups["drop"],
+                    preserve_logits=preserve_logits,
+                    guard_logits=guard_logits,
+                    pad_id=pad_id,
+                    device=device,
+                    seed=args.seed + 5000 + stage_number,
+                    label=f"bridge {stage_name}",
+                )
+            elif args.bridge_update_mode == "gates":
+                stage_report["bridge_trace"] = train_gate_weighted_bridge_stage(
+                    args=args,
+                    adapter=bridge_adapter,
+                    update_examples=encoded_groups[stage_name],
+                    memory_examples=memory_examples,
+                    memory_logits=memory_logits,
+                    gates=final_gates,
+                    people=people,
+                    pad_id=pad_id,
+                    device=device,
+                    seed=args.seed + 5000 + stage_number,
+                    label=f"bridge {stage_name}",
+                )
+            else:
+                raise ValueError(f"Unknown bridge_update_mode={args.bridge_update_mode!r}.")
     metrics = evaluate_learn_adapter(
         adapter=bridge_adapter,
         groups=encoded_groups,
@@ -851,6 +1262,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-json", type=Path, default=Path("model/analysis/gco-tiny-recurrent-invariant-bridge-seed0.json"))
     parser.add_argument("--methods", type=str, default="naive,recurrent_bridge")
     parser.add_argument("--bridge-role-timing", choices=["warmup", "online"], default="warmup")
+    parser.add_argument("--bridge-update-mode", choices=["gates", "roles"], default="gates")
     parser.add_argument("--useful-evidence-people", type=str, default="Alice,Bruno")
     parser.add_argument("--obsolete-evidence-people", type=str, default="Clara,Darin")
     parser.add_argument("--reporting-preserve-people", type=str, default="Alice,Bruno")
@@ -872,6 +1284,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adapter-scale", type=float, default=4.0)
     parser.add_argument("--adapter-init-std", type=float, default=0.02)
     parser.add_argument("--plasticity-hidden-dim", type=int, default=64)
+    parser.add_argument("--write-gate-scale", type=float, default=1.0)
+    parser.add_argument("--protect-gate-scale", type=float, default=1.0)
+    parser.add_argument("--guard-gate-scale", type=float, default=1.0)
+    parser.add_argument("--commit-gate-scale", type=float, default=1.0)
+    parser.add_argument("--drop-gate-scale", type=float, default=1.0)
+    parser.add_argument("--unassigned-write-weight", type=float, default=1.0)
+    parser.add_argument("--min-bridge-weight-sum", type=float, default=1e-6)
     parser.add_argument("--lambda-new", type=float, default=4.0)
     parser.add_argument("--lambda-protect", type=float, default=1.0)
     parser.add_argument("--lambda-guard", type=float, default=1.0)
@@ -897,6 +1316,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--novelty-grace-stages", type=float, default=2.0)
     parser.add_argument("--projected-constraint-mode", choices=["scalar", "category"], default="category")
     parser.add_argument("--projected-solver", choices=["sequential", "gram"], default="gram")
+    parser.add_argument("--projected-plasticity-audit", action="store_true")
     parser.add_argument("--projected-update-damping", type=float, default=1e-6)
     parser.add_argument("--projected-restore-strength", type=float, default=0.05)
     parser.add_argument("--restore-bound-fraction", type=float, default=0.5)

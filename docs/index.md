@@ -12,6 +12,12 @@ capacity inside neural networks.
 > terminology may change as experiments fail, new evidence appears, or better
 > continual-learning research becomes available.
 
+The newer working hypothesis behind this page is that continual learning may
+require more than protecting a fixed neural architecture. A suitable learner
+may need to operate as a self-organizing dynamical system in which
+representations, routes, functional ownership, connectivity, and plasticity can
+change together while useful behavior remains available.
+
 Read this page as five steps:
 
 1. The problem: new learning changes old model geometry.
@@ -91,14 +97,28 @@ from scratch on all 200 words. The key observation is that the successful
 keeping behavior good. That weakens a purely "protect exact old activations"
 view and strengthens the need for behavior-preserving rebasing.
 
-## 1. The Core Claim
+## 1. The Core Claim And Working Hypothesis
 
-The thesis is:
+The starting claim is:
 
 ```text
 continual learning is behavior-preserving representational change
 under fixed capacity
 ```
+
+The broader working hypothesis is:
+
+```text
+continual learning may require behavior-preserving reorganization
+of functional neural geometry under fixed capacity
+```
+
+Here, functional geometry means the relationships that make neural behavior
+usable: how representations are organized, which routes reach which
+computations, which structures carry particular functional roles, and which
+parts of the network are currently more plastic or more stable. The geometry is
+not meant as a literal physical shape. It is the changing organization of
+function inside the network.
 
 When a model learns new data, the update is not just a movement in parameter
 space. It is a change to the model's internal geometry. Sometimes that change
@@ -109,7 +129,7 @@ possible. It causes forgetting when it damages geometry that old behavior still
 depends on, or when uncontrolled movement breaks readouts, routes, or feature
 relations.
 
-The thesis has four parts:
+This framing has four parts:
 
 - **Forgetting is internal damage.** Accuracy drops are symptoms. The internal
   causes can be representation drift, route drift, write collision, readout
@@ -618,14 +638,36 @@ Full hidden-state Jacobians are too expensive for realistic models, so the pract
 
 The Neural Tangent Kernel literature motivates viewing training dynamics in function space rather than only parameter space. See [Jacot et al., 2018](https://arxiv.org/abs/1806.07572).
 
-## 9. How I Am Aiming To Solve It: Read, Route, Reuse, Rebase, Write, Consolidate
+## 9. How I Am Aiming To Solve It: Self-Organizing Functional Geometry
 
-The intervention is not immediate rewriting of shared computation. The model
-should first inspect what is already happening inside itself, then decide what
-kind of change is needed. Sometimes the right change is a local write. Sometimes
-it is a route adjustment. Sometimes the old and new data require a coordinated
-representational rebasing where old internal coordinates move while old
-behavior remains usable.
+My working approach is not to apply protective mechanisms only after a
+conventional network has already become deeply entangled. I am exploring
+whether the network can be trained from the beginning as a self-organizing
+dynamical system. Small functional structures would learn at different rates
+and could change their routing, responsibility, connectivity, and plasticity as
+experience accumulates.
+
+The intended direction is:
+
+```text
+new information enters more plastic functional structure
+-> related and recurring behavior can strengthen and reorganize it
+-> reusable behavior can become slower and more stable
+-> contextual disagreement can separate into branches or corrections
+-> invalidated behavior can regain plasticity
+-> weak or unused structure can gradually release capacity
+```
+
+This is a hypothesis about how a continual learner might organize itself, not a
+claim that these operations already emerge automatically. Within that broader
+direction, the immediate intervention is still not the blind rewriting of
+shared computation.
+
+The model should first inspect what is already happening inside itself, then
+decide what kind of change is needed. Sometimes the right change is a local
+write. Sometimes it is a route adjustment. Sometimes the old and new data
+require a coordinated representational rebasing where old internal coordinates
+move while old behavior remains usable.
 
 The rough loop is:
 

@@ -27,6 +27,10 @@ artifacts/
 wandb/
 mlruns/
 
+# Organized generated research outputs
+research/
+archive/
+
 # Local model downloads and generated analysis artifacts
 model/checkpoints/
 model/analysis/
@@ -46,6 +50,16 @@ model/**/checkpoint-*/
 # Generated trace/export files
 *.jsonl
 
+# LaTeX / PDF build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+controlled_cl_geometry_report.pdf
+
 # GitHub Pages / Jekyll build artifacts
 docs/_site/
 docs/.jekyll-cache/
@@ -59,5 +73,11 @@ docs/.sass-cache/
 .vscode/
 .ipynb_checkpoints/
 CL_Architecture.md
+cl_geometey.md
+CL_PROGRESS.md
+
 local_assets/
 paper/
+NESTED_GEOMETRY_START.md
+CL_READING_PLAN.md
+CLEANUP_MANIFEST.md
